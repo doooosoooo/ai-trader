@@ -1,0 +1,353 @@
+"""Telegram 봇 — 양방향 알림 + 명령 수신."""
+
+import asyncio
+import json
+import os
+from datetime import datetime
+from typing import Any, Callable
+
+from loguru import logger
+
+try:
+    from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram.ext import (
+        Application,
+        CommandHandler,
+        MessageHandler,
+        CallbackQueryHandler,
+        ContextTypes,
+        filters,
+    )
+    TELEGRAM_AVAILABLE = True
+except ImportError:
+    TELEGRAM_AVAILABLE = False
+    logger.warning("python-telegram-bot not available")
+
+
+class TelegramBot:
+    """Telegram 봇 — 알림 발송 및 사용자 명령 수신."""
+
+    def __init__(self, config: dict, system_ref=None):
+        self.enabled = config.get("telegram", {}).get("enabled", True)
+        self.token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+        self.chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+        self.alert_levels = config.get("telegram", {}).get("alert_levels", [])
+        self.system = system_ref  # TradingSystem 참조
+        self._app = None
+        self._pending_confirmations: dict[str, dict] = {}
+
+        if not TELEGRAM_AVAILABLE:
+            self.enabled = False
+
+    async def start(self):
+        """봇 시작."""
+        if not self.enabled or not self.token:
+            logger.info("Telegram bot disabled or no token")
+            return
+
+        self._app = Application.builder().token(self.token).build()
+
+        # 명령 핸들러 등록
+        self._app.add_handler(CommandHandler("start", self._cmd_start))
+        self._app.add_handler(CommandHandler("status", self._cmd_status))
+        self._app.add_handler(CommandHandler("today", self._cmd_today))
+        self._app.add_handler(CommandHandler("strategy", self._cmd_strategy))
+        self._app.add_handler(CommandHandler("portfolio", self._cmd_portfolio))
+        self._app.add_handler(CommandHandler("pause", self._cmd_pause))
+        self._app.add_handler(CommandHandler("resume", self._cmd_resume))
+        self._app.add_handler(CommandHandler("mode", self._cmd_mode))
+        self._app.add_handler(CommandHandler("reset", self._cmd_reset))
+        self._app.add_handler(CallbackQueryHandler(self._handle_callback))
+        self._app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text))
+
+        await self._app.initialize()
+        await self._app.start()
+        await self._app.updater.start_polling()
+        logger.info("Telegram bot started")
+
+    async def stop(self):
+        if self._app:
+            await self._app.updater.stop()
+            await self._app.stop()
+            await self._app.shutdown()
+
+    # --- 알림 발송 ---
+
+    async def send_alert(self, level: str, message: str) -> bool:
+        """알림 발송."""
+        if not self.enabled or not self.chat_id:
+            return False
+
+        if level not in self.alert_levels and level != "circuit_breaker":
+            return False
+
+        try:
+            await self._app.bot.send_message(
+                chat_id=self.chat_id,
+                text=message,
+                parse_mode="HTML",
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Telegram alert failed: {e}")
+            return False
+
+    def send_alert_sync(self, level: str, message: str) -> bool:
+        """동기 알림 발송 (콜백용)."""
+        if not self.enabled or not self.chat_id or not self._app:
+            logger.info(f"[Alert:{level}] {message}")
+            return False
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.ensure_future(self.send_alert(level, message))
+            else:
+                loop.run_until_complete(self.send_alert(level, message))
+            return True
+        except Exception:
+            logger.info(f"[Alert:{level}] {message}")
+            return False
+
+    async def send_trade_alert(self, trade: dict):
+        """매매 체결 알림."""
+        action = trade.get("action", "")
+        emoji = "🟢" if action == "BUY" else "🔴" if action == "SELL" else "⚪"
+        status = trade.get("status", "")
+
+        msg = (
+            f"{emoji} <b>{action}</b> {trade.get('name', '')} ({trade.get('ticker', '')})\n"
+            f"수량: {trade.get('quantity', 0):,}주 @ {trade.get('price', 0):,.0f}원\n"
+            f"금액: {trade.get('amount', 0):,.0f}원\n"
+        )
+
+        if trade.get("pnl") is not None:
+            pnl = trade["pnl"]
+            pnl_emoji = "📈" if pnl > 0 else "📉"
+            msg += f"손익: {pnl_emoji} {pnl:,.0f}원 ({trade.get('pnl_pct', '')})\n"
+
+        msg += f"상태: {status}\n"
+        if trade.get("reason"):
+            msg += f"사유: {trade['reason']}"
+
+        await self.send_alert("trade_executed", msg)
+
+    async def request_confirmation(self, order: dict) -> str:
+        """대규모 주문 확인 요청.
+
+        Returns:
+            confirmation_id
+        """
+        conf_id = f"conf_{datetime.now().strftime('%H%M%S')}"
+
+        msg = (
+            f"⚠️ <b>주문 확인 요청</b>\n\n"
+            f"종목: {order.get('name', '')} ({order.get('ticker', '')})\n"
+            f"방향: {order.get('action', '')}\n"
+            f"수량: {order.get('quantity', 0):,}주\n"
+            f"가격: {order.get('price', 0):,.0f}원\n"
+            f"금액: {order.get('amount', 0):,.0f}원\n"
+            f"사유: {order.get('reason', '')}\n\n"
+            f"승인하시겠습니까?"
+        )
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ 승인", callback_data=f"approve_{conf_id}"),
+                InlineKeyboardButton("❌ 거부", callback_data=f"reject_{conf_id}"),
+            ]
+        ])
+
+        self._pending_confirmations[conf_id] = {
+            "order": order,
+            "status": "pending",
+            "requested_at": datetime.now().isoformat(),
+        }
+
+        if self._app:
+            await self._app.bot.send_message(
+                chat_id=self.chat_id,
+                text=msg,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+
+        return conf_id
+
+    # --- 명령 핸들러 ---
+
+    async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(
+            "🤖 AI Trader Bot\n\n"
+            "사용 가능한 명령:\n"
+            "/status - 시스템 상태\n"
+            "/portfolio - 포트폴리오 현황\n"
+            "/today - 오늘 매매 요약\n"
+            "/strategy - 현재 전략\n"
+            "/pause - 거래 일시 중지\n"
+            "/resume - 거래 재개\n"
+            "/mode <simulation|live> - 모드 전환\n"
+            "/reset - 서킷브레이커 리셋\n\n"
+            "자연어로 전략 변경도 가능합니다.\n"
+            "예: '단타로 전환해', '현금비중 50%로 올려'"
+        )
+
+    async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self.system:
+            await update.message.reply_text("시스템 미연결")
+            return
+
+        status = self.system.get_status()
+        msg = (
+            f"📊 <b>시스템 상태</b>\n\n"
+            f"모드: {status.get('mode', 'unknown')}\n"
+            f"서킷브레이커: {status.get('circuit_state', 'unknown')}\n"
+            f"총자산: {status.get('total_asset', 0):,.0f}원\n"
+            f"수익률: {status.get('total_pnl_pct', '0%')}\n"
+            f"보유종목: {status.get('num_positions', 0)}개\n"
+            f"LLM 일일비용: ${status.get('llm_daily_cost', 0):.2f}\n"
+        )
+        await update.message.reply_html(msg)
+
+    async def _cmd_today(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self.system:
+            await update.message.reply_text("시스템 미연결")
+            return
+
+        trades = self.system.portfolio.get_today_trades()
+        if not trades:
+            await update.message.reply_text("오늘 매매 내역이 없습니다.")
+            return
+
+        msg = "📋 <b>오늘의 매매</b>\n\n"
+        for t in trades:
+            emoji = "🟢" if t["action"] == "BUY" else "🔴"
+            msg += f"{emoji} {t['action']} {t['name']} x{t['quantity']} @{t['price']:,.0f}\n"
+
+        await update.message.reply_html(msg)
+
+    async def _cmd_strategy(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self.system:
+            await update.message.reply_text("시스템 미연결")
+            return
+
+        strategy = self.system.llm_engine.load_strategy()
+        # 너무 길면 잘라서 보냄
+        if len(strategy) > 3000:
+            strategy = strategy[:3000] + "\n\n... (생략)"
+        await update.message.reply_text(f"📜 현재 전략:\n\n{strategy}")
+
+    async def _cmd_portfolio(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self.system:
+            await update.message.reply_text("시스템 미연결")
+            return
+
+        summary = self.system.portfolio.get_summary()
+        msg = (
+            f"💰 <b>포트폴리오</b>\n\n"
+            f"총자산: {summary['total_asset']:,.0f}원\n"
+            f"현금: {summary['cash']:,.0f}원 ({summary['cash_ratio']})\n"
+            f"투자금: {summary['invested']:,.0f}원\n"
+            f"총손익: {summary['total_pnl']:,.0f}원 ({summary['total_pnl_pct']})\n\n"
+        )
+
+        for ticker, pos in summary.get("positions", {}).items():
+            pnl_emoji = "📈" if pos["pnl"] > 0 else "📉" if pos["pnl"] < 0 else "➡️"
+            msg += (
+                f"{pnl_emoji} {pos['name']}({ticker})\n"
+                f"  {pos['quantity']}주 @{pos['avg_price']:,.0f} → {pos['current_price']:,.0f} "
+                f"({pos['pnl_pct']})\n"
+            )
+
+        await update.message.reply_html(msg)
+
+    async def _cmd_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if self.system:
+            self.system.pause()
+        await update.message.reply_text("⏸️ 거래가 일시 중지되었습니다.")
+
+    async def _cmd_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if self.system:
+            self.system.resume()
+        await update.message.reply_text("▶️ 거래가 재개되었습니다.")
+
+    async def _cmd_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        args = context.args
+        if not args or args[0] not in ("simulation", "live"):
+            await update.message.reply_text("사용법: /mode simulation 또는 /mode live")
+            return
+
+        mode = args[0]
+        if mode == "live":
+            await update.message.reply_text(
+                "⚠️ LIVE 모드로 전환하면 실제 주문이 실행됩니다.\n"
+                "확실하면 /mode_confirm_live 를 입력하세요."
+            )
+            return
+
+        if self.system:
+            self.system.config_manager.set_mode(mode)
+        await update.message.reply_text(f"모드 전환: {mode}")
+
+    async def _cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if self.system:
+            msg = self.system.circuit_breaker.manual_reset()
+            await update.message.reply_text(f"🔄 {msg}")
+        else:
+            await update.message.reply_text("시스템 미연결")
+
+    async def _handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """인라인 버튼 콜백 처리 (주문 승인/거부)."""
+        query = update.callback_query
+        await query.answer()
+
+        data = query.data
+        if data.startswith("approve_"):
+            conf_id = data.replace("approve_", "")
+            if conf_id in self._pending_confirmations:
+                self._pending_confirmations[conf_id]["status"] = "approved"
+                await query.edit_message_text("✅ 주문이 승인되었습니다.")
+        elif data.startswith("reject_"):
+            conf_id = data.replace("reject_", "")
+            if conf_id in self._pending_confirmations:
+                self._pending_confirmations[conf_id]["status"] = "rejected"
+                await query.edit_message_text("❌ 주문이 거부되었습니다.")
+
+    async def _handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """자연어 메시지 처리 → 전략 변경."""
+        if not self.system:
+            await update.message.reply_text("시스템 미연결")
+            return
+
+        user_text = update.message.text.strip()
+        if not user_text:
+            return
+
+        await update.message.reply_text("🤔 분석 중...")
+
+        try:
+            result = self.system.handle_natural_language(user_text)
+            msg = f"📝 <b>해석 결과</b>\n\n"
+
+            if result.get("interpretation"):
+                msg += f"{result['interpretation']}\n\n"
+
+            adjustments = result.get("adjustments", [])
+            if adjustments:
+                msg += "<b>파라미터 조정:</b>\n"
+                for adj in adjustments:
+                    status = "✅" if adj.get("applied", False) else "❌"
+                    msg += f"{status} {adj['param']}: {adj.get('old_value', '?')} → {adj['value']}\n"
+
+            if result.get("strategy_change_needed"):
+                msg += f"\n전략 변경 제안: {result.get('strategy_suggestion', '')}"
+
+            await update.message.reply_html(msg)
+
+        except Exception as e:
+            logger.error(f"Natural language processing failed: {e}")
+            await update.message.reply_text(f"처리 실패: {e}")
+
+    def get_confirmation_status(self, conf_id: str) -> str:
+        conf = self._pending_confirmations.get(conf_id, {})
+        return conf.get("status", "unknown")

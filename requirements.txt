@@ -1,0 +1,36 @@
+# Core
+pyyaml>=6.0
+python-dotenv>=1.0
+pydantic>=2.0
+
+# LLM
+anthropic>=0.40.0
+
+# Broker - KIS API
+requests>=2.31
+websockets>=12.0
+aiohttp>=3.9
+
+# Data & ML
+pandas>=2.1
+numpy>=1.26
+ta>=0.11.0
+scikit-learn>=1.4
+lightgbm>=4.3
+xgboost>=2.0
+
+# Scheduling
+apscheduler>=3.10
+
+# Interfaces
+typer[all]>=0.9
+python-telegram-bot>=21.0
+
+# Database
+aiosqlite>=0.20
+
+# Utilities
+rich>=13.0
+loguru>=0.7
+httpx>=0.27
+psutil>=5.9

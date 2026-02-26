@@ -1,0 +1,34 @@
+# Environment
+.env
+config/.env
+.venv/
+__pycache__/
+*.pyc
+
+# Data & Models
+data/storage/*.db
+ml/models/*.pkl
+ml/models/*.json
+
+# Logs
+logs/
+*.log
+
+# Simulation results
+simulation/results/
+
+# Review reports
+review/reports/
+
+# PM2
+pm2-*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
