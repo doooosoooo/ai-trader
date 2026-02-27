@@ -107,7 +107,7 @@ class TradingScheduler:
     def _safe_run(self, func):
         """에러가 발생해도 스케줄러가 멈추지 않도록 래핑."""
         async def wrapper():
-            if not self._is_trading_hours() and "circuit" not in str(func):
+            if not self._is_trading_hours():
                 return
 
             try:
@@ -136,8 +136,12 @@ class TradingScheduler:
         logger.info("Trading scheduler started")
 
     def stop(self):
-        self.scheduler.shutdown(wait=False)
-        logger.info("Trading scheduler stopped")
+        try:
+            if self.scheduler.running:
+                self.scheduler.shutdown(wait=False)
+                logger.info("Trading scheduler stopped")
+        except Exception:
+            pass
 
     def pause_trading_jobs(self):
         """매매 관련 잡만 일시 중지."""

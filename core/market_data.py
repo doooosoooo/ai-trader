@@ -16,18 +16,22 @@ class KISAuth:
     """KIS API 인증 관리 — 토큰 발급 및 갱신."""
 
     def __init__(self, config: dict):
-        self.app_key = os.getenv("KIS_APP_KEY", "")
-        self.app_secret = os.getenv("KIS_APP_SECRET", "")
-        self.account_no = os.getenv("KIS_ACCOUNT_NO", "")
+        self.account_type = config.get("broker", {}).get("account_type", "virtual")
         self.account_product_code = os.getenv("KIS_ACCOUNT_PRODUCT_CODE", "01")
 
-        account_type = config.get("broker", {}).get("account_type", "virtual")
-        if account_type == "virtual":
+        # 모의/실전에 따라 별도 키·계좌 사용
+        if self.account_type == "virtual":
+            self.app_key = os.getenv("KIS_VIRTUAL_APP_KEY", "")
+            self.app_secret = os.getenv("KIS_VIRTUAL_APP_SECRET", "")
+            self.account_no = os.getenv("KIS_VIRTUAL_ACCOUNT_NO", "")
             self.base_url = config.get("broker", {}).get(
                 "base_url_virtual",
                 "https://openapivts.koreainvestment.com:29443",
             )
         else:
+            self.app_key = os.getenv("KIS_REAL_APP_KEY", "")
+            self.app_secret = os.getenv("KIS_REAL_APP_SECRET", "")
+            self.account_no = os.getenv("KIS_REAL_ACCOUNT_NO", "")
             self.base_url = config.get("broker", {}).get(
                 "base_url_real",
                 "https://openapi.koreainvestment.com:9443",

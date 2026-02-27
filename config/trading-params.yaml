@@ -1,41 +1,27 @@
-# ============================================================
-# AI Trader - 매매 파라미터 (LLM이 조정 가능)
-# ============================================================
-# 이 파일의 값은 LLM이 사용자 지시에 따라 조정할 수 있습니다.
-# 단, safety-rules.yaml의 adjustable_limits 범위를 초과할 수 없습니다.
-
 holding_period_days:
-  min: 3
-  max: 14
-
-take_profit_pct: 0.15             # 익절 15%
-stop_loss_pct: -0.05              # 손절 -5%
-trailing_stop_pct: null            # 트레일링 스톱 (null = 미사용)
-
-position_size_pct: 0.10           # 기본 포지션 사이즈 (총자산의 10%)
-max_cash_ratio: 0.30              # 최소 현금 비중 30%
-
-# 기술적 지표 기준값
+  min: 7
+  max: 30
+take_profit_pct: 0.06
+stop_loss_pct: -0.05
+trailing_stop_pct: 0.04
+position_size_pct: 0.04
+max_cash_ratio: 0.65
 indicators:
-  rsi_oversold: 35
-  rsi_overbought: 70
-  volume_surge_multiplier: 2.0
-  ma_short: 5
-  ma_long: 20
+  rsi_oversold: 25
+  rsi_overbought: 60
+  volume_surge_multiplier: 3.0
+  ma_short: 10
+  ma_long: 60
   macd_fast: 12
   macd_slow: 26
   macd_signal: 9
   bb_period: 20
   bb_std: 2.0
-
-# 포트폴리오 목표 수익률
 portfolio_targets:
-  monthly_target_pct: 5.0
+  monthly_target_pct: 1.5
   yearly_target_pct: 50.0
-  on_target_reached: "defensive"
-  on_underperform: "maintain"
-
-# 시장 환경 대응
+  on_target_reached: defensive
+  on_underperform: maintain
 market_conditions:
-  vix_high_threshold: 30
+  vix_high_threshold: 22
   kospi_drop_threshold: -0.02

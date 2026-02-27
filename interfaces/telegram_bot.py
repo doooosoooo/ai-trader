@@ -67,9 +67,13 @@ class TelegramBot:
 
     async def stop(self):
         if self._app:
-            await self._app.updater.stop()
-            await self._app.stop()
-            await self._app.shutdown()
+            try:
+                if self._app.updater and self._app.updater.running:
+                    await self._app.updater.stop()
+                await self._app.stop()
+                await self._app.shutdown()
+            except Exception:
+                pass
 
     # --- 알림 발송 ---
 
@@ -174,9 +178,25 @@ class TelegramBot:
 
         return conf_id
 
+    # --- 권한 체크 ---
+
+    def _is_owner(self, update: Update) -> bool:
+        """메시지 발신자가 등록된 소유자인지 확인."""
+        return str(update.effective_chat.id) == str(self.chat_id)
+
+    async def _check_auth(self, update: Update) -> bool:
+        """권한 체크 — 소유자가 아니면 무시."""
+        if not self._is_owner(update):
+            await update.message.reply_text("⛔ 권한이 없습니다.")
+            logger.warning(f"Unauthorized access attempt: chat_id={update.effective_chat.id}")
+            return False
+        return True
+
     # --- 명령 핸들러 ---
 
     async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._check_auth(update):
+            return
         await update.message.reply_text(
             "🤖 AI Trader Bot\n\n"
             "사용 가능한 명령:\n"
@@ -193,6 +213,8 @@ class TelegramBot:
         )
 
     async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._check_auth(update):
+            return
         if not self.system:
             await update.message.reply_text("시스템 미연결")
             return
@@ -210,6 +232,8 @@ class TelegramBot:
         await update.message.reply_html(msg)
 
     async def _cmd_today(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._check_auth(update):
+            return
         if not self.system:
             await update.message.reply_text("시스템 미연결")
             return
@@ -227,6 +251,8 @@ class TelegramBot:
         await update.message.reply_html(msg)
 
     async def _cmd_strategy(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._check_auth(update):
+            return
         if not self.system:
             await update.message.reply_text("시스템 미연결")
             return
@@ -238,6 +264,8 @@ class TelegramBot:
         await update.message.reply_text(f"📜 현재 전략:\n\n{strategy}")
 
     async def _cmd_portfolio(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._check_auth(update):
+            return
         if not self.system:
             await update.message.reply_text("시스템 미연결")
             return
@@ -262,16 +290,22 @@ class TelegramBot:
         await update.message.reply_html(msg)
 
     async def _cmd_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._check_auth(update):
+            return
         if self.system:
             self.system.pause()
         await update.message.reply_text("⏸️ 거래가 일시 중지되었습니다.")
 
     async def _cmd_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._check_auth(update):
+            return
         if self.system:
             self.system.resume()
         await update.message.reply_text("▶️ 거래가 재개되었습니다.")
 
     async def _cmd_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._check_auth(update):
+            return
         args = context.args
         if not args or args[0] not in ("simulation", "live"):
             await update.message.reply_text("사용법: /mode simulation 또는 /mode live")
@@ -290,6 +324,8 @@ class TelegramBot:
         await update.message.reply_text(f"모드 전환: {mode}")
 
     async def _cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._check_auth(update):
+            return
         if self.system:
             msg = self.system.circuit_breaker.manual_reset()
             await update.message.reply_text(f"🔄 {msg}")
@@ -315,6 +351,8 @@ class TelegramBot:
 
     async def _handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """자연어 메시지 처리 → 전략 변경."""
+        if not self._is_owner(update):
+            return
         if not self.system:
             await update.message.reply_text("시스템 미연결")
             return

@@ -27,7 +27,7 @@ LOG_DIR.mkdir(exist_ok=True)
 (LOG_DIR / "reviews").mkdir(exist_ok=True)
 
 logger.remove()
-logger.add(sys.stderr, level="INFO", format="<green>{time:HH:mm:ss}</green> | <level>{level: <7}</level> | {message}")
+logger.add(sys.stdout, level="INFO", format="<green>{time:HH:mm:ss}</green> | <level>{level: <7}</level> | {message}")
 logger.add(LOG_DIR / "app_{time:YYYY-MM-DD}.log", rotation="1 day", retention="30 days", level="DEBUG")
 logger.add(LOG_DIR / "errors" / "error_{time:YYYY-MM-DD}.log", rotation="1 day", retention="60 days", level="ERROR")
 
@@ -245,26 +245,24 @@ class TradingSystem:
 
     def cycle_circuit_check(self):
         """서킷브레이커 정기 체크."""
+        # 코스피 체크 — API 실패는 스킵 (서킷 체크 자체 실패로 서킷 발동하면 안 됨)
         try:
-            # 코스피 체크
             kospi = self.market_client.get_kospi_index()
             self.circuit_breaker.check_kospi(kospi.get("change_pct", 0) / 100)
-
-            # 일일 손실 체크
-            snapshots = self.portfolio.get_daily_snapshots(days=1)
-            if snapshots:
-                daily_pnl_pct = snapshots[0].get("daily_pnl_pct", 0)
-                self.circuit_breaker.check_daily_loss(daily_pnl_pct)
-
-            # 총자산 비상 체크
-            self.circuit_breaker.check_emergency_loss(self.portfolio.total_pnl_pct)
-
-            # 시스템 리소스 체크
-            self.circuit_breaker.check_system_resources()
-
         except Exception as e:
-            logger.warning(f"Circuit check failed: {e}")
-            self.circuit_breaker.record_api_failure()
+            logger.debug(f"KOSPI check skipped (API unavailable): {e}")
+
+        # 일일 손실 체크
+        snapshots = self.portfolio.get_daily_snapshots(days=1)
+        if snapshots:
+            daily_pnl_pct = snapshots[0].get("daily_pnl_pct", 0)
+            self.circuit_breaker.check_daily_loss(daily_pnl_pct)
+
+        # 총자산 비상 체크
+        self.circuit_breaker.check_emergency_loss(self.portfolio.total_pnl_pct)
+
+        # 시스템 리소스 체크
+        self.circuit_breaker.check_system_resources()
 
     def on_market_open(self):
         """장 시작 전 초기화."""
