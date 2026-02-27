@@ -88,20 +88,25 @@ class ConfigManager:
         return self.get("broker.ws_url_real")
 
     def validate_adjustment(self, param: str, value: Any) -> tuple[bool, str]:
-        """LLM이 제안한 파라미터 조정이 safety-rules 범위 내인지 검증."""
+        """LLM이 제안한 파라미터 조정이 safety-rules 범위 내인지 검증.
+
+        화이트리스트 방식: adjustable_limits에 정의되지 않은 파라미터는 차단.
+        """
         limits = self._safety_rules.get("adjustable_limits", {})
 
         # 점 표기법 → 언더스코어 (safety-rules에서의 키 형식)
         limit_key = param.replace(".", "_")
 
-        if limit_key in limits:
-            limit = limits[limit_key]
-            min_val = limit.get("min")
-            max_val = limit.get("max")
-            if min_val is not None and value < min_val:
-                return False, f"{param}: {value} < 최소값 {min_val}"
-            if max_val is not None and value > max_val:
-                return False, f"{param}: {value} > 최대값 {max_val}"
+        if limit_key not in limits:
+            return False, f"{param}: 조정 허용 목록에 없는 파라미터"
+
+        limit = limits[limit_key]
+        min_val = limit.get("min")
+        max_val = limit.get("max")
+        if min_val is not None and value < min_val:
+            return False, f"{param}: {value} < 최소값 {min_val}"
+        if max_val is not None and value > max_val:
+            return False, f"{param}: {value} > 최대값 {max_val}"
 
         return True, "OK"
 

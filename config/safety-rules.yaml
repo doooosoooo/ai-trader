@@ -24,6 +24,7 @@ max_llm_retry: 3                   # LLM 파싱 실패 시 최대 재시도
 skip_on_parse_failure: true        # 파싱 실패 → 해당 사이클 스킵
 
 # trading-params.yaml에서 LLM이 조정 가능한 범위 제한
+# 주의: 여기에 없는 파라미터는 LLM이 변경할 수 없음 (화이트리스트)
 adjustable_limits:
   take_profit_pct:
     min: 0.02
@@ -31,6 +32,9 @@ adjustable_limits:
   stop_loss_pct:
     min: -0.20
     max: -0.01
+  trailing_stop_pct:
+    min: 0.01
+    max: 0.20
   position_size_pct:
     min: 0.03
     max: 0.15
@@ -43,3 +47,21 @@ adjustable_limits:
   max_cash_ratio:
     min: 0.10
     max: 0.90
+  portfolio_targets_monthly_target_pct:
+    min: 1.0
+    max: 15.0
+  indicators_rsi_oversold:
+    min: 15
+    max: 45
+  indicators_rsi_overbought:
+    min: 55
+    max: 85
+  indicators_volume_surge_multiplier:
+    min: 1.0
+    max: 10.0
+  indicators_ma_short:
+    min: 3
+    max: 60
+  indicators_ma_long:
+    min: 20
+    max: 200
