@@ -65,10 +65,12 @@ class Position:
 class Portfolio:
     """포트폴리오 상태 관리."""
 
-    def __init__(self, db_path: str | None = None):
+    def __init__(self, db_path: str | None = None, mode: str = "simulation"):
         DB_DIR.mkdir(parents=True, exist_ok=True)
         self.db_path = db_path or str(DB_DIR / "trader.db")
+        self.mode = mode  # "simulation" or "live"
         self._init_db()
+        self._migrate_db()
         self.positions: dict[str, Position] = {}
         self.cash: float = 0.0
         self.initial_capital: float = 0.0
@@ -106,7 +108,8 @@ class Portfolio:
                     pnl REAL,
                     pnl_pct REAL,
                     reason TEXT,
-                    signal_json TEXT
+                    signal_json TEXT,
+                    mode TEXT NOT NULL DEFAULT 'simulation'
                 );
 
                 CREATE TABLE IF NOT EXISTS daily_snapshot (
@@ -120,6 +123,14 @@ class Portfolio:
                     positions_json TEXT
                 );
             """)
+
+    def _migrate_db(self) -> None:
+        """기존 DB에 새 컬럼이 없으면 추가."""
+        with sqlite3.connect(self.db_path) as conn:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(trade_history)").fetchall()]
+            if "mode" not in cols:
+                conn.execute("ALTER TABLE trade_history ADD COLUMN mode TEXT NOT NULL DEFAULT 'simulation'")
+                logger.info("Migrated trade_history: added mode column")
 
     def _load_state(self) -> None:
         with sqlite3.connect(self.db_path) as conn:
@@ -288,13 +299,13 @@ class Portfolio:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""
                 INSERT INTO trade_history
-                (timestamp, ticker, name, action, quantity, price, amount, fee, pnl, pnl_pct, reason, signal_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (timestamp, ticker, name, action, quantity, price, amount, fee, pnl, pnl_pct, reason, signal_json, mode)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 trade["timestamp"], trade["ticker"], trade["name"], trade["action"],
                 trade["quantity"], trade["price"], trade["amount"], trade.get("fee", 0),
                 trade.get("pnl"), trade.get("pnl_pct"), trade.get("reason", ""),
-                signal_json,
+                signal_json, self.mode,
             ))
 
     def save_daily_snapshot(self) -> None:
@@ -358,6 +369,7 @@ class Portfolio:
             "cash": self.cash,
             "cash_ratio": f"{self.cash_ratio:.1%}",
             "invested": self.total_invested,
+            "initial_capital": self.initial_capital,
             "total_pnl": self.total_pnl,
             "total_pnl_pct": f"{self.total_pnl_pct:.2%}",
             "positions": {t: p.to_dict() for t, p in self.positions.items()},

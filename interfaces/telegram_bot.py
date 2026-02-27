@@ -57,6 +57,7 @@ class TelegramBot:
         self._app.add_handler(CommandHandler("resume", self._cmd_resume))
         self._app.add_handler(CommandHandler("mode", self._cmd_mode))
         self._app.add_handler(CommandHandler("reset", self._cmd_reset))
+        self._app.add_handler(CommandHandler("trades", self._cmd_trades))
         self._app.add_handler(CallbackQueryHandler(self._handle_callback))
         self._app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text))
 
@@ -118,10 +119,12 @@ class TelegramBot:
         action = trade.get("action", "")
         emoji = "🟢" if action == "BUY" else "🔴" if action == "SELL" else "⚪"
         status = trade.get("status", "")
+        mode = trade.get("mode", "simulation")
+        mode_tag = "[SIM]" if mode == "simulation" else "[LIVE]"
 
         msg = (
-            f"{emoji} <b>{action}</b> {trade.get('name', '')} ({trade.get('ticker', '')})\n"
-            f"수량: {trade.get('quantity', 0):,}주 @ {trade.get('price', 0):,.0f}원\n"
+            f"{emoji} {mode_tag} <b>{action}</b> {trade.get('name', '')} ({trade.get('ticker', '')})\n"
+            f"수량: {trade.get('quantity', 0):,}주 × {trade.get('price', 0):,.0f}원\n"
             f"금액: {trade.get('amount', 0):,.0f}원\n"
         )
 
@@ -201,8 +204,9 @@ class TelegramBot:
             "🤖 AI Trader Bot\n\n"
             "사용 가능한 명령:\n"
             "/status - 시스템 상태\n"
-            "/portfolio - 포트폴리오 현황\n"
-            "/today - 오늘 매매 요약\n"
+            "/portfolio - 포트폴리오 현황 (매입가·손익)\n"
+            "/today - 오늘 매매 내역\n"
+            "/trades - 최근 매매 내역 (전체)\n"
             "/strategy - 현재 전략\n"
             "/pause - 거래 일시 중지\n"
             "/resume - 거래 재개\n"
@@ -249,7 +253,21 @@ class TelegramBot:
         msg = "📋 <b>오늘의 매매</b>\n\n"
         for t in trades:
             emoji = "🟢" if t["action"] == "BUY" else "🔴"
-            msg += f"{emoji} {t['action']} {t['name']} x{t['quantity']} @{t['price']:,.0f}\n"
+            mode_tag = "[SIM]" if t.get("mode", "simulation") == "simulation" else "[LIVE]"
+            pnl_str = ""
+            if t.get("pnl") is not None:
+                pnl = t["pnl"]
+                pnl_str = f"  손익: {pnl:+,.0f}원 ({t.get('pnl_pct', '')})"
+            msg += (
+                f"{emoji} {mode_tag} {t['action']} {t['name']}({t['ticker']})\n"
+                f"  {t['quantity']:,}주 × {t['price']:,.0f}원 = {t['amount']:,.0f}원\n"
+                f"{pnl_str}\n"
+            )
+
+        # 오늘 총 손익
+        total_pnl = sum(t.get("pnl", 0) or 0 for t in trades)
+        if total_pnl:
+            msg += f"\n<b>오늘 실현손익: {total_pnl:+,.0f}원</b>"
 
         await update.message.reply_html(msg)
 
@@ -274,20 +292,30 @@ class TelegramBot:
             return
 
         summary = self.system.portfolio.get_summary()
+        mode = self.system.config_manager.settings.get("mode", "simulation")
+        mode_label = "🔵시뮬레이션" if mode == "simulation" else "🔴실거래"
+
         msg = (
-            f"💰 <b>포트폴리오</b>\n\n"
+            f"💰 <b>포트폴리오</b> ({mode_label})\n\n"
+            f"초기자본: {summary.get('initial_capital', 0):,.0f}원\n"
             f"총자산: {summary['total_asset']:,.0f}원\n"
             f"현금: {summary['cash']:,.0f}원 ({summary['cash_ratio']})\n"
-            f"투자금: {summary['invested']:,.0f}원\n"
-            f"총손익: {summary['total_pnl']:,.0f}원 ({summary['total_pnl_pct']})\n\n"
+            f"평가금: {summary['invested']:,.0f}원\n"
+            f"총손익: {summary['total_pnl']:,.0f}원 ({summary['total_pnl_pct']})\n"
+            f"{'─' * 24}\n"
         )
 
         for ticker, pos in summary.get("positions", {}).items():
             pnl_emoji = "📈" if pos["pnl"] > 0 else "📉" if pos["pnl"] < 0 else "➡️"
+            cost_total = pos["quantity"] * pos["avg_price"]
             msg += (
-                f"{pnl_emoji} {pos['name']}({ticker})\n"
-                f"  {pos['quantity']}주 @{pos['avg_price']:,.0f} → {pos['current_price']:,.0f} "
-                f"({pos['pnl_pct']})\n"
+                f"\n{pnl_emoji} <b>{pos['name']}</b>({ticker})\n"
+                f"  보유: {pos['quantity']}주\n"
+                f"  매입단가: {pos['avg_price']:,.0f}원\n"
+                f"  매입금액: {cost_total:,.0f}원\n"
+                f"  현재가: {pos['current_price']:,.0f}원\n"
+                f"  평가금: {pos['market_value']:,.0f}원\n"
+                f"  손익: {pos['pnl']:+,.0f}원 ({pos['pnl_pct']})\n"
             )
 
         await update.message.reply_html(msg)
@@ -334,6 +362,42 @@ class TelegramBot:
             await update.message.reply_text(f"🔄 {msg}")
         else:
             await update.message.reply_text("시스템 미연결")
+
+    async def _cmd_trades(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """최근 매매 내역 조회."""
+        if not await self._check_auth(update):
+            return
+        if not self.system:
+            await update.message.reply_text("시스템 미연결")
+            return
+
+        limit = 10
+        if context.args:
+            try:
+                limit = min(int(context.args[0]), 30)
+            except ValueError:
+                pass
+
+        trades = self.system.portfolio.get_trade_history(limit=limit)
+        if not trades:
+            await update.message.reply_text("매매 내역이 없습니다.")
+            return
+
+        msg = f"📋 <b>최근 매매 내역</b> (최대 {limit}건)\n\n"
+        for t in trades:
+            emoji = "🟢" if t["action"] == "BUY" else "🔴"
+            mode_tag = "[SIM]" if t.get("mode", "simulation") == "simulation" else "[LIVE]"
+            ts = t["timestamp"][:16].replace("T", " ")
+            pnl_str = ""
+            if t.get("pnl") is not None:
+                pnl_str = f" | 손익: {t['pnl']:+,.0f}원"
+            msg += (
+                f"{emoji} {mode_tag} {ts}\n"
+                f"  {t['action']} {t['name']}({t['ticker']})\n"
+                f"  {t['quantity']:,}주 × {t['price']:,.0f}원{pnl_str}\n\n"
+            )
+
+        await update.message.reply_html(msg)
 
     async def _handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """인라인 버튼 콜백 처리 (주문 승인/거부)."""

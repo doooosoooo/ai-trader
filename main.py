@@ -35,7 +35,7 @@ logger.add(LOG_DIR / "errors" / "error_{time:YYYY-MM-DD}.log", rotation="1 day",
 from core.config_manager import ConfigManager
 from core.market_data import KISAuth, MarketDataClient
 from core.safety_guard import SafetyGuard
-from core.circuit_breaker import CircuitBreaker
+from core.circuit_breaker import CircuitBreaker, CircuitState
 from core.llm_engine import LLMEngine
 from core.ml_engine import MLEngine
 from core.portfolio import Portfolio
@@ -103,7 +103,7 @@ class TradingSystem:
         )
         self.llm_engine = LLMEngine(settings)
         self.ml_engine = MLEngine(settings)
-        self.portfolio = Portfolio()
+        self.portfolio = Portfolio(mode=settings.get("mode", "simulation"))
 
         # 초기 자본금 설정 (포트폴리오가 비어있으면)
         if self.portfolio.total_asset == 0:
@@ -200,7 +200,11 @@ class TradingSystem:
 
     def cycle_data_collection(self):
         """데이터 수집 사이클."""
-        if self._paused or not self.circuit_breaker.is_trading_allowed:
+        if self._paused:
+            logger.info("Data collection skipped: paused")
+            return
+        if not self.circuit_breaker.is_trading_allowed:
+            logger.info(f"Data collection skipped: circuit={self.circuit_breaker.state.value}")
             return
 
         held_tickers = list(self.portfolio.positions.keys())
@@ -209,7 +213,7 @@ class TradingSystem:
         # 포트폴리오 가격 업데이트
         self.portfolio.update_prices(prices)
 
-        logger.debug(f"Data collected: {len(prices)} tickers")
+        logger.info(f"Data collected: {len(prices)} tickers")
 
     def cycle_llm_analysis(self):
         """LLM 분석 사이클 — 핵심 매매 판단 루프."""
@@ -218,8 +222,11 @@ class TradingSystem:
             return
 
         if not self.circuit_breaker.is_trading_allowed:
-            logger.info(f"Circuit breaker active ({self.circuit_breaker.state}), skipping analysis")
+            logger.info(f"Circuit breaker EMERGENCY ({self.circuit_breaker.state}), skipping analysis")
             return
+
+        if self.circuit_breaker.state != CircuitState.NORMAL:
+            logger.info(f"Circuit breaker {self.circuit_breaker.state.value} — analysis with restricted trading")
 
         try:
             # 1. 데이터 수집
@@ -353,12 +360,64 @@ class TradingSystem:
             self.sim_tracker.start_session()
 
     def on_market_close(self):
-        """장 마감 후 정리."""
+        """장 마감 후 정리 + 일일 리포트 발송."""
         logger.info("Market closed — running cleanup")
         self.portfolio.save_daily_snapshot()
 
         if self.config_manager.get_mode() == "simulation":
             self.sim_tracker.save_report()
+
+        # 일일 리포트 텔레그램 발송
+        try:
+            self._send_daily_report()
+        except Exception as e:
+            logger.error(f"Daily report failed: {e}")
+
+    def _send_daily_report(self):
+        """장 마감 일일 손익 리포트 생성 및 발송."""
+        summary = self.portfolio.get_summary()
+        trades = self.portfolio.get_today_trades()
+        mode = self.config_manager.get_mode()
+        mode_label = "🔵시뮬레이션" if mode == "simulation" else "🔴실거래"
+
+        # 오늘 실현 손익
+        realized_pnl = sum(t.get("pnl", 0) or 0 for t in trades)
+        buy_count = sum(1 for t in trades if t["action"] == "BUY")
+        sell_count = sum(1 for t in trades if t["action"] == "SELL")
+
+        # 보유 종목 평가 손익
+        unrealized_pnl = sum(
+            p.pnl for p in self.portfolio.positions.values()
+        )
+
+        msg = (
+            f"📊 <b>일일 리포트</b> ({mode_label})\n"
+            f"{'─' * 26}\n\n"
+            f"<b>자산 현황</b>\n"
+            f"  총자산: {summary['total_asset']:,.0f}원\n"
+            f"  현금: {summary['cash']:,.0f}원 ({summary['cash_ratio']})\n"
+            f"  평가금: {summary['invested']:,.0f}원\n\n"
+            f"<b>오늘 매매</b>\n"
+            f"  매수 {buy_count}건 / 매도 {sell_count}건\n"
+            f"  실현손익: {realized_pnl:+,.0f}원\n\n"
+            f"<b>보유 종목 평가</b>\n"
+        )
+
+        for pos in self.portfolio.positions.values():
+            pnl_emoji = "📈" if pos.pnl > 0 else "📉" if pos.pnl < 0 else "➡️"
+            msg += (
+                f"  {pnl_emoji} {pos.name}({pos.ticker})\n"
+                f"    {pos.quantity}주 | 매입 {pos.avg_price:,.0f} → 현재 {pos.current_price:,.0f}\n"
+                f"    평가손익: {pos.pnl:+,.0f}원 ({pos.pnl_pct:+.2%})\n"
+            )
+
+        msg += (
+            f"\n{'─' * 26}\n"
+            f"<b>미실현손익: {unrealized_pnl:+,.0f}원</b>\n"
+            f"<b>총손익(누적): {summary['total_pnl']:,.0f}원 ({summary['total_pnl_pct']})</b>"
+        )
+
+        self.telegram.send_alert_sync("daily_report", msg)
 
     # --- 공개 API ---
 

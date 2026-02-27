@@ -1,9 +1,8 @@
-"""뉴스 헤드라인 수집 — 네이버 금융 RSS 기반."""
+"""뉴스 헤드라인 수집 — 네이버 금융 API + 뉴스 섹션."""
 
+import html
 import re
-import xml.etree.ElementTree as ET
 from datetime import datetime
-from pathlib import Path
 
 import requests
 from loguru import logger
@@ -14,51 +13,52 @@ class NewsCollector:
 
     def __init__(self):
         self.headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; AITrader/1.0)",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         }
 
     def collect_stock_news(self, ticker: str, count: int = 10) -> list[dict]:
-        """종목 관련 뉴스 수집 (네이버 금융)."""
-        url = f"https://finance.naver.com/item/news_news.naver?code={ticker}&page=1"
+        """종목 관련 뉴스 수집 (네이버 모바일 주식 API)."""
+        url = f"https://m.stock.naver.com/api/news/stock/{ticker}?pageSize={count}"
         try:
             resp = requests.get(url, headers=self.headers, timeout=10)
             resp.raise_for_status()
-            # 간단한 파싱 — 제목 추출
-            titles = re.findall(
-                r'class="tit">\s*<a[^>]*>([^<]+)</a>', resp.text
-            )
+            data = resp.json()
+
             news = []
-            for title in titles[:count]:
-                title = title.strip()
-                if title:
-                    news.append({
-                        "title": title,
-                        "ticker": ticker,
-                        "source": "naver",
-                        "collected_at": datetime.now().isoformat(),
-                    })
+            for group in data:
+                for item in group.get("items", []):
+                    title = html.unescape(item.get("title", "")).strip()
+                    if title:
+                        news.append({
+                            "title": title,
+                            "ticker": ticker,
+                            "source": item.get("officeName", "naver"),
+                            "datetime": item.get("datetime", ""),
+                            "collected_at": datetime.now().isoformat(),
+                        })
+
             logger.info(f"Collected {len(news)} news for {ticker}")
-            return news
+            return news[:count]
         except Exception as e:
             logger.warning(f"News collection failed for {ticker}: {e}")
             return []
 
     def collect_market_news(self, count: int = 15) -> list[dict]:
-        """시장 전체 뉴스 수집."""
-        url = "https://finance.naver.com/news/mainnews.naver"
+        """시장 전체 뉴스 수집 (네이버 뉴스 증권 섹션)."""
+        url = "https://news.naver.com/breakingnews/section/101/258"
         try:
             resp = requests.get(url, headers=self.headers, timeout=10)
             resp.raise_for_status()
             titles = re.findall(
-                r'class="articleSubject">\s*<a[^>]*title="([^"]+)"', resp.text
+                r'<strong class="sa_text_strong">([^<]+)</strong>', resp.text
             )
             news = []
             for title in titles[:count]:
-                title = title.strip()
+                title = html.unescape(title.strip())
                 if title:
                     news.append({
                         "title": title,
-                        "source": "naver_market",
+                        "source": "naver_economy",
                         "collected_at": datetime.now().isoformat(),
                     })
             logger.info(f"Collected {len(news)} market news")
@@ -75,6 +75,7 @@ class NewsCollector:
         lines = []
         for n in news_list[:20]:
             ticker_info = f"[{n['ticker']}] " if n.get("ticker") else ""
-            lines.append(f"- {ticker_info}{n['title']}")
+            source = f" ({n['source']})" if n.get("source") else ""
+            lines.append(f"- {ticker_info}{n['title']}{source}")
 
         return "\n".join(lines)

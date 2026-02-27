@@ -12,6 +12,22 @@ import requests
 from loguru import logger
 
 
+def _safe_int(val, default=0):
+    """빈 문자열/None도 안전하게 int 변환."""
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def _safe_float(val, default=0.0):
+    """빈 문자열/None도 안전하게 float 변환."""
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
 class KISAuth:
     """KIS API 인증 관리 — 토큰 발급 및 갱신."""
 
@@ -132,16 +148,16 @@ class MarketDataClient:
         return {
             "ticker": ticker,
             "name": output.get("hts_kor_isnm", ""),
-            "price": int(output.get("stck_prpr", 0)),
-            "change_pct": float(output.get("prdy_ctrt", 0)),
-            "volume": int(output.get("acml_vol", 0)),
-            "high": int(output.get("stck_hgpr", 0)),
-            "low": int(output.get("stck_lwpr", 0)),
-            "open": int(output.get("stck_oprc", 0)),
-            "prev_close": int(output.get("stck_sdpr", 0)),
-            "market_cap": int(output.get("hts_avls", 0)),
-            "per": float(output.get("per", 0)),
-            "pbr": float(output.get("pbr", 0)),
+            "price": _safe_int(output.get("stck_prpr", 0)),
+            "change_pct": _safe_float(output.get("prdy_ctrt", 0)),
+            "volume": _safe_int(output.get("acml_vol", 0)),
+            "high": _safe_int(output.get("stck_hgpr", 0)),
+            "low": _safe_int(output.get("stck_lwpr", 0)),
+            "open": _safe_int(output.get("stck_oprc", 0)),
+            "prev_close": _safe_int(output.get("stck_sdpr", 0)),
+            "market_cap": _safe_int(output.get("hts_avls", 0)),
+            "per": _safe_float(output.get("per", 0)),
+            "pbr": _safe_float(output.get("pbr", 0)),
             "timestamp": datetime.now().isoformat(),
         }
 
@@ -167,18 +183,15 @@ class MarketDataClient:
 
         records = []
         for item in data.get("output2", [])[:count]:
-            try:
-                records.append({
-                    "date": item.get("stck_bsop_date", ""),
-                    "open": int(item.get("stck_oprc", 0)),
-                    "high": int(item.get("stck_hgpr", 0)),
-                    "low": int(item.get("stck_lwpr", 0)),
-                    "close": int(item.get("stck_clpr", 0)),
-                    "volume": int(item.get("acml_vol", 0)),
-                    "amount": int(item.get("acml_tr_pbmn", 0)),
-                })
-            except (ValueError, TypeError):
-                continue
+            records.append({
+                "date": item.get("stck_bsop_date", ""),
+                "open": _safe_int(item.get("stck_oprc", 0)),
+                "high": _safe_int(item.get("stck_hgpr", 0)),
+                "low": _safe_int(item.get("stck_lwpr", 0)),
+                "close": _safe_int(item.get("stck_clpr", 0)),
+                "volume": _safe_int(item.get("acml_vol", 0)),
+                "amount": _safe_int(item.get("acml_tr_pbmn", 0)),
+            })
 
         return sorted(records, key=lambda x: x["date"])
 
@@ -199,17 +212,14 @@ class MarketDataClient:
 
         records = []
         for item in data.get("output2", []):
-            try:
-                records.append({
-                    "time": item.get("stck_cntg_hour", ""),
-                    "open": int(item.get("stck_oprc", 0)),
-                    "high": int(item.get("stck_hgpr", 0)),
-                    "low": int(item.get("stck_lwpr", 0)),
-                    "close": int(item.get("stck_prpr", 0)),
-                    "volume": int(item.get("cntg_vol", 0)),
-                })
-            except (ValueError, TypeError):
-                continue
+            records.append({
+                "time": item.get("stck_cntg_hour", ""),
+                "open": _safe_int(item.get("stck_oprc", 0)),
+                "high": _safe_int(item.get("stck_hgpr", 0)),
+                "low": _safe_int(item.get("stck_lwpr", 0)),
+                "close": _safe_int(item.get("stck_prpr", 0)),
+                "volume": _safe_int(item.get("cntg_vol", 0)),
+            })
 
         return records
 
@@ -230,9 +240,9 @@ class MarketDataClient:
         # 첫 번째 항목이 당일 데이터
         today = output[0] if output else {}
         return {
-            "foreign_net": int(today.get("frgn_ntby_qty", 0)),
-            "institution_net": int(today.get("orgn_ntby_qty", 0)),
-            "individual_net": int(today.get("prsn_ntby_qty", 0)),
+            "foreign_net": _safe_int(today.get("frgn_ntby_qty", 0)),
+            "institution_net": _safe_int(today.get("orgn_ntby_qty", 0)),
+            "individual_net": _safe_int(today.get("prsn_ntby_qty", 0)),
         }
 
     def get_kospi_index(self) -> dict:
@@ -246,7 +256,7 @@ class MarketDataClient:
         data = self._get(path, tr_id, params)
         output = data.get("output", {})
         return {
-            "index": float(output.get("bstp_nmix_prpr", 0)),
-            "change_pct": float(output.get("bstp_nmix_prdy_ctrt", 0)),
-            "volume": int(output.get("acml_vol", 0)),
+            "index": _safe_float(output.get("bstp_nmix_prpr", 0)),
+            "change_pct": _safe_float(output.get("bstp_nmix_prdy_ctrt", 0)),
+            "volume": _safe_int(output.get("acml_vol", 0)),
         }

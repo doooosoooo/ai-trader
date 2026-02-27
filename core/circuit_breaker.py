@@ -40,7 +40,8 @@ class CircuitBreaker:
 
     @property
     def is_trading_allowed(self) -> bool:
-        return self.state == CircuitState.NORMAL
+        """분석 + 매매 가능 여부. EMERGENCY에서만 전체 중단."""
+        return self.state != CircuitState.EMERGENCY
 
     @property
     def is_buy_allowed(self) -> bool:

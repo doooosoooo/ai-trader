@@ -109,9 +109,9 @@ class TradingScheduler:
         func_name = getattr(func, '__name__', str(func))
 
         async def wrapper():
-            logger.debug(f"Job triggered: {func_name}")
+            logger.info(f"Job triggered: {func_name}")
             if not self._is_trading_hours():
-                logger.debug(f"Outside trading hours, skipping {func_name}")
+                logger.info(f"Outside trading hours, skipping {func_name}")
                 return
 
             try:
