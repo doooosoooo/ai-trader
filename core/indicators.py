@@ -151,22 +151,40 @@ def get_indicator_summary(df: pd.DataFrame, params: dict | None = None) -> dict:
     else:
         bb_signal = f"밴드내({bb_pct:.1%})"
 
+    def _safe_int(val, default=0):
+        try:
+            import math
+            if val is None or (isinstance(val, float) and math.isnan(val)):
+                return default
+            return int(val)
+        except (ValueError, TypeError):
+            return default
+
+    def _safe_round(val, ndigits=1, default=0.0):
+        try:
+            import math
+            if val is None or (isinstance(val, float) and math.isnan(val)):
+                return default
+            return round(val, ndigits)
+        except (ValueError, TypeError):
+            return default
+
     return {
-        "price": int(latest.get("close", 0)),
-        "change_1d": f"{latest.get('return_1d', 0):.2%}",
-        "ma5": int(latest.get("ma5", 0)),
-        "ma20": int(latest.get("ma20", 0)),
-        "ma60": int(latest.get("ma60", 0)),
-        "rsi": round(rsi_val, 1),
+        "price": _safe_int(latest.get("close", 0)),
+        "change_1d": f"{latest.get('return_1d', 0) or 0:.2%}",
+        "ma5": _safe_int(latest.get("ma5", 0)),
+        "ma20": _safe_int(latest.get("ma20", 0)),
+        "ma60": _safe_int(latest.get("ma60", 0)),
+        "rsi": _safe_round(rsi_val, 1),
         "rsi_signal": rsi_signal,
         "macd_signal": macd_signal,
-        "macd_hist": round(macd_hist, 2),
+        "macd_hist": _safe_round(macd_hist, 2),
         "bb_signal": bb_signal,
-        "volume_ratio": round(vol_ratio, 2),
+        "volume_ratio": _safe_round(vol_ratio, 2),
         "volume_signal": vol_signal,
         "golden_cross": bool(latest.get("golden_cross", False)),
         "dead_cross": bool(latest.get("dead_cross", False)),
-        "adx": round(latest.get("adx", 0), 1),
-        "atr": round(latest.get("atr", 0), 1),
-        "volatility_20d": f"{latest.get('volatility_20d', 0):.1%}",
+        "adx": _safe_round(latest.get("adx", 0), 1),
+        "atr": _safe_round(latest.get("atr", 0), 1),
+        "volatility_20d": f"{latest.get('volatility_20d', 0) or 0:.1%}",
     }

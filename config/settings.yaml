@@ -39,7 +39,7 @@ llm:
 # 증권사 API
 broker:
   provider: "kis"
-  account_type: "virtual"          # virtual (모의) | real (실전)
+  account_type: "real"             # virtual (모의) | real (실전) — simulation 모드면 주문 안 나감
   base_url_virtual: "https://openapivts.koreainvestment.com:29443"
   base_url_real: "https://openapi.koreainvestment.com:9443"
   ws_url_virtual: "ws://ops.koreainvestment.com:31000"

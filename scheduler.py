@@ -106,17 +106,21 @@ class TradingScheduler:
 
     def _safe_run(self, func):
         """에러가 발생해도 스케줄러가 멈추지 않도록 래핑."""
+        func_name = getattr(func, '__name__', str(func))
+
         async def wrapper():
+            logger.debug(f"Job triggered: {func_name}")
             if not self._is_trading_hours():
+                logger.debug(f"Outside trading hours, skipping {func_name}")
                 return
 
             try:
                 if asyncio.iscoroutinefunction(func):
                     await func()
                 else:
-                    func()
+                    await asyncio.get_event_loop().run_in_executor(None, func)
             except Exception as e:
-                logger.error(f"Scheduled job failed [{func.__name__}]: {e}")
+                logger.error(f"Scheduled job failed [{func_name}]: {e}")
 
         return wrapper
 

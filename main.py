@@ -27,7 +27,8 @@ LOG_DIR.mkdir(exist_ok=True)
 (LOG_DIR / "reviews").mkdir(exist_ok=True)
 
 logger.remove()
-logger.add(sys.stdout, level="INFO", format="<green>{time:HH:mm:ss}</green> | <level>{level: <7}</level> | {message}")
+logger.add(sys.stdout, level="INFO", format="<green>{time:HH:mm:ss}</green> | <level>{level: <7}</level> | {message}", filter=lambda record: record["level"].no < 40)
+logger.add(sys.stderr, level="ERROR", format="<red>{time:HH:mm:ss}</red> | <level>{level: <7}</level> | {message}")
 logger.add(LOG_DIR / "app_{time:YYYY-MM-DD}.log", rotation="1 day", retention="30 days", level="DEBUG")
 logger.add(LOG_DIR / "errors" / "error_{time:YYYY-MM-DD}.log", rotation="1 day", retention="60 days", level="ERROR")
 
@@ -45,6 +46,37 @@ from review.daily_review import DailyReviewer
 from review.strategy_evaluator import StrategyEvaluator
 from simulation.simulator import SimulationTracker
 from scheduler import TradingScheduler
+
+
+# 종목코드 → 회사명 매핑
+TICKER_NAMES: dict[str, str] = {
+    "005930": "삼성전자",
+    "000660": "SK하이닉스",
+    "373220": "LG에너지솔루션",
+    "006400": "삼성SDI",
+    "035420": "NAVER",
+    "035720": "카카오",
+    "051910": "LG화학",
+    "005490": "POSCO홀딩스",
+    "105560": "KB금융",
+    "055550": "신한지주",
+    "003670": "포스코퓨처엠",
+    "247540": "에코프로비엠",
+    "068270": "셀트리온",
+    "207940": "삼성바이오로직스",
+    "000270": "기아",
+    "005380": "현대차",
+    "012330": "현대모비스",
+    "066570": "LG전자",
+    "028260": "삼성물산",
+    "003550": "LG",
+}
+
+
+def ticker_display(ticker: str) -> str:
+    """종목코드를 '회사명(코드)' 형태로 변환."""
+    name = TICKER_NAMES.get(ticker, "")
+    return f"{name}({ticker})" if name else ticker
 
 
 class TradingSystem:
@@ -104,7 +136,11 @@ class TradingSystem:
         self._running = False
         self._watchlist = self._get_watchlist()
 
-        logger.info(f"System initialized | Mode: {self.config_manager.get_mode()} | Watchlist: {self._watchlist}")
+        # 시작 시 히스토리 데이터 사전 수집
+        self._prefetch_historical_data()
+
+        watchlist_display = [ticker_display(t) for t in self._watchlist]
+        logger.info(f"System initialized | Mode: {self.config_manager.get_mode()} | Watchlist: {watchlist_display}")
 
     def _get_watchlist(self) -> list[str]:
         """전략에서 관심 종목 추출."""
@@ -116,9 +152,49 @@ class TradingSystem:
             tickers = ["005930", "000660", "373220", "006400"]
         return list(set(tickers))
 
+    def _prefetch_historical_data(self):
+        """시작 시 관심종목 + 보유종목의 히스토리 데이터가 부족하면 사전 수집."""
+        import time
+        held = list(self.portfolio.positions.keys())
+        all_tickers = list(set(self._watchlist + held))
+        min_bars = 120  # 지표 계산에 필요한 최소 일수
+
+        for ticker in all_tickers:
+            stored = self.data_pipeline.price_collector.get_stored_daily(ticker, min_bars)
+            if len(stored) < 60:
+                logger.info(f"Prefetching historical data for {ticker_display(ticker)} ({len(stored)} bars → {min_bars})")
+                try:
+                    self.data_pipeline.price_collector.collect_daily(ticker, days=min_bars)
+                    time.sleep(0.5)  # API 부하 방지
+                except Exception as e:
+                    logger.warning(f"Prefetch failed for {ticker}: {e}")
+            else:
+                logger.debug(f"{ticker_display(ticker)}: {len(stored)} bars in DB, skipping prefetch")
+
     def _notify(self, level: str = "", message: str = ""):
         """Telegram 알림 (동기 래퍼)."""
         self.telegram.send_alert_sync(level, message)
+
+    @staticmethod
+    def _format_trade_msg(trade: dict) -> str:
+        """매매 결과를 텔레그램 메시지로 포맷."""
+        action = trade.get("action", "")
+        emoji = "🟢" if action == "BUY" else "🔴"
+        name = trade.get("name", trade.get("ticker", ""))
+        ticker = trade.get("ticker", "")
+        msg = (
+            f"{emoji} {action} {name}({ticker})\n"
+            f"수량: {trade.get('quantity', 0):,}주 @ {trade.get('price', 0):,.0f}원\n"
+            f"금액: {trade.get('amount', 0):,.0f}원"
+        )
+        if trade.get("pnl") is not None:
+            pnl = trade["pnl"]
+            pnl_emoji = "📈" if pnl > 0 else "📉"
+            msg += f"\n손익: {pnl_emoji} {pnl:,.0f}원 ({trade.get('pnl_pct', '')})"
+        msg += f"\n상태: {trade.get('status', '')}"
+        if trade.get("reason"):
+            msg += f"\n사유: {trade['reason']}"
+        return msg
 
     # --- 스케줄러 콜백 ---
 
@@ -219,10 +295,12 @@ class TradingSystem:
                         if self.config_manager.get_mode() == "simulation":
                             self.sim_tracker.record_trade(result)
 
-                        # Telegram 알림
-                        asyncio.get_event_loop().create_task(
-                            self.telegram.send_trade_alert(result)
-                        ) if self.telegram.enabled else None
+                        # Telegram 알림 (동기 래퍼 사용 — executor 스레드 호환)
+                        if self.telegram.enabled:
+                            self.telegram.send_alert_sync(
+                                "trade_executed",
+                                self._format_trade_msg(result),
+                            )
 
             logger.info(
                 f"Analysis cycle complete | "
@@ -352,7 +430,7 @@ class TradingSystem:
             "cash": self.portfolio.cash,
             "total_pnl_pct": f"{self.portfolio.total_pnl_pct:.2%}",
             "num_positions": len(self.portfolio.positions),
-            "watchlist": self._watchlist,
+            "watchlist": [ticker_display(t) for t in self._watchlist],
             "llm_daily_cost": self.llm_engine.get_daily_cost(),
             "circuit_breaker": self.circuit_breaker.get_status(),
         }
@@ -369,9 +447,10 @@ class TradingSystem:
 
         # 시작 알림
         mode = self.config_manager.get_mode()
+        watchlist_str = "\n".join(f"  • {ticker_display(t)}" for t in self._watchlist)
         await self.telegram.send_alert(
             "signal_generated",
-            f"🚀 AI Trader 시작\n모드: {mode}\n관심종목: {', '.join(self._watchlist)}",
+            f"🚀 AI Trader 시작\n모드: {mode}\n\n관심종목:\n{watchlist_str}",
         )
 
         logger.info("AI Trading System is running")

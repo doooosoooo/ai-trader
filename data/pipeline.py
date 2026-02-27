@@ -49,8 +49,11 @@ class DataPipeline:
                 # 현재가
                 current = self.price_collector.collect_current_price(ticker)
 
-                # 일봉 + 지표
-                daily_df = self.price_collector.collect_daily(ticker, days=120)
+                # 일봉 수집 (API → DB 저장)
+                self.price_collector.collect_daily(ticker, days=120)
+
+                # DB에서 저장된 전체 데이터로 지표 계산 (API 실패해도 기존 데이터 활용)
+                daily_df = self.price_collector.get_stored_daily(ticker, days=120)
                 if not daily_df.empty:
                     daily_df = calculate_all_indicators(daily_df, self._indicator_params)
                     indicator_summary = get_indicator_summary(daily_df, self._indicator_params)

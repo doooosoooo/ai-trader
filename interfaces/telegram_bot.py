@@ -220,6 +220,8 @@ class TelegramBot:
             return
 
         status = self.system.get_status()
+        watchlist = status.get('watchlist', [])
+        watchlist_str = ", ".join(watchlist) if watchlist else "없음"
         msg = (
             f"📊 <b>시스템 상태</b>\n\n"
             f"모드: {status.get('mode', 'unknown')}\n"
@@ -227,6 +229,7 @@ class TelegramBot:
             f"총자산: {status.get('total_asset', 0):,.0f}원\n"
             f"수익률: {status.get('total_pnl_pct', '0%')}\n"
             f"보유종목: {status.get('num_positions', 0)}개\n"
+            f"관심종목: {watchlist_str}\n"
             f"LLM 일일비용: ${status.get('llm_daily_cost', 0):.2f}\n"
         )
         await update.message.reply_html(msg)

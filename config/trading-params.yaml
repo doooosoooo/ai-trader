@@ -1,27 +1,27 @@
 holding_period_days:
-  min: 7
-  max: 30
-take_profit_pct: 0.06
-stop_loss_pct: -0.05
-trailing_stop_pct: 0.04
-position_size_pct: 0.04
-max_cash_ratio: 0.65
+  min: 5
+  max: 20
+take_profit_pct: 0.12
+stop_loss_pct: -0.07
+trailing_stop_pct: 0.06
+position_size_pct: 0.07
+max_cash_ratio: 0.5
 indicators:
-  rsi_oversold: 25
-  rsi_overbought: 60
-  volume_surge_multiplier: 3.0
-  ma_short: 10
-  ma_long: 60
+  rsi_oversold: 30
+  rsi_overbought: 70
+  volume_surge_multiplier: 2.0
+  ma_short: 20
+  ma_long: 120
   macd_fast: 12
   macd_slow: 26
   macd_signal: 9
   bb_period: 20
   bb_std: 2.0
 portfolio_targets:
-  monthly_target_pct: 1.5
+  monthly_target_pct: 3.0
   yearly_target_pct: 50.0
-  on_target_reached: defensive
+  on_target_reached: maintain
   on_underperform: maintain
 market_conditions:
-  vix_high_threshold: 22
+  vix_high_threshold: 25
   kospi_drop_threshold: -0.02
