@@ -35,6 +35,7 @@ class TelegramBot:
         self.system = system_ref  # TradingSystem 참조
         self._app = None
         self._pending_confirmations: dict[str, dict] = {}
+        self._pending_param_changes: dict[str, dict] = {}  # force param 확인 대기
 
         if not TELEGRAM_AVAILABLE:
             self.enabled = False
@@ -61,6 +62,7 @@ class TelegramBot:
         self._app.add_handler(CommandHandler("analysis", self._cmd_analysis))
         self._app.add_handler(CommandHandler("screen", self._cmd_screen))
         self._app.add_handler(CommandHandler("backtest", self._cmd_backtest))
+        self._app.add_handler(CommandHandler("param", self._cmd_param))
         self._app.add_handler(CallbackQueryHandler(self._handle_callback))
         self._app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text))
 
@@ -214,6 +216,7 @@ class TelegramBot:
             "/screen - 종목 스크리닝 결과 (now: 즉시 실행)\n"
             "/backtest - 백테스트 (compare/optimize)\n"
             "/strategy - 현재 전략 + 스크리닝 종목\n"
+            "/param - 파라미터 조회/변경 (범위 초과 강제 적용 가능)\n"
             "/pause - 거래 일시 중지\n"
             "/resume - 거래 재개\n"
             "/mode <simulation|live> - 모드 전환\n"
@@ -587,12 +590,147 @@ class TelegramBot:
             logger.error(f"Backtest failed: {e}")
             await update.message.reply_text(f"백테스트 실패: {e}")
 
+    async def _cmd_param(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """트레이딩 파라미터 직접 조회/변경.
+
+        /param — 현재 파라미터 목록
+        /param <key> <value> — 파라미터 변경 (범위 초과 시 확인 요청)
+        """
+        if not await self._check_auth(update):
+            return
+        if not self.system:
+            await update.message.reply_text("시스템 미연결")
+            return
+
+        args = context.args or []
+
+        # /param → 현재 파라미터 목록
+        if not args:
+            params = self.system.config_manager.get_all_params_flat()
+            limits = self.system.config_manager.safety_rules.get("adjustable_limits", {})
+            msg = "⚙️ <b>트레이딩 파라미터</b>\n\n"
+            for key, val in params.items():
+                limit_key = key.replace(".", "_")
+                limit = limits.get(limit_key)
+                if limit:
+                    range_str = f" [{limit['min']}~{limit['max']}]"
+                else:
+                    range_str = " [제한없음]"
+                msg += f"<code>{key}</code>: {val}{range_str}\n"
+            msg += (
+                f"\n{'─' * 24}\n"
+                "변경: /param <키> <값>\n"
+                "예: /param take_profit_pct 0.20\n"
+                "범위 초과 시 확인 후 강제 적용 가능"
+            )
+            await update.message.reply_html(msg)
+            return
+
+        # /param <key> <value>
+        if len(args) < 2:
+            await update.message.reply_text(
+                "사용법: /param <키> <값>\n"
+                "예: /param take_profit_pct 0.20\n"
+                "목록 보기: /param"
+            )
+            return
+
+        param_key = args[0]
+        try:
+            value = float(args[1])
+            # 정수로 표현 가능하면 정수로
+            if value == int(value) and "." not in args[1]:
+                value = int(value)
+        except ValueError:
+            await update.message.reply_text(f"숫자 값이 필요합니다: {args[1]}")
+            return
+
+        # 현재값 확인
+        current = self.system.config_manager.get_all_params_flat()
+        if param_key not in current:
+            await update.message.reply_text(
+                f"존재하지 않는 파라미터: {param_key}\n"
+                "/param 으로 목록을 확인하세요."
+            )
+            return
+
+        old_value = current[param_key]
+
+        # 검증
+        in_whitelist, in_range, msg = self.system.config_manager.validate_and_describe(param_key, value)
+
+        if in_whitelist and in_range:
+            # 정상 범위 내 → 즉시 적용
+            ok, result_msg, _ = self.system.config_manager.force_set_param(param_key, value)
+            if ok:
+                await update.message.reply_html(
+                    f"✅ <b>파라미터 변경 완료</b>\n\n"
+                    f"<code>{param_key}</code>: {old_value} → {value}"
+                )
+            else:
+                await update.message.reply_text(f"변경 실패: {result_msg}")
+            return
+
+        # 범위 초과 또는 비허용 → 경고 + 확인 버튼
+        change_id = f"fp_{datetime.now().strftime('%H%M%S')}_{param_key.replace('.', '_')}"
+        self._pending_param_changes[change_id] = {
+            "param": param_key,
+            "value": value,
+            "old_value": old_value,
+        }
+
+        if not in_whitelist:
+            warning = f"⚠️ LLM 조정 허용 목록에 없는 파라미터입니다."
+        else:
+            warning = f"⚠️ 안전 범위 초과: {msg}"
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🔓 강제 적용", callback_data=f"force_param_{change_id}"),
+                InlineKeyboardButton("❌ 취소", callback_data=f"cancel_param_{change_id}"),
+            ]
+        ])
+
+        await update.message.reply_html(
+            f"⚠️ <b>범위 초과 파라미터 변경</b>\n\n"
+            f"<code>{param_key}</code>: {old_value} → {value}\n\n"
+            f"{warning}\n\n"
+            f"강제 적용하시겠습니까?",
+            reply_markup=keyboard,
+        )
+
     async def _handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """인라인 버튼 콜백 처리 (주문 승인/거부)."""
+        """인라인 버튼 콜백 처리 (주문 승인/거부 + 파라미터 강제 적용)."""
         query = update.callback_query
         await query.answer()
 
         data = query.data
+
+        # 파라미터 강제 적용
+        if data.startswith("force_param_"):
+            change_id = data.replace("force_param_", "")
+            pending = self._pending_param_changes.pop(change_id, None)
+            if not pending:
+                await query.edit_message_text("⏰ 요청이 만료되었습니다.")
+                return
+            ok, result_msg, _ = self.system.config_manager.force_set_param(
+                pending["param"], pending["value"]
+            )
+            if ok:
+                await query.edit_message_text(
+                    f"🔓 강제 적용 완료\n{pending['param']}: {pending['old_value']} → {pending['value']}"
+                )
+            else:
+                await query.edit_message_text(f"변경 실패: {result_msg}")
+            return
+
+        if data.startswith("cancel_param_"):
+            change_id = data.replace("cancel_param_", "")
+            self._pending_param_changes.pop(change_id, None)
+            await query.edit_message_text("❌ 파라미터 변경이 취소되었습니다.")
+            return
+
+        # 기존: 주문 승인/거부
         if data.startswith("approve_"):
             conf_id = data.replace("approve_", "")
             if conf_id in self._pending_confirmations:

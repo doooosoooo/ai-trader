@@ -166,6 +166,65 @@ class ConfigManager:
 
         return results
 
+    def get_all_params_flat(self) -> dict[str, Any]:
+        """trading-params를 플랫 키로 반환. 예: {'take_profit_pct': 0.12, 'indicators.rsi_oversold': 30}"""
+        result = {}
+
+        def _flatten(d: dict, prefix: str = "") -> None:
+            for k, v in d.items():
+                key = f"{prefix}.{k}" if prefix else k
+                if isinstance(v, dict):
+                    _flatten(v, key)
+                else:
+                    result[key] = v
+
+        _flatten(self._trading_params)
+        return result
+
+    def validate_and_describe(self, param: str, value: Any) -> tuple[bool, bool, str]:
+        """파라미터 검증 — 화이트리스트 + 범위 체크.
+
+        Returns:
+            (in_whitelist, in_range, message)
+            - in_whitelist=False: 허용 목록에 없음
+            - in_whitelist=True, in_range=False: 허용 목록에 있으나 범위 초과
+            - in_whitelist=True, in_range=True: 정상
+        """
+        limits = self._safety_rules.get("adjustable_limits", {})
+        limit_key = param.replace(".", "_")
+
+        if limit_key not in limits:
+            return False, False, f"안전 허용 목록에 없는 파라미터"
+
+        limit = limits[limit_key]
+        min_val = limit.get("min")
+        max_val = limit.get("max")
+        if min_val is not None and value < min_val:
+            return True, False, f"최소값 {min_val} 미만 (현재 입력: {value})"
+        if max_val is not None and value > max_val:
+            return True, False, f"최대값 {max_val} 초과 (현재 입력: {value})"
+
+        return True, True, "OK"
+
+    def force_set_param(self, param: str, value: Any) -> tuple[bool, str, Any]:
+        """검증 없이 강제로 파라미터 설정 (사용자 직접 명령용).
+
+        Returns:
+            (success, message, old_value)
+        """
+        parts = param.split(".")
+        target = self._trading_params
+        try:
+            for part in parts[:-1]:
+                target = target[part]
+            old_value = target.get(parts[-1])
+            target[parts[-1]] = value
+            self._save_yaml("trading-params.yaml", self._trading_params)
+            logger.info(f"Config force-set by user: {param}: {old_value} → {value}")
+            return True, f"{param}: {old_value} → {value}", old_value
+        except (KeyError, TypeError) as e:
+            return False, f"파라미터를 찾을 수 없습니다: {e}", None
+
     def get_mode(self) -> str:
         return self.get("system.mode", "simulation")
 
