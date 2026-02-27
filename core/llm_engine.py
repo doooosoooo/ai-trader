@@ -78,6 +78,7 @@ class LLMEngine:
         ml_predictions: dict | None = None,
         news_summary: str = "",
         macro_data: dict | None = None,
+        screening_context: str = "",
     ) -> dict:
         """시장 분석 및 매매 판단.
 
@@ -94,6 +95,7 @@ class LLMEngine:
             ml_predictions=ml_predictions or {},
             news_summary=news_summary,
             macro_data=macro_data or {},
+            screening_context=screening_context,
         )
 
         raw_response = self._call_llm(system_prompt, user_message)
@@ -232,18 +234,26 @@ BUY ratio: 매수할 비중, SELL ratio: 보유분 중 매도할 비율 (1.0 = �
         ml_predictions: dict,
         news_summary: str,
         macro_data: dict,
+        screening_context: str = "",
     ) -> str:
         parts = [
             "## 현재 전략",
             strategy,
             "",
+        ]
+
+        # 스크리닝 결과가 있으면 전략 바로 뒤에 삽입
+        if screening_context:
+            parts.extend([screening_context, ""])
+
+        parts.extend([
             "## 포트폴리오 현황",
             json.dumps(portfolio, ensure_ascii=False, indent=2),
             "",
             "## 시장 데이터 (관심 종목)",
             json.dumps(market_data, ensure_ascii=False, indent=2),
             "",
-        ]
+        ])
 
         if ml_predictions:
             parts.extend([

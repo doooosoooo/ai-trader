@@ -45,6 +45,7 @@ from interfaces.telegram_bot import TelegramBot
 from review.daily_review import DailyReviewer
 from review.strategy_evaluator import StrategyEvaluator
 from simulation.simulator import SimulationTracker
+from data.collectors.screener import StockScreener
 from scheduler import TradingScheduler
 
 
@@ -128,12 +129,17 @@ class TradingSystem:
         # Simulation
         self.sim_tracker = SimulationTracker(self.portfolio)
 
+        # Screener
+        screening_config = self.config_manager.load_yaml("screening-params.yaml")
+        self.screener = StockScreener(screening_config) if screening_config.get("screening", {}).get("enabled", True) else None
+
         # Scheduler
         self.trading_scheduler = TradingScheduler(self, settings)
 
         # State
         self._paused = False
         self._running = False
+        self._last_analysis: dict | None = None  # 마지막 LLM 분석 결과
         self._watchlist = self._get_watchlist()
 
         # 시작 시 히스토리 데이터 사전 수집
@@ -143,12 +149,24 @@ class TradingSystem:
         logger.info(f"System initialized | Mode: {self.config_manager.get_mode()} | Watchlist: {watchlist_display}")
 
     def _get_watchlist(self) -> list[str]:
-        """전략에서 관심 종목 추출."""
+        """스크리닝 결과 또는 전략에서 관심 종목 추출."""
+        # 스크리너 결과가 있으면 우선 사용
+        if self.screener:
+            result = self.screener.get_last_result()
+            if result and result.candidates:
+                held = list(self.portfolio.positions.keys())
+                watchlist = self.screener.get_watchlist(held_tickers=held, max_tickers=8)
+                if watchlist:
+                    # TICKER_NAMES 동적 확장
+                    for c in result.candidates:
+                        if c["ticker"] not in TICKER_NAMES and c.get("name"):
+                            TICKER_NAMES[c["ticker"]] = c["name"]
+                    return watchlist
+
+        # 폴백: 전략 파일에서 추출
         strategy = self.llm_engine.load_strategy()
-        # 6자리 종목코드 패턴 추출
         tickers = re.findall(r'\b(\d{6})\b', strategy)
         if not tickers:
-            # 기본 관심종목
             tickers = ["005930", "000660", "373220", "006400"]
         return list(set(tickers))
 
@@ -175,6 +193,58 @@ class TradingSystem:
         """Telegram 알림 (동기 래퍼)."""
         self.telegram.send_alert_sync(level, message)
 
+    def _format_analysis_msg(self, signal: dict, actions: list) -> str:
+        """LLM 분석 결과를 텔레그램 메시지로 포맷."""
+        now = datetime.now().strftime("%H:%M")
+        mode = self.config_manager.get_mode()
+        mode_tag = "[SIM]" if mode == "simulation" else "[LIVE]"
+
+        risk = signal.get("risk_assessment", "?")
+        risk_emoji = {"LOW": "🟢", "MEDIUM": "🟡", "HIGH": "🔴"}.get(risk, "⚪")
+        outlook = signal.get("market_outlook", "없음")
+        reasoning = signal.get("reasoning", "없음")
+
+        msg = (
+            f"📊 LLM 분석 결과 {mode_tag} [{now}]\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"{risk_emoji} 리스크: {risk}\n"
+            f"🔍 시장 전망: {outlook}\n"
+        )
+
+        # 종목별 판단
+        all_actions = signal.get("actions", [])
+        if all_actions:
+            msg += "\n📋 종목 판단:\n"
+            for a in all_actions:
+                action_type = a.get("type", "HOLD")
+                ticker = a.get("ticker", "")
+                name = a.get("name", ticker_display(ticker) if ticker else "")
+                reason = a.get("reason", "")
+                emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪"}.get(action_type, "⚪")
+                ratio_str = ""
+                if a.get("ratio"):
+                    ratio_str = f" ({a['ratio']:.0%})"
+                msg += f"  {emoji} {action_type} {name}{ratio_str}"
+                if reason:
+                    msg += f"\n     └ {reason}"
+                msg += "\n"
+        else:
+            msg += "\n📋 판단: 전종목 HOLD\n"
+
+        # 실행된 매매 수 (HOLD 제외)
+        executed = sum(1 for a in actions if a.get("type", "").upper() in ("BUY", "SELL"))
+        if executed > 0:
+            msg += f"\n⚡ 매매 실행: {executed}건"
+
+        # 판단 근거
+        if reasoning and reasoning != "없음":
+            # 너무 길면 자르기
+            if len(reasoning) > 200:
+                reasoning = reasoning[:200] + "..."
+            msg += f"\n\n💬 근거:\n{reasoning}"
+
+        return msg
+
     @staticmethod
     def _format_trade_msg(trade: dict) -> str:
         """매매 결과를 텔레그램 메시지로 포맷."""
@@ -197,6 +267,42 @@ class TradingSystem:
         return msg
 
     # --- 스케줄러 콜백 ---
+
+    def _build_screening_context(self) -> str:
+        """스크리닝 결과를 LLM 컨텍스트 문자열로 변환."""
+        if not self.screener:
+            return ""
+        result = self.screener.get_last_result()
+        if not result or not result.candidates:
+            return ""
+
+        lines = ["## 오늘의 스크리닝 결과 (자동 선별된 관심종목)"]
+        lines.append(f"분석 시간: {result.timestamp[:16]}")
+        lines.append(f"전체 {result.screening_stats.get('total_analyzed', 0)}종목 중 "
+                      f"{result.screening_stats.get('after_filter', 0)}종목 필터 통과 → "
+                      f"상위 {len(result.candidates)}종목 선정\n")
+        lines.append("| 순위 | 종목 | 종합점수 | 모멘텀 | 밸류 | 거래량 | 수급 | 기술적 | 등락률 |")
+        lines.append("|------|------|---------|--------|------|--------|------|--------|--------|")
+        for i, c in enumerate(result.candidates, 1):
+            lines.append(
+                f"| {i} | {c.get('name', '')}({c['ticker']}) "
+                f"| {c.get('composite_score', 0):.0f} "
+                f"| {c.get('momentum_score', 0):.0f} "
+                f"| {c.get('value_score', 0):.0f} "
+                f"| {c.get('volume_score', 0):.0f} "
+                f"| {c.get('flow_score', 0):.0f} "
+                f"| {c.get('technical_score', 0):.0f} "
+                f"| {c.get('change_pct', 0):+.1f}% |"
+            )
+        lines.append("")
+        lines.append("위 종목들은 멀티팩터 스코어링(모멘텀·밸류·거래량·수급·기술적 지표)으로 자동 선별되었습니다.")
+        lines.append("이 종목들을 중심으로 매매 판단을 내려주세요.")
+
+        if result.held_tickers_added:
+            held_names = [ticker_display(t) for t in result.held_tickers_added]
+            lines.append(f"\n보유 중인 종목(스크리닝 외 추가): {', '.join(held_names)}")
+
+        return "\n".join(lines)
 
     def cycle_data_collection(self):
         """데이터 수집 사이클."""
@@ -258,13 +364,15 @@ class TradingSystem:
                 "progress": f"{(current_pnl / monthly_target * 100):.0f}%" if monthly_target > 0 else "N/A",
             }
 
-            # 4. LLM 분석
+            # 4. LLM 분석 (스크리닝 결과를 전략 컨텍스트에 주입)
+            screening_context = self._build_screening_context()
             signal = self.llm_engine.analyze_market(
                 portfolio=portfolio_summary,
                 market_data=data.get("market_data", {}),
                 ml_predictions=ml_predictions,
                 news_summary=data.get("news_summary", ""),
                 macro_data=data.get("macro_data", {}),
+                screening_context=screening_context,
             )
             self.circuit_breaker.record_llm_success()
 
@@ -309,6 +417,19 @@ class TradingSystem:
                                 self._format_trade_msg(result),
                             )
 
+            # 8. 분석 결과 저장 + 텔레그램 전송
+            self._last_analysis = {
+                "signal": signal,
+                "actions": actions,
+                "timestamp": datetime.now().isoformat(),
+            }
+            if self.telegram.enabled:
+                try:
+                    analysis_msg = self._format_analysis_msg(signal, actions)
+                    self.telegram.send_alert_sync("llm_analysis", analysis_msg)
+                except Exception as e:
+                    logger.warning(f"Failed to send analysis to Telegram: {e}")
+
             logger.info(
                 f"Analysis cycle complete | "
                 f"Risk: {signal.get('risk_assessment', '?')} | "
@@ -317,7 +438,7 @@ class TradingSystem:
             )
 
         except Exception as e:
-            logger.error(f"LLM analysis cycle failed: {e}")
+            logger.exception(f"LLM analysis cycle failed: {e}")
             self.circuit_breaker.record_llm_failure()
 
     def cycle_news_check(self):
@@ -348,6 +469,79 @@ class TradingSystem:
 
         # 시스템 리소스 체크
         self.circuit_breaker.check_system_resources()
+
+    def cycle_screening(self):
+        """종목 스크리닝 사이클."""
+        if not self.screener:
+            logger.info("Screener disabled, skipping")
+            return
+
+        try:
+            held = list(self.portfolio.positions.keys())
+            result = self.screener.run_screening(held_tickers=held)
+
+            # 관심종목 갱신
+            self._watchlist = self._get_watchlist()
+
+            # 새 종목 히스토리 프리페치
+            self._prefetch_historical_data()
+
+            # 텔레그램 알림
+            if result.candidates:
+                msg = self._format_screening_msg(result)
+                self.telegram.send_alert_sync("screening_result", msg)
+
+            watchlist_display = [ticker_display(t) for t in self._watchlist]
+            logger.info(f"Screening complete | Watchlist: {watchlist_display}")
+
+        except Exception as e:
+            logger.error(f"Screening failed: {e}")
+
+    def _format_screening_msg(self, result) -> str:
+        """스크리닝 결과 텔레그램 메시지 포맷."""
+        ts = result.timestamp[:16].replace("T", " ")
+        stats = result.screening_stats
+        mode = self.config_manager.get_mode()
+        mode_tag = "[SIM]" if mode == "simulation" else "[LIVE]"
+
+        msg = (
+            f"🔍 <b>종목 스크리닝 결과</b> {mode_tag}\n"
+            f"⏰ {ts}\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"분석: {stats.get('total_analyzed', 0):,}종목 → "
+            f"필터: {stats.get('after_filter', 0)}종목 → "
+            f"선정: {len(result.candidates)}종목\n\n"
+        )
+
+        for i, c in enumerate(result.candidates[:8], 1):
+            name = c.get("name", c["ticker"])
+            score = c.get("composite_score", 0)
+            change = c.get("change_pct", 0)
+            ch_emoji = "📈" if change > 0 else ("📉" if change < 0 else "➡️")
+            msg += (
+                f"{i}. <b>{name}</b>({c['ticker']}) "
+                f"점수: {score:.0f} {ch_emoji}{change:+.1f}%\n"
+                f"   M:{c.get('momentum_score', 0):.0f} "
+                f"V:{c.get('value_score', 0):.0f} "
+                f"거:{c.get('volume_score', 0):.0f} "
+                f"수:{c.get('flow_score', 0):.0f} "
+                f"기:{c.get('technical_score', 0):.0f}\n"
+            )
+
+        if result.held_tickers_added:
+            held_names = [ticker_display(t) for t in result.held_tickers_added]
+            msg += f"\n📌 보유종목 추가: {', '.join(held_names)}"
+
+        # 시장 요약
+        kospi = result.market_summary.get("kospi", {})
+        if kospi:
+            msg += (
+                f"\n\n📊 KOSPI: 상승 {kospi.get('advancing', 0)} / "
+                f"하락 {kospi.get('declining', 0)} "
+                f"(평균 {kospi.get('avg_change_pct', 0):+.2f}%)"
+            )
+
+        return msg
 
     def on_market_open(self):
         """장 시작 전 초기화."""
@@ -449,6 +643,120 @@ class TradingSystem:
             return {"error": "no_data"}
         return self.ml_engine.predict(df)
 
+    def run_backtest(
+        self,
+        mode: str = "single",
+        strategy_name: str = "swing",
+        start_date: str = "",
+        end_date: str = "",
+    ) -> list[str]:
+        """백테스트/비교/최적화 실행 → 텔레그램 메시지 리스트 반환.
+
+        mode: "single" | "compare" | "optimize"
+        """
+        from simulation.backtest import Backtester
+        from simulation.strategies import STRATEGY_REGISTRY
+        from simulation.report import format_telegram_report, format_optimization_report
+
+        tickers = list(self._watchlist)
+        if not tickers:
+            return ["관심종목이 없어 백테스트를 실행할 수 없습니다."]
+
+        if not end_date:
+            from datetime import datetime as dt
+            end_date = dt.now().strftime("%Y%m%d")
+        if not start_date:
+            start_date = "20240301"
+
+        capital = self.portfolio.initial_capital or 10_000_000
+        bt = Backtester(initial_capital=capital)
+
+        # 데이터 부족 종목 자동 수집 (최소 400일)
+        import time
+        min_bars = 400
+        for ticker in tickers:
+            stored = self.data_pipeline.price_collector.get_stored_daily(ticker, min_bars)
+            if len(stored) < min_bars:
+                logger.info(f"Backtest: collecting historical data for {ticker_display(ticker)} ({len(stored)}/{min_bars})")
+                try:
+                    self.data_pipeline.price_collector.collect_historical(ticker, start_date, end_date)
+                    time.sleep(0.5)
+                except Exception as e:
+                    logger.warning(f"Backtest data collection failed for {ticker}: {e}")
+
+        messages = []
+
+        if mode == "single":
+            factory = STRATEGY_REGISTRY.get(strategy_name)
+            if not factory:
+                return [f"지원 전략: {list(STRATEGY_REGISTRY.keys())}"]
+            strategy = factory()
+            result = bt.run(tickers, strategy, start_date, end_date)
+            messages.append(format_telegram_report(result))
+
+        elif mode == "compare":
+            for name, factory in STRATEGY_REGISTRY.items():
+                strategy = factory()
+                result = bt.run(tickers, strategy, start_date, end_date)
+                messages.append(format_telegram_report(result))
+
+        elif mode == "optimize":
+            from simulation.optimizer import train_test_split
+
+            factory = STRATEGY_REGISTRY.get(strategy_name)
+            if not factory:
+                return [f"지원 전략: {list(STRATEGY_REGISTRY.keys())}"]
+
+            param_grid = {
+                "rsi_oversold": [25, 30, 35],
+                "take_profit_pct": [0.05, 0.10, 0.15],
+                "stop_loss_pct": [0.03, 0.05, 0.07],
+                "position_size_pct": [0.08, 0.10],
+            }
+
+            split_result = train_test_split(
+                bt, tickers, factory, param_grid, start_date, end_date,
+            )
+
+            if "error" in split_result:
+                return [f"최적화 실패: {split_result['error']}"]
+
+            bp = split_result["best_params"]
+            train_m = split_result["train_metrics"]
+            test_m = split_result["test_metrics"]
+            overfit = split_result["overfit_ratio"]
+
+            msg = (
+                f"🔧 <b>파라미터 최적화 결과: {strategy_name}</b>\n"
+                f"━━━━━━━━━━━━━━\n\n"
+                f"<b>최적 파라미터:</b>\n"
+            )
+            for k, v in bp.items():
+                if isinstance(v, float):
+                    msg += f"  {k}: {v:.2%}\n" if v < 1 else f"  {k}: {v}\n"
+                else:
+                    msg += f"  {k}: {v}\n"
+
+            msg += (
+                f"\n<b>Train 기간</b> ({split_result['train_period']})\n"
+                f"  수익률: {train_m.get('total_return', 0):+.2%}\n"
+                f"  샤프: {train_m.get('sharpe_ratio', 0):.2f}\n"
+                f"  MDD: -{train_m.get('max_drawdown', 0):.2%}\n"
+                f"\n<b>Test 기간</b> ({split_result['test_period']})\n"
+                f"  수익률: {test_m.get('total_return', 0):+.2%}\n"
+                f"  샤프: {test_m.get('sharpe_ratio', 0):.2f}\n"
+                f"  MDD: -{test_m.get('max_drawdown', 0):.2%}\n"
+                f"\n과적합 비율: {overfit:.2f} (1.0에 가까울수록 좋음)"
+            )
+            messages.append(msg)
+
+            # 최적 파라미터로 전체 기간 백테스트
+            best_strategy = factory(bp)
+            full_result = bt.run(tickers, best_strategy, start_date, end_date)
+            messages.append("📊 <b>최적 파라미터 전체 기간 결과</b>\n" + format_telegram_report(full_result))
+
+        return messages or ["결과 없음"]
+
     def collect_data(self):
         """수동 데이터 수집."""
         held = list(self.portfolio.positions.keys())
@@ -479,6 +787,10 @@ class TradingSystem:
         self._paused = False
         self.trading_scheduler.resume_trading_jobs()
         logger.info("Trading resumed")
+
+    def get_last_analysis(self) -> dict | None:
+        """마지막 LLM 분석 결과 반환."""
+        return self._last_analysis
 
     def get_status(self) -> dict:
         return {

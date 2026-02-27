@@ -45,6 +45,10 @@ class ConfigManager:
     def reload(self) -> None:
         self._load_all()
 
+    def load_yaml(self, filename: str) -> dict:
+        """외부에서 추가 설정 파일 로드."""
+        return self._load_yaml(filename)
+
     @property
     def settings(self) -> dict:
         return self._settings

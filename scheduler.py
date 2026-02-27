@@ -3,10 +3,14 @@
 import asyncio
 from datetime import datetime, time
 
+import holidays
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from loguru import logger
+
+# 한국 공휴일 (매년 자동 갱신)
+_kr_holidays = holidays.KR(years=range(2025, 2030))
 
 
 class TradingScheduler:
@@ -61,25 +65,33 @@ class TradingScheduler:
             misfire_grace_time=30,
         )
 
-        # 장 시작 전 초기화 (08:50)
+        # 장전 종목 스크리닝 (08:45) — on_market_open 전에 완료
         self.scheduler.add_job(
-            self._safe_run(self.system.on_market_open),
+            self._safe_run(self.system.cycle_screening, check_hours=False),
+            CronTrigger(hour=8, minute=45, day_of_week="mon-fri"),
+            id="daily_screening",
+            name="종목 스크리닝",
+        )
+
+        # 장 시작 전 초기화 (08:50) — 장외시간이므로 check_hours=False
+        self.scheduler.add_job(
+            self._safe_run(self.system.on_market_open, check_hours=False),
             CronTrigger(hour=8, minute=50, day_of_week="mon-fri"),
             id="market_open",
             name="장 시작 초기화",
         )
 
-        # 장 마감 후 정리 (15:40)
+        # 장 마감 후 정리 (15:40) — 장외시간이므로 check_hours=False
         self.scheduler.add_job(
-            self._safe_run(self.system.on_market_close),
+            self._safe_run(self.system.on_market_close, check_hours=False),
             CronTrigger(hour=15, minute=40, day_of_week="mon-fri"),
             id="market_close",
             name="장 마감 정리",
         )
 
-        # 일일 복기 (16:00)
+        # 일일 복기 (16:00) — 장외시간이므로 check_hours=False
         self.scheduler.add_job(
-            self._safe_run(self.system.run_daily_review),
+            self._safe_run(self.system.run_daily_review, check_hours=False),
             CronTrigger(hour=16, minute=0, day_of_week="mon-fri"),
             id="daily_review",
             name="일일 복기",
@@ -90,27 +102,30 @@ class TradingScheduler:
         if ml_config.get("training_mode") == "batch":
             if ml_config.get("retrain_schedule") == "daily":
                 self.scheduler.add_job(
-                    self._safe_run(self.system.train_ml_models),
+                    self._safe_run(self.system.train_ml_models, check_hours=False),
                     CronTrigger(hour=17, minute=0, day_of_week="mon-fri"),
                     id="ml_retrain",
                     name="ML 재학습",
                 )
 
-        # 주간 리포트 (토요일 10:00)
+        # 주간 리포트 (토요일 10:00) — 주말이므로 거래일 체크도 skip
         self.scheduler.add_job(
-            self._safe_run(self.system.run_weekly_review),
+            self._safe_run(self.system.run_weekly_review, check_hours=False, check_trading_day=False),
             CronTrigger(hour=10, minute=0, day_of_week="sat"),
             id="weekly_review",
             name="주간 리포트",
         )
 
-    def _safe_run(self, func):
+    def _safe_run(self, func, check_hours=True, check_trading_day=True):
         """에러가 발생해도 스케줄러가 멈추지 않도록 래핑."""
         func_name = getattr(func, '__name__', str(func))
 
         async def wrapper():
             logger.info(f"Job triggered: {func_name}")
-            if not self._is_trading_hours():
+            if check_trading_day and not self._is_trading_day():
+                logger.info(f"Not a trading day (holiday/weekend), skipping {func_name}")
+                return
+            if check_hours and not self._is_trading_hours():
                 logger.info(f"Outside trading hours, skipping {func_name}")
                 return
 
@@ -124,13 +139,21 @@ class TradingScheduler:
 
         return wrapper
 
+    def _is_trading_day(self) -> bool:
+        """오늘이 거래일(평일 + 공휴일 아님)인지 확인."""
+        today = datetime.now().date()
+        if today.weekday() >= 5:
+            return False
+        if today in _kr_holidays:
+            return False
+        return True
+
     def _is_trading_hours(self) -> bool:
         """현재 장 시간인지 확인."""
-        now = datetime.now()
-        # 주말 제외
-        if now.weekday() >= 5:
+        if not self._is_trading_day():
             return False
         # 09:00 ~ 15:35
+        now = datetime.now()
         market_open = time(9, 0)
         market_close = time(15, 35)
         return market_open <= now.time() <= market_close

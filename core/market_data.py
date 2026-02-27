@@ -195,6 +195,69 @@ class MarketDataClient:
 
         return sorted(records, key=lambda x: x["date"])
 
+    def get_daily_ohlcv_range(
+        self, ticker: str, start_date: str, end_date: str, period: str = "D",
+    ) -> list[dict]:
+        """날짜 범위 지정 일봉 조회 (페이지네이션 지원).
+
+        KIS API가 1회 ~100바 제한이므로 end_date를 뒤로 이동하며 반복 호출.
+        Args:
+            start_date: "20240301" 형식
+            end_date: "20260227" 형식
+        """
+        path = "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+        tr_id = "FHKST03010100"
+        all_records = []
+        current_end = end_date
+
+        for _ in range(15):  # 최대 15회 (~1500 거래일 ≈ 6년)
+            params = {
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": ticker,
+                "FID_INPUT_DATE_1": start_date,
+                "FID_INPUT_DATE_2": current_end,
+                "FID_PERIOD_DIV_CODE": period,
+                "FID_ORG_ADJ_PRC": "0",
+            }
+            data = self._get(path, tr_id, params)
+            batch = data.get("output2", [])
+            if not batch:
+                break
+
+            for item in batch:
+                date = item.get("stck_bsop_date", "")
+                if not date or date < start_date:
+                    continue
+                all_records.append({
+                    "date": date,
+                    "open": _safe_int(item.get("stck_oprc", 0)),
+                    "high": _safe_int(item.get("stck_hgpr", 0)),
+                    "low": _safe_int(item.get("stck_lwpr", 0)),
+                    "close": _safe_int(item.get("stck_clpr", 0)),
+                    "volume": _safe_int(item.get("acml_vol", 0)),
+                    "amount": _safe_int(item.get("acml_tr_pbmn", 0)),
+                })
+
+            # 배치에서 가장 오래된 날짜 찾기
+            oldest = min(item.get("stck_bsop_date", "") for item in batch)
+            if oldest <= start_date:
+                break
+
+            # 다음 호출: oldest 하루 전까지
+            oldest_dt = datetime.strptime(oldest, "%Y%m%d")
+            current_end = (oldest_dt - timedelta(days=1)).strftime("%Y%m%d")
+            time.sleep(0.5)  # API 부하 방지
+
+        # 중복 제거 + 정렬
+        seen = set()
+        unique = []
+        for r in all_records:
+            if r["date"] not in seen:
+                seen.add(r["date"])
+                unique.append(r)
+
+        return sorted(unique, key=lambda x: x["date"])
+
     def get_minute_ohlcv(self, ticker: str, interval: str = "1") -> list[dict]:
         """분봉 데이터 조회. interval: 1, 3, 5, 10, 15, 30, 60."""
         path = "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"

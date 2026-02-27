@@ -81,6 +81,36 @@ class PriceCollector:
             logger.error(f"Daily collection failed for {ticker}: {e}")
             return pd.DataFrame()
 
+    def collect_historical(self, ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """과거 데이터 대량 수집 (페이지네이션 지원).
+
+        Args:
+            ticker: 종목코드 (e.g. "005930")
+            start_date: 시작일 "20240301" 형식
+            end_date: 종료일 "20260227" 형식
+        """
+        try:
+            records = self.market.get_daily_ohlcv_range(ticker, start_date, end_date)
+            if not records:
+                logger.warning(f"No historical data for {ticker}")
+                return pd.DataFrame()
+
+            with sqlite3.connect(self.db_path) as conn:
+                for r in records:
+                    conn.execute("""
+                        INSERT OR REPLACE INTO daily_ohlcv
+                        (ticker, date, open, high, low, close, volume, amount)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (ticker, r["date"], r["open"], r["high"],
+                          r["low"], r["close"], r["volume"], r.get("amount", 0)))
+
+            logger.info(f"Historical collection: {ticker} got {len(records)} bars ({start_date}~{end_date})")
+            return pd.DataFrame(records)
+
+        except Exception as e:
+            logger.error(f"Historical collection failed for {ticker}: {e}")
+            return pd.DataFrame()
+
     def collect_current_price(self, ticker: str) -> dict:
         """현재가 수집 및 저장."""
         try:

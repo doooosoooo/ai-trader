@@ -58,6 +58,9 @@ class TelegramBot:
         self._app.add_handler(CommandHandler("mode", self._cmd_mode))
         self._app.add_handler(CommandHandler("reset", self._cmd_reset))
         self._app.add_handler(CommandHandler("trades", self._cmd_trades))
+        self._app.add_handler(CommandHandler("analysis", self._cmd_analysis))
+        self._app.add_handler(CommandHandler("screen", self._cmd_screen))
+        self._app.add_handler(CommandHandler("backtest", self._cmd_backtest))
         self._app.add_handler(CallbackQueryHandler(self._handle_callback))
         self._app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text))
 
@@ -207,7 +210,10 @@ class TelegramBot:
             "/portfolio - 포트폴리오 현황 (매입가·손익)\n"
             "/today - 오늘 매매 내역\n"
             "/trades - 최근 매매 내역 (전체)\n"
-            "/strategy - 현재 전략\n"
+            "/analysis - 마지막 LLM 분석 결과 (now: 즉시 실행)\n"
+            "/screen - 종목 스크리닝 결과 (now: 즉시 실행)\n"
+            "/backtest - 백테스트 (compare/optimize)\n"
+            "/strategy - 현재 전략 + 스크리닝 종목\n"
             "/pause - 거래 일시 중지\n"
             "/resume - 거래 재개\n"
             "/mode <simulation|live> - 모드 전환\n"
@@ -279,10 +285,24 @@ class TelegramBot:
             return
 
         strategy = self.system.llm_engine.load_strategy()
-        # 너무 길면 잘라서 보냄
-        if len(strategy) > 3000:
-            strategy = strategy[:3000] + "\n\n... (생략)"
-        await update.message.reply_text(f"📜 현재 전략:\n\n{strategy}")
+        if len(strategy) > 2500:
+            strategy = strategy[:2500] + "\n\n... (생략)"
+
+        msg = f"📜 현재 전략:\n\n{strategy}"
+
+        # 스크리닝 관심종목 추가
+        if self.system.screener:
+            result = self.system.screener.get_last_result()
+            if result and result.candidates:
+                ts = result.timestamp[:16].replace("T", " ")
+                msg += f"\n\n{'─' * 24}\n🔍 스크리닝 관심종목 ({ts})\n"
+                for i, c in enumerate(result.candidates[:8], 1):
+                    name = c.get("name", c["ticker"])
+                    score = c.get("composite_score", 0)
+                    change = c.get("change_pct", 0)
+                    msg += f"  {i}. {name}({c['ticker']}) 점수:{score:.0f} {change:+.1f}%\n"
+
+        await update.message.reply_text(msg)
 
     async def _cmd_portfolio(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_auth(update):
@@ -398,6 +418,174 @@ class TelegramBot:
             )
 
         await update.message.reply_html(msg)
+
+    async def _cmd_analysis(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """마지막 LLM 분석 결과 조회. /analysis now 로 즉시 분석 실행."""
+        if not await self._check_auth(update):
+            return
+        if not self.system:
+            await update.message.reply_text("시스템 미연결")
+            return
+
+        # /analysis now → 즉시 분석 실행
+        if context.args and context.args[0].lower() == "now":
+            await update.message.reply_text("🔄 LLM 분석 즉시 실행 중... (1~2분 소요)")
+            try:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, self.system.cycle_llm_analysis)
+            except Exception as e:
+                await update.message.reply_text(f"분석 실행 실패: {e}")
+                return
+
+        last = self.system.get_last_analysis()
+        if not last:
+            await update.message.reply_text(
+                "아직 분석 결과가 없습니다.\n"
+                "/analysis now 로 즉시 실행할 수 있습니다."
+            )
+            return
+
+        signal = last["signal"]
+        actions = last["actions"]
+        ts = last["timestamp"][:16].replace("T", " ")
+
+        mode = self.system.config_manager.get_mode()
+        mode_tag = "[SIM]" if mode == "simulation" else "[LIVE]"
+
+        risk = signal.get("risk_assessment", "?")
+        risk_emoji = {"LOW": "🟢", "MEDIUM": "🟡", "HIGH": "🔴"}.get(risk, "⚪")
+        outlook = signal.get("market_outlook", "없음")
+        reasoning = signal.get("reasoning", "없음")
+
+        msg = (
+            f"📊 <b>마지막 LLM 분석</b> {mode_tag}\n"
+            f"⏰ {ts}\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"{risk_emoji} 리스크: {risk}\n"
+            f"🔍 시장 전망: {outlook}\n"
+        )
+
+        all_actions = signal.get("actions", [])
+        if all_actions:
+            msg += "\n📋 <b>종목 판단:</b>\n"
+            for a in all_actions:
+                action_type = a.get("type", "HOLD")
+                name = a.get("name", a.get("ticker", ""))
+                reason = a.get("reason", "")
+                emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪"}.get(action_type, "⚪")
+                ratio_str = ""
+                if a.get("ratio"):
+                    ratio_str = f" ({a['ratio']:.0%})"
+                msg += f"  {emoji} {action_type} {name}{ratio_str}\n"
+                if reason:
+                    msg += f"     └ {reason}\n"
+        else:
+            msg += "\n📋 판단: 전종목 HOLD\n"
+
+        executed = sum(1 for a in actions if a.get("type", "").upper() in ("BUY", "SELL"))
+        if executed > 0:
+            msg += f"\n⚡ 매매 실행: {executed}건\n"
+
+        if reasoning and reasoning != "없음":
+            if len(reasoning) > 300:
+                reasoning = reasoning[:300] + "..."
+            msg += f"\n💬 <b>판단 근거:</b>\n{reasoning}"
+
+        await update.message.reply_html(msg)
+
+    async def _cmd_screen(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """종목 스크리닝 결과 조회. /screen now 로 즉시 실행."""
+        if not await self._check_auth(update):
+            return
+        if not self.system:
+            await update.message.reply_text("시스템 미연결")
+            return
+        if not self.system.screener:
+            await update.message.reply_text("스크리너가 비활성화되어 있습니다.")
+            return
+
+        # /screen now → 즉시 스크리닝 실행
+        if context.args and context.args[0].lower() == "now":
+            await update.message.reply_text("🔍 종목 스크리닝 실행 중... (30초~1분 소요)")
+            try:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, self.system.cycle_screening)
+            except Exception as e:
+                await update.message.reply_text(f"스크리닝 실패: {e}")
+                return
+
+        result = self.system.screener.get_last_result()
+        if not result or not result.candidates:
+            await update.message.reply_text(
+                "스크리닝 결과가 없습니다.\n"
+                "/screen now 로 즉시 실행할 수 있습니다."
+            )
+            return
+
+        msg = self.system._format_screening_msg(result)
+        await update.message.reply_html(msg)
+
+    async def _cmd_backtest(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """백테스트 실행.
+
+        /backtest — 현재 전략(swing) 백테스트
+        /backtest swing|daytrading|defensive — 특정 전략
+        /backtest compare — 3개 전략 비교
+        /backtest optimize — 현재 전략 파라미터 최적화
+        /backtest optimize swing|daytrading|defensive — 특정 전략 최적화
+        """
+        if not await self._check_auth(update):
+            return
+        if not self.system:
+            await update.message.reply_text("시스템 미연결")
+            return
+
+        args = [a.lower() for a in (context.args or [])]
+        valid_strategies = ["swing", "daytrading", "defensive"]
+
+        # 명령 파싱
+        if not args:
+            mode = "single"
+            strategy_name = "swing"
+        elif args[0] == "compare":
+            mode = "compare"
+            strategy_name = ""
+        elif args[0] == "optimize":
+            mode = "optimize"
+            strategy_name = args[1] if len(args) > 1 and args[1] in valid_strategies else "swing"
+        elif args[0] in valid_strategies:
+            mode = "single"
+            strategy_name = args[0]
+        else:
+            await update.message.reply_text(
+                "사용법:\n"
+                "/backtest — 스윙 전략 백테스트\n"
+                "/backtest swing|daytrading|defensive\n"
+                "/backtest compare — 3개 전략 비교\n"
+                "/backtest optimize [전략] — 최적화"
+            )
+            return
+
+        time_msg = "1~2분" if mode != "optimize" else "3~5분"
+        label = {
+            "single": f"{strategy_name} 백테스트",
+            "compare": "3개 전략 비교",
+            "optimize": f"{strategy_name} 최적화",
+        }[mode]
+        await update.message.reply_text(f"🔬 {label} 실행 중... ({time_msg} 소요)")
+
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: self.system.run_backtest(mode=mode, strategy_name=strategy_name),
+            )
+            # 결과가 여러 메시지일 수 있음 (길면 분할)
+            for msg in result:
+                await update.message.reply_html(msg)
+        except Exception as e:
+            logger.error(f"Backtest failed: {e}")
+            await update.message.reply_text(f"백테스트 실패: {e}")
 
     async def _handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """인라인 버튼 콜백 처리 (주문 승인/거부)."""

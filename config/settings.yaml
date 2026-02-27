@@ -55,5 +55,6 @@ telegram:
     - daily_report
     - confirmation_required
     - strategy_suggestion
+    - screening_result
     - error
   confirmation_timeout_seconds: 300  # 확인 요청 타임아웃 5분
