@@ -4,9 +4,12 @@ import asyncio
 import json
 import os
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable
 
 from loguru import logger
+
+_PENDING_SELLS_PATH = Path(__file__).parent.parent / "data" / "pending_sell_confirmations.json"
 
 try:
     from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -36,6 +39,8 @@ class TelegramBot:
         self._app = None
         self._pending_confirmations: dict[str, dict] = {}
         self._pending_param_changes: dict[str, dict] = {}  # force param 확인 대기
+        self._pending_sell_confirmations: dict[str, dict] = {}  # 익절 확인 대기
+        self._load_pending_sells()  # 재시작 시 복구
 
         if not TELEGRAM_AVAILABLE:
             self.enabled = False
@@ -57,6 +62,7 @@ class TelegramBot:
         self._app.add_handler(CommandHandler("pause", self._cmd_pause))
         self._app.add_handler(CommandHandler("resume", self._cmd_resume))
         self._app.add_handler(CommandHandler("mode", self._cmd_mode))
+        self._app.add_handler(CommandHandler("mode_confirm_live", self._cmd_mode_confirm_live))
         self._app.add_handler(CommandHandler("reset", self._cmd_reset))
         self._app.add_handler(CommandHandler("trades", self._cmd_trades))
         self._app.add_handler(CommandHandler("analysis", self._cmd_analysis))
@@ -71,6 +77,9 @@ class TelegramBot:
         await self._app.updater.start_polling()
         logger.info("Telegram bot started")
 
+        # 재시작 시 복원된 pending sell에 대해 타임아웃 태스크 재스케줄링
+        self._reschedule_pending_sell_timeouts()
+
     async def stop(self):
         if self._app:
             try:
@@ -80,6 +89,50 @@ class TelegramBot:
                 await self._app.shutdown()
             except Exception:
                 pass
+
+    # --- 익절 확인 저장/복구 ---
+
+    def _load_pending_sells(self):
+        """재시작 시 미처리 익절 확인 복구."""
+        try:
+            if _PENDING_SELLS_PATH.exists():
+                with open(_PENDING_SELLS_PATH, "r", encoding="utf-8") as f:
+                    saved = json.load(f)
+                # 24시간 이상 된 건 제거
+                now = datetime.now()
+                for conf_id, item in list(saved.items()):
+                    req_time = datetime.fromisoformat(item.get("requested_at", ""))
+                    if (now - req_time).total_seconds() > 86400:
+                        del saved[conf_id]
+                self._pending_sell_confirmations = saved
+                if saved:
+                    logger.info(f"Restored {len(saved)} pending sell confirmations")
+        except Exception as e:
+            logger.warning(f"Failed to load pending sells: {e}")
+
+    def _reschedule_pending_sell_timeouts(self):
+        """재시작 시 복원된 pending sell에 대해 타임아웃 태스크를 재생성."""
+        if not self._pending_sell_confirmations:
+            return
+        timeout = self._get_confirmation_timeout()
+        now = datetime.now()
+        for conf_id, item in list(self._pending_sell_confirmations.items()):
+            if item.get("status") != "pending":
+                continue
+            # 이미 경과한 시간을 계산하여 남은 타임아웃 적용
+            req_time = datetime.fromisoformat(item.get("requested_at", ""))
+            elapsed = (now - req_time).total_seconds()
+            remaining = max(0, timeout - elapsed)
+            logger.info(f"Rescheduling sell timeout for {conf_id}: {remaining:.0f}s remaining")
+            asyncio.ensure_future(self._auto_sell_after_timeout(conf_id, int(remaining)))
+
+    def _save_pending_sells(self):
+        """미처리 익절 확인 파일 저장."""
+        try:
+            with open(_PENDING_SELLS_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._pending_sell_confirmations, f, ensure_ascii=False)
+        except Exception as e:
+            logger.warning(f"Failed to save pending sells: {e}")
 
     # --- 알림 발송 ---
 
@@ -150,7 +203,7 @@ class TelegramBot:
         Returns:
             confirmation_id
         """
-        conf_id = f"conf_{datetime.now().strftime('%H%M%S')}"
+        conf_id = f"conf_{datetime.now().strftime('%H%M%S%f')}"
 
         msg = (
             f"⚠️ <b>주문 확인 요청</b>\n\n"
@@ -185,6 +238,105 @@ class TelegramBot:
             )
 
         return conf_id
+
+    async def request_sell_confirmation(self, order_info: dict) -> str:
+        """익절 매도 확인 요청 — 수익 중인 포지션 매도 전 사용자 승인.
+
+        타임아웃(기본 5분) 내 응답 없으면 AI 판단대로 자동 익절.
+
+        Returns:
+            confirmation_id
+        """
+        conf_id = f"sell_{datetime.now().strftime('%H%M%S%f')}_{order_info['ticker']}"
+        timeout = self._get_confirmation_timeout()
+
+        self._pending_sell_confirmations[conf_id] = {
+            "order_info": order_info,
+            "status": "pending",
+            "requested_at": datetime.now().isoformat(),
+        }
+        self._save_pending_sells()
+
+        msg = (
+            f"💰 <b>익절 매도 확인</b>\n\n"
+            f"종목: {order_info.get('name', '')} ({order_info.get('ticker', '')})\n"
+            f"수량: {order_info.get('quantity', 0):,}주\n"
+            f"현재가: {order_info.get('price', 0):,.0f}원\n"
+            f"평가금: {order_info.get('amount', 0):,.0f}원\n"
+            f"수익: {order_info.get('pnl', '')}\n"
+            f"사유: {order_info.get('reason', '')}\n\n"
+            f"익절하시겠습니까?\n"
+            f"<i>{timeout // 60}분 내 응답 없으면 AI 판단대로 자동 익절됩니다.</i>"
+        )
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("💰 익절 실행", callback_data=f"sell_yes_{conf_id}"),
+                InlineKeyboardButton("📈 홀드", callback_data=f"sell_no_{conf_id}"),
+            ]
+        ])
+
+        if self._app:
+            await self._app.bot.send_message(
+                chat_id=self.chat_id,
+                text=msg,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+
+            # 타임아웃 후 자동 익절 스케줄링
+            asyncio.ensure_future(self._auto_sell_after_timeout(conf_id, timeout))
+
+        return conf_id
+
+    def _get_confirmation_timeout(self) -> int:
+        """확인 타임아웃(초)."""
+        if self.system and hasattr(self.system, "config_manager"):
+            return self.system.config_manager.get(
+                "telegram.confirmation_timeout_seconds", 300
+            )
+        return 300
+
+    async def _auto_sell_after_timeout(self, conf_id: str, timeout: int):
+        """타임아웃 후 응답 없으면 AI 판단대로 자동 익절 실행."""
+        await asyncio.sleep(timeout)
+
+        # 아직 pending 상태면 자동 실행 (pop으로 원자적으로 가져와서 이중실행 방지)
+        pending = self._pending_sell_confirmations.get(conf_id)
+        if not pending or pending["status"] != "pending":
+            return  # 이미 사용자가 처리함 (승인/거부)
+        pending = self._pending_sell_confirmations.pop(conf_id, None)
+        if not pending:
+            return  # 다른 경로에서 이미 처리됨
+        self._save_pending_sells()
+
+        order_info = pending["order_info"]
+        logger.info(f"Sell confirmation timeout — auto-executing: {order_info['name']}({order_info['ticker']})")
+
+        try:
+            signal = order_info.get("signal", {"actions": [order_info.get("action_data", {})]})
+            sell_signal = {**signal, "actions": [order_info["action_data"]]}
+            ticker = order_info["ticker"]
+            # 실시간 현재가 조회 (요청 당시 가격이 아닌 최신 가격 사용)
+            fresh_prices = self.system.data_pipeline.collect_prices_only([ticker])
+            current_prices = fresh_prices if fresh_prices.get(ticker) else {ticker: order_info["price"]}
+            results = self.system.executor.execute_signal(sell_signal, current_prices)
+            for result in results:
+                self.system._process_trade_result(result)
+
+            await self.send_alert(
+                "trade_executed",
+                f"⏰ <b>자동 익절 실행</b> (응답 대기 {timeout // 60}분 초과)\n"
+                f"{order_info['name']}({ticker}) "
+                f"{order_info['quantity']:,}주 매도\n"
+                f"수익: {order_info.get('pnl', '')}",
+            )
+        except Exception as e:
+            logger.error(f"Auto sell execution failed: {e}")
+            await self.send_alert(
+                "error",
+                f"자동 익절 실행 실패: {order_info['name']}({order_info['ticker']})\n{e}",
+            )
 
     # --- 권한 체크 ---
 
@@ -233,18 +385,58 @@ class TelegramBot:
             return
 
         status = self.system.get_status()
+        mode = status.get('mode', 'unknown')
+        mode_label = "🔴 실거래" if mode == "live" else "🔵 시뮬레이션"
+        paused_str = " (⏸ 일시중지)" if status.get("paused") else ""
         watchlist = status.get('watchlist', [])
-        watchlist_str = ", ".join(watchlist) if watchlist else "없음"
+        watchlist_str = ", ".join(watchlist[:5]) if watchlist else "없음"
+        if len(watchlist) > 5:
+            watchlist_str += f" 외 {len(watchlist) - 5}개"
+
         msg = (
-            f"📊 <b>시스템 상태</b>\n\n"
-            f"모드: {status.get('mode', 'unknown')}\n"
-            f"서킷브레이커: {status.get('circuit_state', 'unknown')}\n"
-            f"총자산: {status.get('total_asset', 0):,.0f}원\n"
-            f"수익률: {status.get('total_pnl_pct', '0%')}\n"
-            f"보유종목: {status.get('num_positions', 0)}개\n"
-            f"관심종목: {watchlist_str}\n"
-            f"LLM 일일비용: ${status.get('llm_daily_cost', 0):.2f}\n"
+            f"📊 <b>시스템 상태</b>\n"
+            f"{'━' * 24}\n\n"
+            f"모드: {mode_label}{paused_str}\n"
+            f"서킷브레이커: {status.get('circuit_state', 'unknown')}\n\n"
+            f"<b>자산 현황</b>\n"
+            f"  총자산: {status.get('total_asset', 0):,.0f}원\n"
+            f"  현금: {status.get('cash', 0):,.0f}원\n"
+            f"  수익률: {status.get('total_pnl_pct', '0%')}\n\n"
         )
+
+        # 보유종목 상세
+        summary = self.system.portfolio.get_summary()
+        positions = summary.get("positions", {})
+        if positions:
+            msg += f"<b>보유종목 ({len(positions)}개)</b>\n"
+            for ticker, pos in positions.items():
+                pnl = pos.get("pnl", 0)
+                pnl_pct = pos.get("pnl_pct", "0%")
+                pnl_emoji = "📈" if pnl > 0 else "📉" if pnl < 0 else "➡️"
+                msg += (
+                    f"  {pnl_emoji} {pos['name']}({ticker})\n"
+                    f"     {pos['quantity']}주 | 현재가 {pos['current_price']:,.0f}원\n"
+                    f"     매입 {pos['avg_price']:,.0f}원 → {pnl:+,.0f}원({pnl_pct})\n"
+                )
+        else:
+            msg += f"<b>보유종목: 없음</b>\n"
+
+        msg += (
+            f"\n<b>관심종목</b>\n  {watchlist_str}\n"
+            f"\nLLM 비용(오늘): ${status.get('llm_daily_cost', 0):.2f}\n"
+        )
+
+        # 오늘 매매 요약
+        trades = self.system.portfolio.get_today_trades()
+        if trades:
+            buy_cnt = sum(1 for t in trades if t["action"] == "BUY")
+            sell_cnt = sum(1 for t in trades if t["action"] == "SELL")
+            realized = sum(t.get("pnl", 0) or 0 for t in trades)
+            msg += f"\n<b>오늘 매매</b>: 매수 {buy_cnt}건 / 매도 {sell_cnt}건"
+            if realized:
+                msg += f" | 실현 {realized:+,.0f}원"
+            msg += "\n"
+
         await update.message.reply_html(msg)
 
     async def _cmd_today(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -374,8 +566,24 @@ class TelegramBot:
             return
 
         if self.system:
-            self.system.config_manager.set_mode(mode)
-        await update.message.reply_text(f"모드 전환: {mode}")
+            msg = self.system.switch_mode(mode)
+            await update.message.reply_text(msg)
+        else:
+            await update.message.reply_text("시스템이 초기화되지 않았습니다.")
+
+    async def _cmd_mode_confirm_live(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """LIVE 모드 전환 확인 — 실계좌 동기화 포함."""
+        if not await self._check_auth(update):
+            return
+        if self.system:
+            await update.message.reply_text("⏳ 실계좌 동기화 중...")
+            msg = self.system.switch_mode("live")
+            await update.message.reply_text(
+                f"{msg}\n\n이제부터 실제 주문이 실행됩니다.\n"
+                f"시뮬레이션으로 돌아가려면: /mode simulation"
+            )
+        else:
+            await update.message.reply_text("시스템이 초기화되지 않았습니다.")
 
     async def _cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_auth(update):
@@ -468,6 +676,22 @@ class TelegramBot:
             f"🔍 시장 전망: {outlook}\n"
         )
 
+        # 보유 종목 현황
+        summary = self.system.portfolio.get_summary()
+        positions = summary.get("positions", {})
+        if positions:
+            msg += f"\n💼 <b>보유 종목:</b>\n"
+            for ticker, pos in positions.items():
+                pnl = pos.get("pnl", 0)
+                pnl_pct = pos.get("pnl_pct", "0%")
+                pnl_emoji = "📈" if pnl > 0 else "📉" if pnl < 0 else "➡️"
+                msg += (
+                    f"  {pnl_emoji} {pos['name']}({ticker})"
+                    f" {pos['quantity']}주"
+                    f" | {pnl:+,.0f}원({pnl_pct})\n"
+                )
+            msg += f"  총자산: {summary['total_asset']:,.0f}원 ({summary['total_pnl_pct']})\n"
+
         all_actions = signal.get("actions", [])
         if all_actions:
             msg += "\n📋 <b>종목 판단:</b>\n"
@@ -532,10 +756,10 @@ class TelegramBot:
         """백테스트 실행.
 
         /backtest — 현재 전략(swing) 백테스트
-        /backtest swing|daytrading|defensive — 특정 전략
-        /backtest compare — 3개 전략 비교
+        /backtest swing|daytrading — 특정 전략
+        /backtest compare — 전략 비교
         /backtest optimize — 현재 전략 파라미터 최적화
-        /backtest optimize swing|daytrading|defensive — 특정 전략 최적화
+        /backtest optimize swing|daytrading — 특정 전략 최적화
         """
         if not await self._check_auth(update):
             return
@@ -544,12 +768,23 @@ class TelegramBot:
             return
 
         args = [a.lower() for a in (context.args or [])]
-        valid_strategies = ["swing", "daytrading", "defensive"]
+        valid_strategies = ["swing", "daytrading"]
 
         # 명령 파싱
         if not args:
             mode = "single"
             strategy_name = "swing"
+        elif args[0] == "results":
+            # 최근 백테스트 결과 조회 (DB에서)
+            feedback = self.system._build_backtest_feedback()
+            if feedback:
+                await update.message.reply_text(f"📊 최근 백테스트 결과\n\n{feedback}")
+            else:
+                await update.message.reply_text(
+                    "저장된 백테스트 결과가 없습니다.\n"
+                    "/backtest compare 로 실행하세요."
+                )
+            return
         elif args[0] == "compare":
             mode = "compare"
             strategy_name = ""
@@ -563,9 +798,10 @@ class TelegramBot:
             await update.message.reply_text(
                 "사용법:\n"
                 "/backtest — 스윙 전략 백테스트\n"
-                "/backtest swing|daytrading|defensive\n"
-                "/backtest compare — 3개 전략 비교\n"
-                "/backtest optimize [전략] — 최적화"
+                "/backtest swing|daytrading\n"
+                "/backtest compare — 전략 비교\n"
+                "/backtest optimize [전략] — 최적화\n"
+                "/backtest results — 최근 백테스트 결과 조회"
             )
             return
 
@@ -730,17 +966,73 @@ class TelegramBot:
             await query.edit_message_text("❌ 파라미터 변경이 취소되었습니다.")
             return
 
+        # 익절 매도 승인/거부
+        if data.startswith("sell_yes_"):
+            conf_id = data.replace("sell_yes_", "")
+            pending = self._pending_sell_confirmations.pop(conf_id, None)
+            self._save_pending_sells()
+            if not pending:
+                await query.edit_message_text("⏰ 요청이 만료되었습니다.")
+                return
+            order_info = pending["order_info"]
+            try:
+                # 실시간 현재가 조회 (요청 당시 가격이 아닌 최신 가격 사용)
+                signal = order_info.get("signal", {"actions": [order_info.get("action_data", {})]})
+                sell_signal = {**signal, "actions": [order_info["action_data"]]}
+                ticker = order_info["ticker"]
+                fresh_prices = self.system.data_pipeline.collect_prices_only([ticker])
+                current_prices = fresh_prices if fresh_prices.get(ticker) else {ticker: order_info["price"]}
+                results = self.system.executor.execute_signal(sell_signal, current_prices)
+                for result in results:
+                    self.system._process_trade_result(result)
+                await query.edit_message_text(
+                    f"💰 익절 실행 완료\n"
+                    f"{order_info['name']}({ticker}) "
+                    f"{order_info['quantity']:,}주 매도\n"
+                    f"수익: {order_info.get('pnl', '')}"
+                )
+            except Exception as e:
+                await query.edit_message_text(f"매도 실행 실패: {e}")
+            return
+
+        if data.startswith("sell_no_"):
+            conf_id = data.replace("sell_no_", "")
+            self._pending_sell_confirmations.pop(conf_id, None)
+            self._save_pending_sells()
+            await query.edit_message_text("📈 홀드 — 익절을 보류합니다.")
+            return
+
         # 기존: 주문 승인/거부
         if data.startswith("approve_"):
             conf_id = data.replace("approve_", "")
-            if conf_id in self._pending_confirmations:
-                self._pending_confirmations[conf_id]["status"] = "approved"
-                await query.edit_message_text("✅ 주문이 승인되었습니다.")
+            conf = self._pending_confirmations.pop(conf_id, None)
+            if conf and conf["status"] == "pending" and self.system:
+                conf["status"] = "approved"
+                order = conf["order"]
+                try:
+                    signal = {"actions": [order]}
+                    ticker = order.get("ticker", "")
+                    prices = self.system.data_pipeline.collect_prices_only([ticker])
+                    results = self.system.executor.execute_signal(signal, prices)
+                    for result in results:
+                        self.system._process_trade_result(result)
+                    await query.edit_message_text(
+                        f"✅ 주문 승인 — 실행 완료\n"
+                        f"{order.get('name', '')} {order.get('action', '')} "
+                        f"{order.get('quantity', 0):,}주"
+                    )
+                except Exception as e:
+                    logger.error(f"Approved order execution failed: {e}")
+                    await query.edit_message_text(f"✅ 승인했으나 실행 실패: {e}")
+            elif not conf:
+                await query.edit_message_text("⏰ 만료된 주문입니다.")
         elif data.startswith("reject_"):
             conf_id = data.replace("reject_", "")
-            if conf_id in self._pending_confirmations:
-                self._pending_confirmations[conf_id]["status"] = "rejected"
+            conf = self._pending_confirmations.pop(conf_id, None)
+            if conf:
                 await query.edit_message_text("❌ 주문이 거부되었습니다.")
+            else:
+                await query.edit_message_text("⏰ 만료된 주문입니다.")
 
     async def _handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """자연어 메시지 처리 → 전략 변경."""

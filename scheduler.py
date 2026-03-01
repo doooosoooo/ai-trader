@@ -47,9 +47,9 @@ class TradingScheduler:
             misfire_grace_time=120,
         )
 
-        # 뉴스/공시 체크
+        # 뉴스/공시 체크 — 주말/공휴일 포함 상시 수집
         self.scheduler.add_job(
-            self._safe_run(self.system.cycle_news_check),
+            self._safe_run(self.system.cycle_news_check, check_hours=False, check_trading_day=False),
             IntervalTrigger(minutes=news_interval),
             id="news_check",
             name="뉴스 체크",
@@ -114,6 +114,14 @@ class TradingScheduler:
             CronTrigger(hour=10, minute=0, day_of_week="sat"),
             id="weekly_review",
             name="주간 리포트",
+        )
+
+        # 주간 백테스트 (토요일 02:00) — 주말 새벽에 자동 실행
+        self.scheduler.add_job(
+            self._safe_run(self.system.cycle_backtest, check_hours=False, check_trading_day=False),
+            CronTrigger(hour=2, minute=0, day_of_week="sat"),
+            id="weekly_backtest",
+            name="주간 백테스트",
         )
 
     def _safe_run(self, func, check_hours=True, check_trading_day=True):

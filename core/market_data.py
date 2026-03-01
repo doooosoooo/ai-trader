@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -55,15 +56,17 @@ class KISAuth:
 
         self._access_token: str = ""
         self._token_expires: datetime = datetime.min
+        self._token_lock = threading.Lock()
 
     @property
     def is_authenticated(self) -> bool:
         return bool(self._access_token) and datetime.now() < self._token_expires
 
     def get_token(self) -> str:
-        if self.is_authenticated:
-            return self._access_token
-        return self._issue_token()
+        with self._token_lock:
+            if self.is_authenticated:
+                return self._access_token
+            return self._issue_token()
 
     def _issue_token(self) -> str:
         url = f"{self.base_url}/oauth2/tokenP"
@@ -127,9 +130,14 @@ class MarketDataClient:
             resp = requests.get(url, headers=headers, params=params, timeout=15)
             resp.raise_for_status()
             data = resp.json()
-            if data.get("rt_cd") != "0":
-                logger.warning(f"KIS API warning: {data.get('msg1', 'unknown')}")
+            rt_cd = data.get("rt_cd", "")
+            if rt_cd != "0":
+                error_msg = data.get("msg1", "unknown")
+                logger.error(f"KIS API error [{path}] rt_cd={rt_cd}: {error_msg}")
+                raise RuntimeError(f"KIS API error [{rt_cd}]: {error_msg}")
             return data
+        except RuntimeError:
+            raise
         except Exception as e:
             logger.error(f"KIS API GET failed [{path}]: {e}")
             raise
@@ -306,6 +314,107 @@ class MarketDataClient:
             "foreign_net": _safe_int(today.get("frgn_ntby_qty", 0)),
             "institution_net": _safe_int(today.get("orgn_ntby_qty", 0)),
             "individual_net": _safe_int(today.get("prsn_ntby_qty", 0)),
+        }
+
+    def get_account_balance(self) -> dict:
+        """계좌 잔고 및 보유종목 조회 (KIS API).
+
+        Returns:
+            {
+                "cash": int,               # 예수금
+                "total_asset": int,         # 총자산
+                "positions": [              # 보유종목 리스트
+                    {"ticker": str, "name": str, "quantity": int,
+                     "avg_price": float, "current_price": int, "pnl": float, "pnl_pct": float},
+                ]
+            }
+        """
+        path = "/uapi/domestic-stock/v1/trading/inquire-balance"
+        # 실전/모의 tr_id 구분
+        if self.auth.account_type == "virtual":
+            tr_id = "VTTC8434R"
+        else:
+            tr_id = "TTTC8434R"
+
+        params = {
+            "CANO": self.auth.account_no[:8],
+            "ACNT_PRDT_CD": self.auth.account_product_code,
+            "AFHR_FLPR_YN": "N",
+            "OFL_YN": "",
+            "INQR_DVSN": "02",
+            "UNPR_DVSN": "01",
+            "FUND_STTL_ICLD_YN": "N",
+            "FNCG_AMT_AUTO_RDPT_YN": "N",
+            "PRCS_DVSN": "01",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+        }
+
+        try:
+            data = self._get(path, tr_id, params)
+        except RuntimeError as e:
+            # 장 외 시간 등에서 rt_cd != "0" 반환 시 빈 결과로 안전하게 처리
+            logger.warning(f"Account balance query failed (may be outside trading hours): {e}")
+            return {"cash": 0, "total_asset": 0, "positions": []}
+
+        # 보유종목 파싱
+        positions = []
+        for item in data.get("output1", []):
+            qty = _safe_int(item.get("hldg_qty", 0))
+            if qty <= 0:
+                continue
+            positions.append({
+                "ticker": item.get("pdno", ""),
+                "name": item.get("prdt_name", ""),
+                "quantity": qty,
+                "avg_price": _safe_float(item.get("pchs_avg_pric", 0)),
+                "current_price": _safe_int(item.get("prpr", 0)),
+                "pnl": _safe_float(item.get("evlu_pfls_amt", 0)),
+                "pnl_pct": _safe_float(item.get("evlu_pfls_rt", 0)),
+            })
+
+        # 계좌 요약 — 여러 필드 시도 (증권사 API 응답 형식 차이 대응)
+        output2 = data.get("output2", [{}])
+        summary = output2[0] if output2 else {}
+
+        invested = sum(p["quantity"] * p["current_price"] for p in positions)
+
+        # 총평가금액(tot_evlu_amt)이 가장 신뢰할 수 있는 기준값
+        total_asset = _safe_int(summary.get("tot_evlu_amt", 0))
+
+        # 예수금: dnca_tot_amt 사용. 0이면 total_asset에서 역산
+        cash = _safe_int(summary.get("dnca_tot_amt", 0))
+
+        if total_asset > 0 and invested > 0:
+            # total_asset이 있으면 cash를 역산 — 이중 계산 방지
+            derived_cash = total_asset - invested
+            if cash == 0 or abs(cash - total_asset) < abs(cash - derived_cash):
+                # cash가 0이거나, cash가 total_asset에 가까운 경우(=잘못된 값)
+                # → total_asset에서 역산
+                cash = derived_cash
+        elif total_asset == 0 and cash > 0:
+            total_asset = cash + invested
+        elif total_asset == 0 and cash == 0:
+            # 둘 다 0이면 nass_amt(순자산) 시도
+            nass = _safe_int(summary.get("nass_amt", 0))
+            if nass > 0:
+                total_asset = nass
+                cash = nass - invested
+            else:
+                total_asset = invested
+                cash = 0
+
+        logger.info(f"Account balance raw: dnca_tot_amt={summary.get('dnca_tot_amt')}, "
+                    f"nass_amt={summary.get('nass_amt')}, tot_evlu_amt={summary.get('tot_evlu_amt')}, "
+                    f"scts_evlu_amt={summary.get('scts_evlu_amt')}, "
+                    f"pchs_amt_smtl_amt={summary.get('pchs_amt_smtl_amt')}, "
+                    f"evlu_amt_smtl_amt={summary.get('evlu_amt_smtl_amt')}, "
+                    f"→ cash={cash}, total_asset={total_asset}, invested={invested}")
+
+        return {
+            "cash": cash,
+            "total_asset": total_asset,
+            "positions": positions,
         }
 
     def get_kospi_index(self) -> dict:

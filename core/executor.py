@@ -66,6 +66,10 @@ class OrderExecutor:
                 continue
 
             ticker = action.get("ticker", "")
+            if not ticker:
+                logger.warning("Action with empty ticker, skipping")
+                continue
+
             name = action.get("name", ticker)
             ratio = action.get("ratio", 0)
             urgency = action.get("urgency", "limit")
@@ -210,14 +214,16 @@ class OrderExecutor:
         return trade
 
     def _live_buy(self, ticker, name, quantity, price, urgency, fee, reason, signal_json) -> dict:
-        """실전 매수 — KIS API 호출."""
+        """실전 매수 — KIS API 호출.
+
+        주문 접수(SUBMITTED) 시 포트폴리오를 즉시 반영하지 않음.
+        장 시작 전/후 계좌 동기화 시 실제 체결 결과로 포트폴리오 갱신.
+        """
         tr_id = "TTTC0802U"  # 실전 매수
         if self.config.get("broker", {}).get("account_type") == "virtual":
             tr_id = "VTTC0802U"  # 모의 매수
 
-        ord_type = "01" if urgency == "limit" else "01"  # 지정가
-        if urgency == "immediate":
-            ord_type = "01"  # 시장가 대신 지정가 사용 (안전)
+        ord_type = "01"  # 지정가 (안전)
 
         body = {
             "CANO": self.auth.account_no[:8],
@@ -237,35 +243,49 @@ class OrderExecutor:
             data = resp.json()
 
             if data.get("rt_cd") == "0":
-                trade = self.portfolio.execute_buy(
-                    ticker=ticker, name=name, quantity=quantity,
-                    price=price, fee=fee, reason=reason, signal_json=signal_json,
-                )
-                trade["status"] = "SUBMITTED"
-                trade["order_no"] = data.get("output", {}).get("ODNO", "")
+                order_no = data.get("output", {}).get("ODNO", "")
                 self.safety_guard.record_trade(ticker)
-                logger.info(f"Live BUY order submitted: {ticker} x{quantity} @{price}")
-                return trade
+                logger.info(f"Live BUY order submitted: {ticker} x{quantity} @{price} (주문번호: {order_no})")
+                return {
+                    "timestamp": datetime.now().isoformat(),
+                    "ticker": ticker,
+                    "name": name,
+                    "action": "BUY",
+                    "quantity": quantity,
+                    "price": price,
+                    "amount": quantity * price,
+                    "fee": fee,
+                    "reason": reason,
+                    "status": "SUBMITTED",
+                    "order_no": order_no,
+                }
             else:
                 error_msg = data.get("msg1", "Unknown error")
                 logger.error(f"Live BUY failed: {error_msg}")
                 return {
-                    "ticker": ticker, "action": "BUY",
+                    "ticker": ticker, "name": name, "action": "BUY",
                     "status": "FAILED", "error": error_msg,
                 }
 
         except Exception as e:
             logger.error(f"Live BUY exception: {e}")
-            return {"ticker": ticker, "action": "BUY", "status": "FAILED", "error": str(e)}
+            return {"ticker": ticker, "name": name, "action": "BUY", "status": "FAILED", "error": str(e)}
 
     def _live_sell(self, ticker, quantity, price, urgency, fee, reason, signal_json) -> dict:
-        """실전 매도 — KIS API 호출."""
+        """실전 매도 — KIS API 호출.
+
+        주문 접수(SUBMITTED) 시 포트폴리오를 즉시 반영하지 않음.
+        """
         tr_id = "TTTC0801U"  # 실전 매도
         if self.config.get("broker", {}).get("account_type") == "virtual":
             tr_id = "VTTC0801U"  # 모의 매도
 
         ord_type = "01"  # 지정가
 
+        # 포지션 이름 가져오기
+        pos = self.portfolio.positions.get(ticker)
+        name = pos.name if pos else ticker
+
         body = {
             "CANO": self.auth.account_no[:8],
             "ACNT_PRDT_CD": self.auth.account_product_code,
@@ -284,27 +304,33 @@ class OrderExecutor:
             data = resp.json()
 
             if data.get("rt_cd") == "0":
-                name = self.portfolio.positions.get(ticker, Position(ticker, ticker, 0, 0)).name if ticker in self.portfolio.positions else ticker
-                trade = self.portfolio.execute_sell(
-                    ticker=ticker, quantity=quantity,
-                    price=price, fee=fee, reason=reason, signal_json=signal_json,
-                )
-                trade["status"] = "SUBMITTED"
-                trade["order_no"] = data.get("output", {}).get("ODNO", "")
+                order_no = data.get("output", {}).get("ODNO", "")
                 self.safety_guard.record_trade(ticker)
-                logger.info(f"Live SELL order submitted: {ticker} x{quantity} @{price}")
-                return trade
+                logger.info(f"Live SELL order submitted: {ticker} x{quantity} @{price} (주문번호: {order_no})")
+                return {
+                    "timestamp": datetime.now().isoformat(),
+                    "ticker": ticker,
+                    "name": name,
+                    "action": "SELL",
+                    "quantity": quantity,
+                    "price": price,
+                    "amount": quantity * price,
+                    "fee": fee,
+                    "reason": reason,
+                    "status": "SUBMITTED",
+                    "order_no": order_no,
+                }
             else:
                 error_msg = data.get("msg1", "Unknown error")
                 logger.error(f"Live SELL failed: {error_msg}")
                 return {
-                    "ticker": ticker, "action": "SELL",
+                    "ticker": ticker, "name": name, "action": "SELL",
                     "status": "FAILED", "error": error_msg,
                 }
 
         except Exception as e:
             logger.error(f"Live SELL exception: {e}")
-            return {"ticker": ticker, "action": "SELL", "status": "FAILED", "error": str(e)}
+            return {"ticker": ticker, "name": name, "action": "SELL", "status": "FAILED", "error": str(e)}
 
     def _calculate_fee(self, amount: float, side: str) -> float:
         """수수료 계산 (증권사 기본 수수료율).

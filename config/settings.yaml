@@ -1,60 +1,47 @@
-# ============================================================
-# AI Trader - 전역 설정
-# ============================================================
-
 system:
-  mode: "simulation"               # simulation | live
-  timezone: "Asia/Seoul"
-  log_level: "INFO"
-  db_path: "data/storage/trader.db"
-
-# 분석 주기 (분 단위)
+  mode: live
+  timezone: Asia/Seoul
+  log_level: INFO
+  db_path: data/storage/trader.db
 schedule:
-  data_collection_interval: 5      # 데이터 수집 주기
-  llm_analysis_interval: 15        # LLM 분석 주기
-  news_check_interval: 30          # 뉴스/공시 확인 주기
-  market_open: "09:00"
-  market_close: "15:30"
-
-# ML 설정
+  data_collection_interval: 5
+  llm_analysis_interval: 15
+  news_check_interval: 30
+  market_open: 09:00
+  market_close: '15:30'
 ml:
-  training_mode: "batch"           # batch | online | manual
-  retrain_schedule: "daily"        # daily | weekly | manual
+  training_mode: batch
+  retrain_schedule: daily
   models:
     price_direction: true
     market_regime: true
     anomaly_detection: true
-  lookback_days: 120               # 학습 데이터 기간
-  feature_window: 20               # 피처 윈도우 크기
-
-# LLM 설정
+  lookback_days: 120
+  feature_window: 20
 llm:
-  model: "claude-sonnet-4-6"
+  model: claude-sonnet-4-6
   max_tokens: 2048
   temperature: 0.3
   cost_limit_daily_usd: 5.0
   max_retries: 3
   timeout_seconds: 30
-
-# 증권사 API
 broker:
-  provider: "kis"
-  account_type: "real"             # virtual (모의) | real (실전) — simulation 모드면 주문 안 나감
-  base_url_virtual: "https://openapivts.koreainvestment.com:29443"
-  base_url_real: "https://openapi.koreainvestment.com:9443"
-  ws_url_virtual: "ws://ops.koreainvestment.com:31000"
-  ws_url_real: "ws://ops.koreainvestment.com:21000"
-
-# Telegram
+  provider: kis
+  account_type: real
+  base_url_virtual: https://openapivts.koreainvestment.com:29443
+  base_url_real: https://openapi.koreainvestment.com:9443
+  ws_url_virtual: ws://ops.koreainvestment.com:31000
+  ws_url_real: ws://ops.koreainvestment.com:21000
 telegram:
   enabled: true
   alert_levels:
-    - trade_executed
-    - signal_generated
-    - circuit_breaker
-    - daily_report
-    - confirmation_required
-    - strategy_suggestion
-    - screening_result
-    - error
-  confirmation_timeout_seconds: 300  # 확인 요청 타임아웃 5분
+  - trade_executed
+  - signal_generated
+  - llm_analysis
+  - circuit_breaker
+  - daily_report
+  - confirmation_required
+  - strategy_suggestion
+  - screening_result
+  - error
+  confirmation_timeout_seconds: 300

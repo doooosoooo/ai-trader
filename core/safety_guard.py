@@ -74,14 +74,17 @@ class SafetyGuard:
         if action_type == "HOLD":
             return []
 
-        # 1. 거래 시간 확인
+        # 1. 거래 시간 확인 (09:00 ~ 15:30)
         if self.rules.get("trading_hours_only", True):
             now = datetime.now()
             hour = now.hour
             minute = now.minute
-            market_open = hour > 9 or (hour == 9 and minute >= 0)
-            market_close = hour < 15 or (hour == 15 and minute <= 30)
-            if not (market_open and market_close):
+            # 09:00 이상
+            after_open = hour > 9 or (hour == 9 and minute >= 0)
+            # 15:30 이하
+            before_close = hour < 15 or (hour == 15 and minute <= 30)
+            in_market_hours = after_open and before_close
+            if not in_market_hours:
                 violations.append(SafetyViolation(
                     "trading_hours_only",
                     f"장 시간 외 거래 시도: {now.strftime('%H:%M')}",

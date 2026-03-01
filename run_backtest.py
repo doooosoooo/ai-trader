@@ -96,6 +96,7 @@ def cmd_backtest(
     bt = Backtester(initial_capital=capital, db_path=DB_PATH)
     result = bt.run(tickers, strategy, start_date, end_date)
     print_console_report(result)
+    result.save_to_db(DB_PATH)
 
 
 def cmd_compare(tickers: list[str], start_date: str, end_date: str, capital: float):
@@ -111,6 +112,7 @@ def cmd_compare(tickers: list[str], start_date: str, end_date: str, capital: flo
         strategy = factory()
         result = bt.run(tickers, strategy, start_date, end_date)
         results.append(result)
+        result.save_to_db(DB_PATH)
 
     print_comparison_report(results)
 
@@ -181,7 +183,7 @@ def main():
     group.add_argument("--collect-data", action="store_true", help="과거 데이터 수집")
     group.add_argument("--data-status", action="store_true", help="데이터 현황")
 
-    parser.add_argument("--strategy", type=str, default="swing", help="전략 (swing/daytrading/defensive)")
+    parser.add_argument("--strategy", type=str, default="swing", help="전략 (swing/daytrading)")
     parser.add_argument("--tickers", type=str, default=",".join(DEFAULT_TICKERS), help="종목코드 (콤마 구분)")
     parser.add_argument("--start", type=str, default="20240301", help="시작일 (YYYYMMDD)")
     parser.add_argument("--end", type=str, default=datetime.now().strftime("%Y%m%d"), help="종료일 (YYYYMMDD)")

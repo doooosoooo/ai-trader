@@ -9,6 +9,7 @@ import json
 import re
 import signal
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -38,7 +39,7 @@ from core.safety_guard import SafetyGuard
 from core.circuit_breaker import CircuitBreaker, CircuitState
 from core.llm_engine import LLMEngine
 from core.ml_engine import MLEngine
-from core.portfolio import Portfolio
+from core.portfolio import Portfolio, Position
 from core.executor import OrderExecutor
 from data.pipeline import DataPipeline
 from interfaces.telegram_bot import TelegramBot
@@ -104,10 +105,37 @@ class TradingSystem:
         )
         self.llm_engine = LLMEngine(settings)
         self.ml_engine = MLEngine(settings)
-        self.portfolio = Portfolio(mode=settings.get("mode", "simulation"))
+        self.portfolio = Portfolio(mode=self.config_manager.get_mode())
 
-        # 초기 자본금 설정 (포트폴리오가 비어있으면)
-        if self.portfolio.total_asset == 0:
+        # live 모드면 실계좌 동기화, 시뮬레이션이면 초기 자본금 설정
+        if self.config_manager.get_mode() == "live":
+            try:
+                account = self.market_client.get_account_balance()
+                # API 실패로 빈 결과가 돌아온 경우 동기화 스킵
+                if account["total_asset"] == 0 and not account["positions"]:
+                    raise RuntimeError("Empty account data returned (API may be unavailable)")
+                self.portfolio.cash = account["cash"]
+                # initial_capital은 최초 1회만 설정
+                if self.portfolio.initial_capital == 0 and account["total_asset"] > 0:
+                    self.portfolio.initial_capital = account["total_asset"]
+                self.portfolio.positions.clear()
+                for pos_data in account["positions"]:
+                    self.portfolio.positions[pos_data["ticker"]] = Position(
+                        ticker=pos_data["ticker"],
+                        name=pos_data["name"],
+                        quantity=pos_data["quantity"],
+                        avg_price=pos_data["avg_price"],
+                        current_price=pos_data["current_price"],
+                    )
+                    if pos_data["ticker"] not in TICKER_NAMES and pos_data["name"]:
+                        TICKER_NAMES[pos_data["ticker"]] = pos_data["name"]
+                self.portfolio._save_state()
+                logger.info(f"Live account synced: cash={account['cash']:,}, positions={len(account['positions'])}")
+            except Exception as e:
+                logger.error(f"Live account sync failed on startup: {e}")
+                if self.portfolio.total_asset == 0:
+                    self.portfolio.initialize(10_000_000)
+        elif self.portfolio.total_asset == 0:
             self.portfolio.initialize(10_000_000)  # 기본 1000만원
 
         self.executor = OrderExecutor(
@@ -139,7 +167,7 @@ class TradingSystem:
         # State
         self._paused = False
         self._running = False
-        self._last_analysis: dict | None = None  # 마지막 LLM 분석 결과
+        self._last_analysis: dict | None = self._load_last_analysis()  # 마지막 LLM 분석 결과
         self._watchlist = self._get_watchlist()
 
         # 시작 시 히스토리 데이터 사전 수집
@@ -172,7 +200,6 @@ class TradingSystem:
 
     def _prefetch_historical_data(self):
         """시작 시 관심종목 + 보유종목의 히스토리 데이터가 부족하면 사전 수집."""
-        import time
         held = list(self.portfolio.positions.keys())
         all_tickers = list(set(self._watchlist + held))
         min_bars = 120  # 지표 계산에 필요한 최소 일수
@@ -343,6 +370,19 @@ class TradingSystem:
             )
             self.circuit_breaker.record_api_success()
 
+            # 1-b. 시세 데이터 유효성 검증
+            market_data = data.get("market_data", {})
+            valid_prices = {k: v for k, v in market_data.items()
+                          if isinstance(v, dict) and v.get("current", {}).get("price", 0) > 0}
+            if not valid_prices:
+                logger.critical("All market data collection failed — skipping LLM analysis")
+                return
+
+            # 1-c. 이전 예측 평가 (현재 가격으로 이전 분석의 정확도 측정)
+            all_tickers = list(set(self._watchlist + held_tickers))
+            eval_prices = self.data_pipeline.collect_prices_only(all_tickers)
+            self._evaluate_previous_predictions(eval_prices)
+
             # 2. ML 예측
             ml_predictions = {}
             if self.ml_engine.is_ready:
@@ -364,8 +404,10 @@ class TradingSystem:
                 "progress": f"{(current_pnl / monthly_target * 100):.0f}%" if monthly_target > 0 else "N/A",
             }
 
-            # 4. LLM 분석 (스크리닝 결과를 전략 컨텍스트에 주입)
+            # 4. LLM 분석 (스크리닝 결과 + 예측 피드백 + 백테스트 피드백 주입)
             screening_context = self._build_screening_context()
+            prediction_feedback = self._build_prediction_feedback()
+            backtest_feedback = self._build_backtest_feedback()
             signal = self.llm_engine.analyze_market(
                 portfolio=portfolio_summary,
                 market_data=data.get("market_data", {}),
@@ -373,6 +415,8 @@ class TradingSystem:
                 news_summary=data.get("news_summary", ""),
                 macro_data=data.get("macro_data", {}),
                 screening_context=screening_context,
+                prediction_feedback=prediction_feedback,
+                backtest_feedback=backtest_feedback,
             )
             self.circuit_breaker.record_llm_success()
 
@@ -387,6 +431,18 @@ class TradingSystem:
                             message=f"파라미터 조정: {r['param']} → {r['value']} ({r['reason']})",
                         )
 
+            # 5-b. LLM 출력 ticker 검증 — 관심종목 + 보유종목에 없는 ticker 제거
+            valid_tickers = set(self._watchlist + held_tickers)
+            validated_actions = []
+            for action in signal.get("actions", []):
+                action_type = action.get("type", "").upper()
+                ticker = action.get("ticker", "")
+                if action_type == "HOLD" or ticker in valid_tickers:
+                    validated_actions.append(action)
+                else:
+                    logger.warning(f"LLM hallucinated ticker rejected: {ticker} ({action.get('name', '')})")
+            signal["actions"] = validated_actions
+
             # 6. Safety Guard 필터링
             filtered = self.safety_guard.filter_actions(
                 signal, self.portfolio.get_summary(), self.portfolio.total_asset,
@@ -396,33 +452,88 @@ class TradingSystem:
                 for sf in filtered["safety_filtered"]:
                     logger.warning(f"Action filtered: {sf['rule']} — {sf['message']}")
 
-            # 7. 주문 실행
+            # 7. 주문 실행 (익절 매도는 텔레그램 확인 후 실행)
             actions = filtered.get("actions", [])
             if actions:
                 current_prices = self.data_pipeline.collect_prices_only(
                     [a["ticker"] for a in actions if a.get("ticker")]
                 )
-                results = self.executor.execute_signal(filtered, current_prices)
 
-                for result in results:
-                    if result.get("status") in ("SIMULATED", "SUBMITTED"):
-                        # 시뮬레이션 추적
-                        if self.config_manager.get_mode() == "simulation":
-                            self.sim_tracker.record_trade(result)
+                # 서킷브레이커 상태에 따라 BUY/SELL 필터링
+                if not self.circuit_breaker.is_buy_allowed:
+                    blocked = [a for a in actions if a.get("type", "").upper() == "BUY"]
+                    if blocked:
+                        logger.warning(
+                            f"Circuit breaker [{self.circuit_breaker.state.value}] blocked "
+                            f"{len(blocked)} BUY action(s)"
+                        )
+                    actions = [a for a in actions if a.get("type", "").upper() != "BUY"]
 
-                        # Telegram 알림 (동기 래퍼 사용 — executor 스레드 호환)
-                        if self.telegram.enabled:
-                            self.telegram.send_alert_sync(
-                                "trade_executed",
-                                self._format_trade_msg(result),
-                            )
+                if not self.circuit_breaker.is_sell_allowed:
+                    blocked = [a for a in actions if a.get("type", "").upper() == "SELL"]
+                    if blocked:
+                        logger.warning(
+                            f"Circuit breaker [{self.circuit_breaker.state.value}] blocked "
+                            f"{len(blocked)} SELL action(s)"
+                        )
+                    actions = [a for a in actions if a.get("type", "").upper() != "SELL"]
+
+                if not actions:
+                    logger.info("All actions blocked by circuit breaker")
+
+                # 익절 매도 분리: 수익 중인 SELL은 확인 대기
+                auto_actions = []
+                confirm_actions = []
+                for action in actions:
+                    ticker = action.get("ticker", "")
+                    if (action.get("type", "").upper() == "SELL"
+                            and ticker in self.portfolio.positions):
+                        pos = self.portfolio.positions[ticker]
+                        cp = current_prices.get(ticker, pos.current_price)
+                        if cp > pos.avg_price:  # 수익 중 → 확인 필요
+                            confirm_actions.append(action)
+                            continue
+                    auto_actions.append(action)
+
+                # 확인 불필요 주문 즉시 실행
+                if auto_actions:
+                    auto_signal = {**filtered, "actions": auto_actions}
+                    results = self.executor.execute_signal(auto_signal, current_prices)
+                    for result in results:
+                        self._process_trade_result(result)
+
+                # 익절 매도 확인 요청
+                for action in confirm_actions:
+                    ticker = action["ticker"]
+                    pos = self.portfolio.positions[ticker]
+                    cp = current_prices.get(ticker, pos.current_price)
+                    pnl = (cp - pos.avg_price) * pos.quantity
+                    pnl_pct = (cp - pos.avg_price) / pos.avg_price * 100
+
+                    if self.telegram.enabled:
+                        self._request_sell_confirmation(
+                            action=action,
+                            signal=filtered,
+                            current_price=cp,
+                            pnl=pnl,
+                            pnl_pct=pnl_pct,
+                        )
 
             # 8. 분석 결과 저장 + 텔레그램 전송
             self._last_analysis = {
                 "signal": signal,
                 "actions": actions,
                 "timestamp": datetime.now().isoformat(),
+                "portfolio": portfolio_summary,
             }
+            self._save_last_analysis()
+            self._append_analysis_log(
+                signal=signal,
+                actions=actions,
+                portfolio=portfolio_summary,
+                ml_predictions=ml_predictions,
+                prices=eval_prices,
+            )
             if self.telegram.enabled:
                 try:
                     analysis_msg = self._format_analysis_msg(signal, actions)
@@ -441,13 +552,150 @@ class TradingSystem:
             logger.exception(f"LLM analysis cycle failed: {e}")
             self.circuit_breaker.record_llm_failure()
 
+    def _process_trade_result(self, result: dict) -> None:
+        """매매 결과 처리 — 알림 + 시뮬레이션 추적 + live 계좌 동기화."""
+        status = result.get("status", "")
+
+        if status == "SIMULATED":
+            self.sim_tracker.record_trade(result)
+            if self.telegram.enabled:
+                self.telegram.send_alert_sync(
+                    "trade_executed",
+                    self._format_trade_msg(result),
+                )
+
+        elif status == "SUBMITTED":
+            # Live 주문 접수됨 — 포트폴리오는 즉시 반영하지 않음
+            # 다음 계좌 동기화 시 실제 체결 결과로 반영
+            if self.telegram.enabled:
+                mode_tag = "[LIVE]"
+                order_no = result.get("order_no", "")
+                self.telegram.send_alert_sync(
+                    "trade_executed",
+                    f"{mode_tag} {self._format_trade_msg(result)}\n주문번호: {order_no}",
+                )
+            # 주문 후 계좌 동기화 (체결 반영) — 최대 3회 재시도
+            synced = False
+            for attempt in range(3):
+                try:
+                    if attempt > 0:
+                        time.sleep(2 * attempt)  # 2초, 4초 대기
+                    self.sync_account_from_broker()
+                    synced = True
+                    break
+                except Exception as e:
+                    logger.warning(f"Post-trade sync attempt {attempt + 1}/3 failed: {e}")
+            if not synced:
+                logger.error("Post-trade account sync failed after 3 attempts")
+                if self.telegram.enabled:
+                    self.telegram.send_alert_sync(
+                        "error",
+                        "⚠️ 주문 후 계좌 동기화 실패 (3회 재시도)\n"
+                        "포트폴리오가 실제 계좌와 다를 수 있습니다.\n"
+                        "/status 로 확인해주세요.",
+                    )
+
+        elif status == "PENDING_CONFIRMATION":
+            # 대규모 주문 확인 필요 — 텔레그램으로 확인 요청
+            if self.telegram.enabled:
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        asyncio.ensure_future(
+                            self.telegram.request_confirmation(result)
+                        )
+                    else:
+                        loop.run_until_complete(
+                            self.telegram.request_confirmation(result)
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to send confirmation request: {e}")
+
+        elif status == "FAILED":
+            if self.telegram.enabled:
+                error = result.get("error", "unknown")
+                self.telegram.send_alert_sync(
+                    "error",
+                    f"주문 실패: {result.get('name', result.get('ticker', ''))} "
+                    f"{result.get('action', '')} — {error}",
+                )
+
+    def _request_sell_confirmation(
+        self, action: dict, signal: dict, current_price: float,
+        pnl: float, pnl_pct: float,
+    ) -> None:
+        """익절 매도 확인 요청을 텔레그램으로 전송."""
+        ticker = action["ticker"]
+        name = action.get("name", ticker)
+        pos = self.portfolio.positions.get(ticker)
+        if not pos:
+            return
+
+        order_info = {
+            "ticker": ticker,
+            "name": name,
+            "action": "SELL",
+            "quantity": int(pos.quantity * action.get("ratio", 1.0)) or pos.quantity,
+            "price": current_price,
+            "amount": int((int(pos.quantity * action.get("ratio", 1.0)) or pos.quantity) * current_price),
+            "reason": action.get("reason", ""),
+            "pnl": f"{pnl:+,.0f}원 ({pnl_pct:+.1f}%)",
+            "signal": signal,
+            "action_data": action,
+        }
+
+        # 텔레그램 확인 요청 (비동기이므로 sync wrapper)
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.ensure_future(
+                    self.telegram.request_sell_confirmation(order_info)
+                )
+            else:
+                loop.run_until_complete(
+                    self.telegram.request_sell_confirmation(order_info)
+                )
+            logger.info(f"Sell confirmation requested: {name}({ticker}) PnL: {pnl:+,.0f}원")
+        except Exception as e:
+            logger.warning(f"Failed to request sell confirmation: {e}")
+            # 확인 실패 시 자동 실행하지 않음 (안전)
+
+    _NEWS_LOG_PATH = Path(__file__).parent / "data" / "news_history.jsonl"
+
     def cycle_news_check(self):
-        """뉴스/공시 체크 사이클."""
+        """뉴스/공시 체크 사이클 — 주말/공휴일 포함 상시 수집."""
         if self._paused:
             return
-        # 뉴스 수집은 data_pipeline에서 처리됨
-        # 긴급 공시 감지 시 LLM 임시 분석 트리거 가능
-        logger.debug("News check cycle")
+
+        try:
+            all_news = []
+            # 관심종목 뉴스
+            for ticker in self._watchlist[:5]:
+                news = self.data_pipeline.news_collector.collect_stock_news(ticker, count=5)
+                all_news.extend(news)
+            # 보유종목 뉴스 (관심종목과 겹치지 않는 것만)
+            held = [t for t in self.portfolio.positions.keys() if t not in self._watchlist[:5]]
+            for ticker in held[:3]:
+                news = self.data_pipeline.news_collector.collect_stock_news(ticker, count=5)
+                all_news.extend(news)
+            # 시장 뉴스
+            market_news = self.data_pipeline.news_collector.collect_market_news(count=10)
+            all_news.extend(market_news)
+
+            if all_news:
+                # JSONL에 누적 저장
+                record = {
+                    "timestamp": datetime.now().isoformat(),
+                    "count": len(all_news),
+                    "news": all_news,
+                }
+                with open(self._NEWS_LOG_PATH, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+            logger.info(f"News check complete: {len(all_news)} items collected")
+
+        except Exception as e:
+            logger.warning(f"News check failed: {e}")
 
     def cycle_circuit_check(self):
         """서킷브레이커 정기 체크."""
@@ -458,10 +706,19 @@ class TradingSystem:
         except Exception as e:
             logger.debug(f"KOSPI check skipped (API unavailable): {e}")
 
-        # 일일 손실 체크
-        snapshots = self.portfolio.get_daily_snapshots(days=1)
-        if snapshots:
-            daily_pnl_pct = snapshots[0].get("daily_pnl_pct", 0)
+        # 일일 손실 체크 — 전일 종가 기준 vs 현재 자산으로 실시간 계산
+        snapshots = self.portfolio.get_daily_snapshots(days=2)
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        # 전일 스냅샷 찾기 (오늘 것 제외)
+        prev_asset = None
+        for snap in snapshots:
+            if snap.get("date") != today_str:
+                prev_asset = snap.get("total_asset", 0)
+                break
+        if prev_asset is None:
+            prev_asset = self.portfolio.initial_capital
+        if prev_asset > 0:
+            daily_pnl_pct = (self.portfolio.total_asset - prev_asset) / prev_asset
             self.circuit_breaker.check_daily_loss(daily_pnl_pct)
 
         # 총자산 비상 체크
@@ -543,6 +800,196 @@ class TradingSystem:
 
         return msg
 
+    def cycle_backtest(self):
+        """주간 자동 백테스트 + 최적화 — watchlist 종목 대상 × 3개 전략."""
+        from simulation.backtest import Backtester
+        from simulation.strategies import STRATEGY_REGISTRY
+        from simulation.optimizer import train_test_split
+
+        tickers = list(set(self._watchlist + list(self.portfolio.positions.keys())))
+        if not tickers:
+            logger.info("No tickers for backtest, skipping")
+            return
+
+        db_path = str(Path(__file__).parent / "data" / "storage" / "trader.db")
+        end_date = datetime.now().strftime("%Y%m%d")
+        from dateutil.relativedelta import relativedelta
+        start_date = (datetime.now() - relativedelta(months=6)).strftime("%Y%m%d")
+
+        param_grid = {
+            "rsi_oversold": [25, 30, 35],
+            "take_profit_pct": [0.05, 0.10, 0.15],
+            "stop_loss_pct": [0.03, 0.05, 0.07],
+            "position_size_pct": [0.08, 0.10],
+        }
+
+        results_summary = []
+        for strategy_name, factory in STRATEGY_REGISTRY.items():
+            try:
+                bt = Backtester(initial_capital=10_000_000, db_path=db_path)
+
+                # 1. 파라미터 최적화 (train/test split)
+                logger.info(f"Optimizing {strategy_name}...")
+                split_result = train_test_split(
+                    bt, tickers, factory, param_grid, start_date, end_date,
+                )
+
+                if "error" not in split_result:
+                    best_params = split_result["best_params"]
+                    test_m = split_result["test_metrics"]
+                    train_m = split_result["train_metrics"]
+                    overfit = split_result["overfit_ratio"]
+
+                    # 과적합 비율 검증: 0.3~5.0 범위 + test 샤프 양수일 때만 저장
+                    if 0.3 <= overfit <= 5.0 and test_m.get("sharpe_ratio", 0) > 0:
+                        self._save_optimized_params(strategy_name, best_params, {
+                            "train_return": train_m.get("total_return", 0),
+                            "test_return": test_m.get("total_return", 0),
+                            "train_sharpe": train_m.get("sharpe_ratio", 0),
+                            "test_sharpe": test_m.get("sharpe_ratio", 0),
+                            "overfit_ratio": overfit,
+                        })
+                        logger.info(f"Optimized {strategy_name}: {best_params} (overfit={overfit:.2f})")
+                    else:
+                        logger.warning(
+                            f"Skipping optimization for {strategy_name}: "
+                            f"overfit ratio too low ({overfit:.2f})"
+                        )
+
+                # 2. 최적화된 파라미터로 전체 기간 백테스트
+                opt_params = self._load_optimized_params(strategy_name)
+                strategy = factory(opt_params)
+                result = bt.run(tickers, strategy, start_date, end_date)
+                if "error" not in result.metrics:
+                    result.save_to_db(db_path)
+                    results_summary.append({
+                        "name": strategy_name,
+                        "return": result.metrics.get("total_return", 0),
+                        "win_rate": result.metrics.get("win_rate", 0),
+                        "sharpe": result.metrics.get("sharpe_ratio", 0),
+                        "mdd": result.metrics.get("max_drawdown", 0),
+                        "trades": result.metrics.get("total_trades", 0),
+                        "optimized": opt_params is not None,
+                    })
+            except Exception as e:
+                logger.error(f"Backtest/optimize failed for {strategy_name}: {e}")
+
+        if results_summary and self.telegram.enabled:
+            msg = self._format_backtest_summary(results_summary, start_date, end_date)
+            self.telegram.send_alert_sync("backtest_result", msg)
+
+        logger.info(f"Weekly backtest+optimize complete | {len(results_summary)} strategies")
+
+    def _format_backtest_summary(self, results: list[dict], start: str, end: str) -> str:
+        """백테스트 요약 텔레그램 메시지."""
+        msg = (
+            f"📊 <b>주간 백테스트 결과</b>\n"
+            f"기간: {start[:4]}-{start[4:6]}-{start[6:]} ~ {end[:4]}-{end[4:6]}-{end[6:]}\n"
+            f"━━━━━━━━━━━━━━\n"
+        )
+        for r in results:
+            ret_emoji = "🟢" if r["return"] > 0 else "🔴"
+            opt_tag = " ⚙️" if r.get("optimized") else ""
+            msg += (
+                f"\n{ret_emoji} <b>{r['name']}</b>{opt_tag}\n"
+                f"  수익률: {r['return']:+.1%} | 승률: {r['win_rate']:.0%}\n"
+                f"  샤프: {r['sharpe']:.2f} | MDD: {r['mdd']:.1%}\n"
+                f"  거래: {r['trades']}건\n"
+            )
+        # 최고 전략 추천
+        if results:
+            best = max(results, key=lambda x: x["sharpe"])
+            msg += f"\n💡 최적 전략: <b>{best['name']}</b> (샤프 {best['sharpe']:.2f})"
+        return msg
+
+    def sync_account_from_broker(self) -> dict | None:
+        """KIS API에서 실제 계좌 잔고/보유종목을 가져와 포트폴리오 동기화.
+
+        Returns:
+            동기화 결과 dict 또는 실패 시 None
+        """
+        try:
+            account = self.market_client.get_account_balance()
+            # API 실패로 빈 결과가 돌아온 경우 기존 포트폴리오 유지
+            if account["total_asset"] == 0 and not account["positions"]:
+                raise RuntimeError("Empty account data returned (API may be unavailable)")
+            logger.info(f"Account sync: cash={account['cash']:,}, "
+                       f"positions={len(account['positions'])}, "
+                       f"total={account['total_asset']:,}")
+
+            # 포트폴리오 현금 동기화
+            self.portfolio.cash = account["cash"]
+            # initial_capital은 최초 1회만 설정 (이후 동기화에서 덮어쓰면 PnL 추적이 깨짐)
+            if self.portfolio.initial_capital == 0 and account["total_asset"] > 0:
+                self.portfolio.initial_capital = account["total_asset"]
+
+            # 보유종목 동기화 — 기존 시뮬레이션 포지션 제거 후 실제 데이터로 교체
+            self.portfolio.positions.clear()
+            for pos_data in account["positions"]:
+                self.portfolio.positions[pos_data["ticker"]] = Position(
+                    ticker=pos_data["ticker"],
+                    name=pos_data["name"],
+                    quantity=pos_data["quantity"],
+                    avg_price=pos_data["avg_price"],
+                    current_price=pos_data["current_price"],
+                )
+                # TICKER_NAMES에 추가
+                if pos_data["ticker"] not in TICKER_NAMES and pos_data["name"]:
+                    TICKER_NAMES[pos_data["ticker"]] = pos_data["name"]
+
+            self.portfolio._save_state()
+            logger.info(f"Portfolio synced from broker: {len(account['positions'])} positions")
+            return account
+
+        except Exception as e:
+            logger.error(f"Account sync failed: {e}")
+            raise
+
+    def switch_mode(self, mode: str) -> str:
+        """모드 전환 + 필요 시 계좌 동기화.
+
+        거래 일시 중지 → 모드 전환 → 재개 순서로 안전하게 전환.
+
+        Returns:
+            결과 메시지
+        """
+        old_mode = self.config_manager.get_mode()
+        # 전환 중 매매 방지
+        was_paused = self._paused
+        self._paused = True
+
+        self.config_manager.set_mode(mode)
+        self.portfolio.mode = mode
+        self.executor.mode = mode
+
+        if mode == "live":
+            # 실계좌 동기화
+            try:
+                account = self.sync_account_from_broker()
+                pos_count = len(account["positions"])
+                msg = (
+                    f"🔴 LIVE 모드 전환 완료\n"
+                    f"계좌 동기화 성공\n"
+                    f"  예수금: {account['cash']:,.0f}원\n"
+                    f"  보유종목: {pos_count}개\n"
+                    f"  총평가: {account['total_asset']:,.0f}원"
+                )
+            except Exception as e:
+                logger.error(f"Mode switch account sync failed: {e}")
+                msg = (
+                    f"🔴 LIVE 모드 전환 완료\n"
+                    f"⚠️ 계좌 동기화 실패 — 수동 확인 필요"
+                )
+        else:
+            msg = f"🔵 시뮬레이션 모드 전환 완료 (이전: {old_mode})"
+
+        # 거래 재개
+        if not was_paused:
+            self._paused = False
+
+        logger.info(f"Mode switched: {old_mode} → {mode}")
+        return msg
+
     def on_market_open(self):
         """장 시작 전 초기화."""
         logger.info("Market opening — initializing")
@@ -550,7 +997,13 @@ class TradingSystem:
         self.config_manager.reload()
         self._watchlist = self._get_watchlist()
 
-        if self.config_manager.get_mode() == "simulation":
+        # live 모드면 장 시작 전 계좌 동기화
+        if self.config_manager.get_mode() == "live":
+            try:
+                self.sync_account_from_broker()
+            except Exception as e:
+                logger.error(f"Market open account sync failed: {e}")
+        else:
             self.sim_tracker.start_session()
 
     def on_market_close(self):
@@ -672,7 +1125,6 @@ class TradingSystem:
         bt = Backtester(initial_capital=capital)
 
         # 데이터 부족 종목 자동 수집 (최소 400일)
-        import time
         min_bars = 400
         for ticker in tickers:
             stored = self.data_pipeline.price_collector.get_stored_daily(ticker, min_bars)
@@ -690,14 +1142,22 @@ class TradingSystem:
             factory = STRATEGY_REGISTRY.get(strategy_name)
             if not factory:
                 return [f"지원 전략: {list(STRATEGY_REGISTRY.keys())}"]
-            strategy = factory()
+            opt_params = self._load_optimized_params(strategy_name)
+            strategy = factory(opt_params)
+            if opt_params:
+                messages.append(f"⚙️ 최적화된 파라미터 적용: {opt_params}")
             result = bt.run(tickers, strategy, start_date, end_date)
+            if "error" not in result.metrics:
+                result.save_to_db(bt.db_path)
             messages.append(format_telegram_report(result))
 
         elif mode == "compare":
             for name, factory in STRATEGY_REGISTRY.items():
-                strategy = factory()
+                opt_params = self._load_optimized_params(name)
+                strategy = factory(opt_params)
                 result = bt.run(tickers, strategy, start_date, end_date)
+                if "error" not in result.metrics:
+                    result.save_to_db(bt.db_path)
                 messages.append(format_telegram_report(result))
 
         elif mode == "optimize":
@@ -753,7 +1213,28 @@ class TradingSystem:
             # 최적 파라미터로 전체 기간 백테스트
             best_strategy = factory(bp)
             full_result = bt.run(tickers, best_strategy, start_date, end_date)
+            if "error" not in full_result.metrics:
+                full_result.save_to_db(bt.db_path)
             messages.append("📊 <b>최적 파라미터 전체 기간 결과</b>\n" + format_telegram_report(full_result))
+
+            # 최적 파라미터 저장 — overfit 가드 적용
+            if 0.3 <= overfit <= 5.0 and test_m.get("sharpe_ratio", 0) > 0:
+                self._save_optimized_params(strategy_name, bp, {
+                    "train_return": train_m.get("total_return", 0),
+                    "test_return": test_m.get("total_return", 0),
+                    "train_sharpe": train_m.get("sharpe_ratio", 0),
+                    "test_sharpe": test_m.get("sharpe_ratio", 0),
+                    "overfit_ratio": overfit,
+                })
+                messages.append(
+                    f"✅ 최적 파라미터가 저장되었습니다.\n"
+                    f"다음 /backtest 실행 시 최적화된 파라미터로 실행됩니다."
+                )
+            else:
+                messages.append(
+                    f"⚠️ 과적합 비율({overfit:.2f}) 또는 test 샤프({test_m.get('sharpe_ratio', 0):.2f})가 "
+                    f"기준 미달로 파라미터를 저장하지 않았습니다."
+                )
 
         return messages or ["결과 없음"]
 
@@ -788,6 +1269,406 @@ class TradingSystem:
         self.trading_scheduler.resume_trading_jobs()
         logger.info("Trading resumed")
 
+    _ANALYSIS_PATH = Path(__file__).parent / "data" / "last_analysis.json"
+    _ANALYSIS_LOG_PATH = Path(__file__).parent / "data" / "analysis_history.jsonl"
+    _OUTCOMES_PATH = Path(__file__).parent / "data" / "prediction_outcomes.jsonl"
+    _OPTIMIZED_PARAMS_PATH = Path(__file__).parent / "data" / "optimized_params.json"
+
+    def _load_last_analysis(self) -> dict | None:
+        """파일에서 마지막 분석 결과 로드."""
+        try:
+            if self._ANALYSIS_PATH.exists():
+                with open(self._ANALYSIS_PATH, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to load last analysis: {e}")
+        return None
+
+    def _save_last_analysis(self) -> None:
+        """마지막 분석 결과를 파일에 저장."""
+        try:
+            with open(self._ANALYSIS_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._last_analysis, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to save last analysis: {e}")
+
+    def _save_optimized_params(self, strategy_name: str, params: dict, metrics: dict):
+        """최적화된 전략 파라미터를 파일에 저장."""
+        try:
+            # 기존 데이터 로드
+            all_params = {}
+            if self._OPTIMIZED_PARAMS_PATH.exists():
+                with open(self._OPTIMIZED_PARAMS_PATH, "r", encoding="utf-8") as f:
+                    all_params = json.load(f)
+
+            all_params[strategy_name] = {
+                "params": params,
+                "metrics": metrics,
+                "updated_at": datetime.now().isoformat(),
+            }
+
+            with open(self._OPTIMIZED_PARAMS_PATH, "w", encoding="utf-8") as f:
+                json.dump(all_params, f, ensure_ascii=False, indent=2)
+            logger.info(f"Optimized params saved for {strategy_name}: {params}")
+        except Exception as e:
+            logger.warning(f"Failed to save optimized params: {e}")
+
+    def _load_optimized_params(self, strategy_name: str) -> dict | None:
+        """저장된 최적화 파라미터 로드. 없으면 None."""
+        try:
+            if not self._OPTIMIZED_PARAMS_PATH.exists():
+                return None
+            with open(self._OPTIMIZED_PARAMS_PATH, "r", encoding="utf-8") as f:
+                all_params = json.load(f)
+            entry = all_params.get(strategy_name)
+            return entry.get("params") if entry else None
+        except Exception:
+            return None
+
+    def _build_backtest_feedback(self) -> str:
+        """최근 백테스트 결과를 LLM 프롬프트용 피드백 텍스트로 생성."""
+        try:
+            import sqlite3 as _sqlite3
+            db_path = str(Path(__file__).parent / "data" / "storage" / "trader.db")
+            with _sqlite3.connect(db_path) as conn:
+                conn.row_factory = _sqlite3.Row
+                # 최근 백테스트 결과 조회 (전략별 최신 1건씩)
+                rows = conn.execute("""
+                    SELECT * FROM backtest_results
+                    WHERE id IN (
+                        SELECT MAX(id) FROM backtest_results
+                        GROUP BY strategy_name
+                    )
+                    ORDER BY created_at DESC
+                """).fetchall()
+
+            if not rows:
+                return ""
+
+            results = [dict(r) for r in rows]
+            created = results[0].get("created_at", "")[:10]
+
+            parts = [f"최근 백테스트 실행일: {created}", ""]
+
+            # 전략별 성과 요약
+            parts.append("전략별 성과:")
+            for r in results:
+                total_ret = r.get("total_return", 0)
+                win_rate = r.get("win_rate", 0)
+                mdd = r.get("max_drawdown", 0)
+                sharpe = r.get("sharpe_ratio", 0)
+                pf = r.get("profit_factor", 0)
+                trades = r.get("total_trades", 0)
+                period = f"{r.get('period_start', '')}~{r.get('period_end', '')}"
+                parts.append(
+                    f"- {r['strategy_name']}: 수익률 {total_ret:+.1%}, "
+                    f"승률 {win_rate:.0%}, MDD {mdd:.1%}, "
+                    f"샤프 {sharpe:.2f}, 손익비 {pf:.2f}, "
+                    f"거래 {trades}건 ({period})"
+                )
+
+            # 종목별 성과 (현재 watchlist 기준)
+            watchlist_tickers = set(self._watchlist + list(self.portfolio.positions.keys()))
+            ticker_summary: dict[str, list[str]] = {}
+            for r in results:
+                try:
+                    breakdown = json.loads(r.get("ticker_breakdown_json", "{}"))
+                except Exception:
+                    continue
+                for ticker, stats in breakdown.items():
+                    if ticker not in watchlist_tickers:
+                        continue
+                    wins = stats.get("wins", 0)
+                    losses = stats.get("losses", 0)
+                    avg_pnl = stats.get("avg_pnl_pct", 0)
+                    name = TICKER_NAMES.get(ticker, ticker)
+                    label = "양호" if avg_pnl > 0 else "주의"
+                    if ticker not in ticker_summary:
+                        ticker_summary[ticker] = []
+                    ticker_summary[ticker].append(
+                        f"{r['strategy_name']} {avg_pnl:+.1%}({wins}승{losses}패)"
+                    )
+
+            if ticker_summary:
+                parts.extend(["", "종목별 백테스트 성과 (관심종목):"])
+                for ticker, summaries in sorted(ticker_summary.items()):
+                    name = TICKER_NAMES.get(ticker, ticker)
+                    parts.append(f"- {name}({ticker}): {', '.join(summaries)}")
+
+            # 최적화된 파라미터 정보
+            if self._OPTIMIZED_PARAMS_PATH.exists():
+                try:
+                    with open(self._OPTIMIZED_PARAMS_PATH, "r", encoding="utf-8") as f:
+                        opt_data = json.load(f)
+                    if opt_data:
+                        parts.extend(["", "최적화된 전략 파라미터:"])
+                        for sname, entry in opt_data.items():
+                            p = entry.get("params", {})
+                            m = entry.get("metrics", {})
+                            param_str = ", ".join(f"{k}={v}" for k, v in p.items())
+                            parts.append(
+                                f"- {sname}: {param_str} "
+                                f"(test 수익률 {m.get('test_return', 0):+.1%}, "
+                                f"test 샤프 {m.get('test_sharpe', 0):.2f})"
+                            )
+                except Exception:
+                    pass
+
+            return "\n".join(parts)
+
+        except Exception as e:
+            logger.debug(f"Backtest feedback unavailable: {e}")
+            return ""
+
+    def _build_prediction_feedback(self, lookback: int = 20) -> str:
+        """최근 예측 결과를 LLM 프롬프트용 피드백 텍스트로 생성."""
+        if not self._OUTCOMES_PATH.exists():
+            return ""
+
+        try:
+            with open(self._OUTCOMES_PATH, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except Exception:
+            return ""
+
+        if not lines:
+            return ""
+
+        # 최근 N건 로드
+        recent = []
+        for line in lines[-lookback:]:
+            try:
+                recent.append(json.loads(line.strip()))
+            except Exception:
+                continue
+
+        if not recent:
+            return ""
+
+        # 전체 통계
+        total_correct = sum(r.get("correct_count", 0) for r in recent)
+        total_evaluated = sum(r.get("total_evaluated", 0) for r in recent)
+        if total_evaluated == 0:
+            return ""
+
+        overall_accuracy = total_correct / total_evaluated
+
+        # 액션 타입별 통계
+        type_stats: dict[str, dict] = {}
+        ticker_stats: dict[str, list] = {}
+        for record in recent:
+            for pred in record.get("predictions", []):
+                action = pred.get("predicted_action", "HOLD")
+                correct = pred.get("correct", False)
+                ret = pred.get("actual_return_pct", 0)
+                ticker = pred.get("ticker", "")
+                name = pred.get("name", ticker)
+
+                if action not in type_stats:
+                    type_stats[action] = {"correct": 0, "total": 0, "returns": []}
+                type_stats[action]["total"] += 1
+                type_stats[action]["returns"].append(ret)
+                if correct:
+                    type_stats[action]["correct"] += 1
+
+                key = f"{name}({ticker})"
+                if key not in ticker_stats:
+                    ticker_stats[key] = []
+                ticker_stats[key].append({
+                    "action": action, "return": ret, "correct": correct
+                })
+
+        # 피드백 텍스트 생성
+        parts = [
+            f"최근 {len(recent)}회 분석 예측 정확도: {overall_accuracy:.0%} ({total_correct}/{total_evaluated})",
+            "",
+        ]
+
+        # 액션 타입별
+        for action_type in ["BUY", "SELL", "HOLD"]:
+            stats = type_stats.get(action_type)
+            if not stats or stats["total"] == 0:
+                continue
+            acc = stats["correct"] / stats["total"]
+            avg_ret = sum(stats["returns"]) / len(stats["returns"])
+            parts.append(
+                f"- {action_type}: 정확도 {acc:.0%} ({stats['correct']}/{stats['total']}), "
+                f"평균 실제수익률 {avg_ret:+.1f}%"
+            )
+
+        # 반복 오류 종목 (3회 이상 예측, 정확도 50% 미만)
+        bad_tickers = []
+        for name_ticker, preds in ticker_stats.items():
+            if len(preds) >= 3:
+                correct_cnt = sum(1 for p in preds if p["correct"])
+                if correct_cnt / len(preds) < 0.5:
+                    avg_ret = sum(p["return"] for p in preds) / len(preds)
+                    bad_tickers.append((name_ticker, correct_cnt, len(preds), avg_ret))
+
+        if bad_tickers:
+            parts.append("")
+            parts.append("주의 종목 (반복 오류):")
+            for name_ticker, correct, total, avg_ret in bad_tickers[:5]:
+                parts.append(
+                    f"- {name_ticker}: 정확도 {correct}/{total}, 평균수익률 {avg_ret:+.1f}%"
+                )
+
+        return "\n".join(parts)
+
+    def _evaluate_previous_predictions(self, current_prices: dict[str, float]) -> None:
+        """이전 분석의 예측을 현재 가격과 비교하여 결과를 기록 (학습 데이터용).
+
+        각 예측(BUY/SELL/HOLD)에 대해 실제 수익률을 계산하고
+        prediction_outcomes.jsonl에 누적 기록한다.
+        """
+        prev = self._last_analysis
+        if not prev or not prev.get("signal"):
+            return
+
+        prev_actions = prev["signal"].get("actions", [])
+        if not prev_actions:
+            return
+
+        prev_ts = prev.get("timestamp", "")
+        now = datetime.now()
+
+        # 이전 분석 시점 파싱
+        try:
+            prev_dt = datetime.fromisoformat(prev_ts)
+            hours_elapsed = (now - prev_dt).total_seconds() / 3600
+        except (ValueError, TypeError):
+            hours_elapsed = 0
+
+        # 이전 분석 시점의 가격 (portfolio positions + market_data에서 추출)
+        prev_portfolio = prev.get("portfolio", {}) if "portfolio" in prev else {}
+
+        outcomes = []
+        correct_count = 0
+        total_evaluated = 0
+
+        for action in prev_actions:
+            ticker = action.get("ticker", "")
+            if not ticker or ticker not in current_prices:
+                continue
+
+            current_price = current_prices[ticker]
+            action_type = action.get("type", "HOLD")
+
+            # 이전 가격: portfolio에 보유 중이었으면 그 가격, 아니면 analysis_history에서
+            prev_price = None
+            if prev_portfolio and isinstance(prev_portfolio, dict):
+                positions = prev_portfolio.get("positions", {})
+                if ticker in positions:
+                    prev_price = positions[ticker].get("current_price")
+
+            # 보유종목이 아니었으면 analysis_history에서 찾기
+            if not prev_price:
+                prev_price = self._get_price_at_analysis(ticker, prev_ts)
+
+            if not prev_price or prev_price == 0:
+                continue
+
+            # 실제 수익률 계산
+            actual_return = (current_price - prev_price) / prev_price
+            total_evaluated += 1
+
+            # 예측 정확도 판단
+            if action_type == "BUY":
+                is_correct = actual_return > 0  # BUY 했는데 올랐으면 정답
+            elif action_type == "SELL":
+                is_correct = actual_return < 0  # SELL 했는데 내렸으면 정답
+            else:  # HOLD
+                is_correct = abs(actual_return) < 0.03  # 3% 미만 변동이면 HOLD 정답
+
+            if is_correct:
+                correct_count += 1
+
+            outcomes.append({
+                "ticker": ticker,
+                "name": action.get("name", ""),
+                "predicted_action": action_type,
+                "predicted_reason": action.get("reason", ""),
+                "price_at_prediction": prev_price,
+                "price_at_evaluation": current_price,
+                "actual_return_pct": round(actual_return * 100, 2),
+                "correct": is_correct,
+            })
+
+        if not outcomes:
+            return
+
+        record = {
+            "analysis_timestamp": prev_ts,
+            "evaluation_timestamp": now.isoformat(),
+            "hours_elapsed": round(hours_elapsed, 1),
+            "predictions": outcomes,
+            "accuracy": round(correct_count / total_evaluated, 2) if total_evaluated else 0,
+            "total_evaluated": total_evaluated,
+            "correct_count": correct_count,
+        }
+
+        try:
+            with open(self._OUTCOMES_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            logger.info(
+                f"Prediction evaluation: {correct_count}/{total_evaluated} correct "
+                f"({record['accuracy']:.0%}) over {hours_elapsed:.1f}h"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to write prediction outcomes: {e}")
+
+    def _get_price_at_analysis(self, ticker: str, analysis_ts: str) -> float | None:
+        """analysis_history.jsonl에서 특정 분석 시점의 종목 가격을 찾는다."""
+        try:
+            if not self._ANALYSIS_LOG_PATH.exists():
+                return None
+            with open(self._ANALYSIS_LOG_PATH, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            for line in reversed(lines[-20:]):  # 최근 20건만
+                record = json.loads(line.strip())
+                if record.get("timestamp", "")[:16] == analysis_ts[:16]:
+                    # 1순위: prices_snapshot
+                    snapshot = record.get("prices_snapshot", {})
+                    if ticker in snapshot:
+                        return snapshot[ticker]
+                    # 2순위: portfolio positions
+                    positions = record.get("portfolio", {}).get("positions", {})
+                    if ticker in positions:
+                        return positions[ticker].get("current_price")
+                    break
+        except Exception:
+            pass
+        return None
+
+    def _append_analysis_log(self, signal: dict, actions: list,
+                              portfolio: dict, ml_predictions: dict,
+                              prices: dict[str, float] | None = None) -> None:
+        """분석 결과를 JSONL 히스토리에 누적 (학습 데이터용)."""
+        record = {
+            "timestamp": datetime.now().isoformat(),
+            "mode": self.config_manager.get_mode(),
+            "signal": signal,
+            "actions_executed": actions,
+            "portfolio": {
+                "total_asset": portfolio.get("total_asset"),
+                "cash": portfolio.get("cash"),
+                "cash_ratio": portfolio.get("cash_ratio"),
+                "total_pnl_pct": portfolio.get("total_pnl_pct"),
+                "positions": portfolio.get("positions", {}),
+            },
+            "prices_snapshot": prices or {},
+            "ml_predictions": {
+                t: {k: round(v, 4) if isinstance(v, float) else v
+                     for k, v in pred.items()}
+                for t, pred in ml_predictions.items()
+            } if ml_predictions else {},
+        }
+        try:
+            with open(self._ANALYSIS_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.warning(f"Failed to append analysis log: {e}")
+
     def get_last_analysis(self) -> dict | None:
         """마지막 LLM 분석 결과 반환."""
         return self._last_analysis
@@ -799,8 +1680,12 @@ class TradingSystem:
             "circuit_state": self.circuit_breaker.state.value,
             "total_asset": self.portfolio.total_asset,
             "cash": self.portfolio.cash,
+            "invested": self.portfolio.total_invested,
+            "initial_capital": self.portfolio.initial_capital,
+            "total_pnl": self.portfolio.total_pnl,
             "total_pnl_pct": f"{self.portfolio.total_pnl_pct:.2%}",
             "num_positions": len(self.portfolio.positions),
+            "positions": {t: p.to_dict() for t, p in self.portfolio.positions.items()},
             "watchlist": [ticker_display(t) for t in self._watchlist],
             "llm_daily_cost": self.llm_engine.get_daily_cost(),
             "circuit_breaker": self.circuit_breaker.get_status(),

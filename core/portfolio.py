@@ -148,7 +148,9 @@ class Portfolio:
         logger.info(f"Portfolio loaded: cash={self.cash:,.0f}, positions={len(self.positions)}")
 
     def _save_state(self) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute("""
                 INSERT INTO portfolio_state (id, cash, initial_capital, updated_at)
                 VALUES (1, ?, ?, ?)
@@ -164,6 +166,13 @@ class Portfolio:
                     INSERT INTO positions (ticker, name, quantity, avg_price, current_price, bought_at)
                     VALUES (?, ?, ?, ?, ?, ?)
                 """, (pos.ticker, pos.name, pos.quantity, pos.avg_price, pos.current_price, pos.bought_at))
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Portfolio save failed, rolled back: {e}")
+            raise
+        finally:
+            conn.close()
 
     def initialize(self, capital: float) -> None:
         """초기 자본금 설정."""

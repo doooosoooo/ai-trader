@@ -144,7 +144,7 @@ def bb_above_upper() -> Condition:
     """볼린저밴드 상단 돌파."""
     return Condition(
         name="bb_above_upper",
-        evaluate=lambda row, prev, ctx: row.get("close", 0) > row.get("bb_upper", 0),
+        evaluate=lambda row, prev, ctx: row.get("close", 0) > row.get("bb_upper", float("inf")),
     )
 
 
@@ -246,25 +246,28 @@ def create_swing_strategy(params: dict | None = None) -> Strategy:
 
 
 def create_daytrading_strategy(params: dict | None = None) -> Strategy:
-    """단타 전략: 거래량 급증 + RSI 약세 구간 진입.
+    """단타(모멘텀 돌파) 전략: 상승추세 + 거래량 급증 진입.
 
     config/strategies/daytrading.md 기반.
-    RSI<45 + Vol>=1.5x: 대형주에서도 충분한 진입 기회 확보.
+    MA20 위 + Vol>=1.5x: 상승추세에서 거래량 돌파 시 진입.
+    tp/sl = 4%/1.5% (손익비 2.7:1) — 승률보다 기대값 극대화.
+    RSI 과매수(>70)는 청산 조건으로 활용.
     """
     p = params or {}
-    tp = p.get("take_profit_pct", 0.03)
-    sl = p.get("stop_loss_pct", 0.02)
+    tp = p.get("take_profit_pct", 0.04)
+    sl = p.get("stop_loss_pct", 0.015)
     max_days = p.get("max_hold_days", 3)
 
     return Strategy(
         name="daytrading",
         entry_conditions=[
-            rsi_below(p.get("rsi_oversold", 45)),
+            price_above_ma(p.get("trend_ma_period", 20)),
             volume_surge(p.get("volume_surge_multiplier", 1.5)),
         ],
         exit_conditions=[
             take_profit_reached(tp),
             stop_loss_reached(sl),
+            rsi_above(p.get("rsi_overbought", 70)),
             max_hold_exceeded(max_days),
         ],
         position_size_pct=p.get("position_size_pct", 0.05),
@@ -311,5 +314,4 @@ def create_defensive_strategy(params: dict | None = None) -> Strategy:
 STRATEGY_REGISTRY = {
     "swing": create_swing_strategy,
     "daytrading": create_daytrading_strategy,
-    "defensive": create_defensive_strategy,
 }

@@ -3,8 +3,11 @@
 인메모리 포트폴리오로 라이브 DB와 완전 분리.
 """
 
+import json
 import sqlite3
+from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -70,6 +73,93 @@ class BacktestResult:
     trades: list[BacktestTrade]
     equity_curve: list[dict]
     metrics: dict
+
+    def _calc_ticker_breakdown(self) -> dict:
+        """종목별 성과 집계 — LLM 피드백에 사용."""
+        breakdown: dict[str, dict] = defaultdict(
+            lambda: {"wins": 0, "losses": 0, "total_pnl_pct": 0.0, "trades": 0}
+        )
+        for t in self.trades:
+            if t.action != "SELL":
+                continue
+            entry = breakdown[t.ticker]
+            entry["trades"] += 1
+            entry["total_pnl_pct"] += t.pnl_pct
+            if t.pnl > 0:
+                entry["wins"] += 1
+            elif t.pnl < 0:
+                entry["losses"] += 1
+        # 평균 수익률 계산
+        result = {}
+        for ticker, stats in breakdown.items():
+            if stats["trades"] > 0:
+                stats["avg_pnl_pct"] = stats["total_pnl_pct"] / stats["trades"]
+            else:
+                stats["avg_pnl_pct"] = 0.0
+            result[ticker] = dict(stats)
+        return result
+
+    def save_to_db(self, db_path: str) -> int:
+        """백테스트 결과를 DB에 저장. 반환: inserted row id."""
+        period_parts = self.period.split("~")
+        period_start = period_parts[0].strip() if len(period_parts) >= 1 else ""
+        period_end = period_parts[1].strip() if len(period_parts) >= 2 else ""
+
+        ticker_breakdown = self._calc_ticker_breakdown()
+        m = self.metrics
+
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS backtest_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    strategy_name TEXT NOT NULL,
+                    params_json TEXT NOT NULL,
+                    tickers TEXT NOT NULL,
+                    period_start TEXT NOT NULL,
+                    period_end TEXT NOT NULL,
+                    total_return REAL,
+                    annualized_return REAL,
+                    max_drawdown REAL,
+                    sharpe_ratio REAL,
+                    win_rate REAL,
+                    profit_factor REAL,
+                    total_trades INTEGER,
+                    avg_hold_days REAL,
+                    metrics_json TEXT NOT NULL,
+                    ticker_breakdown_json TEXT NOT NULL
+                )
+            """)
+            cursor = conn.execute(
+                """INSERT INTO backtest_results
+                (created_at, strategy_name, params_json, tickers, period_start, period_end,
+                 total_return, annualized_return, max_drawdown, sharpe_ratio,
+                 win_rate, profit_factor, total_trades, avg_hold_days,
+                 metrics_json, ticker_breakdown_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    datetime.now().isoformat(),
+                    self.strategy_name,
+                    json.dumps(self.params, ensure_ascii=False),
+                    ",".join(self.tickers),
+                    period_start, period_end,
+                    m.get("total_return", 0),
+                    m.get("annualized_return", 0),
+                    m.get("max_drawdown", 0),
+                    m.get("sharpe_ratio", 0),
+                    m.get("win_rate", 0),
+                    m.get("profit_factor", 0),
+                    m.get("total_trades", 0),
+                    m.get("avg_hold_days", 0),
+                    json.dumps(m, ensure_ascii=False),
+                    json.dumps(ticker_breakdown, ensure_ascii=False),
+                ),
+            )
+            logger.info(
+                f"Backtest result saved: {self.strategy_name} | "
+                f"return={m.get('total_return', 0):.2%} | id={cursor.lastrowid}"
+            )
+            return cursor.lastrowid
 
 
 class BacktestPortfolio:
