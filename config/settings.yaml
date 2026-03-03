@@ -44,4 +44,8 @@ telegram:
   - strategy_suggestion
   - screening_result
   - error
+  - risk_exit
+  - concentration_alert
+  - drawdown_alert
+  - backtest_result
   confirmation_timeout_seconds: 300

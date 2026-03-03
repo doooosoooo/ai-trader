@@ -86,6 +86,7 @@ class TradingSystem:
 
     def __init__(self):
         logger.info("Initializing AI Trading System...")
+        self._main_loop = None  # 메인 이벤트 루프 참조 (스레드에서 async 호출용)
 
         # Config
         self.config_manager = ConfigManager()
@@ -115,9 +116,10 @@ class TradingSystem:
                 if account["total_asset"] == 0 and not account["positions"]:
                     raise RuntimeError("Empty account data returned (API may be unavailable)")
                 self.portfolio.cash = account["cash"]
-                # initial_capital은 최초 1회만 설정
+                # initial_capital은 최초 1회만 자동 설정 — 이후 변경은 /setcapital로
                 if self.portfolio.initial_capital == 0 and account["total_asset"] > 0:
                     self.portfolio.initial_capital = account["total_asset"]
+                    logger.info(f"Initial capital set: {account['total_asset']:,.0f}")
                 self.portfolio.positions.clear()
                 for pos_data in account["positions"]:
                     self.portfolio.positions[pos_data["ticker"]] = Position(
@@ -168,35 +170,83 @@ class TradingSystem:
         self._paused = False
         self._running = False
         self._last_analysis: dict | None = self._load_last_analysis()  # 마지막 LLM 분석 결과
+        # 스크리닝 캐시가 없거나 오래됐으면 시작 시 즉시 실행
+        if self.screener:
+            cached = self.screener.get_last_result()
+            if not cached or not cached.candidates:
+                logger.info("No valid screening cache — running initial screening...")
+                try:
+                    self.cycle_screening()
+                except Exception as e:
+                    logger.warning(f"Initial screening failed: {e}")
+
         self._watchlist = self._get_watchlist()
 
         # 시작 시 히스토리 데이터 사전 수집
         self._prefetch_historical_data()
 
+        # 시작 시 분석 결과가 없거나 오래됐으면 자동 실행
+        run_initial_analysis = False
+        if not self._last_analysis:
+            run_initial_analysis = True
+        elif self._last_analysis.get("timestamp"):
+            last_ts = datetime.fromisoformat(self._last_analysis["timestamp"])
+            if (datetime.now() - last_ts).total_seconds() > 7200:  # 2시간 이상 경과
+                run_initial_analysis = True
+        if run_initial_analysis:
+            logger.info("Running initial LLM analysis (no recent result)...")
+            try:
+                self.cycle_llm_analysis()
+            except Exception as e:
+                logger.warning(f"Initial LLM analysis failed: {e}")
+
         watchlist_display = [ticker_display(t) for t in self._watchlist]
         logger.info(f"System initialized | Mode: {self.config_manager.get_mode()} | Watchlist: {watchlist_display}")
 
     def _get_watchlist(self) -> list[str]:
-        """스크리닝 결과 또는 전략에서 관심 종목 추출."""
-        # 스크리너 결과가 있으면 우선 사용
+        """스크리닝 결과 + 보유종목 + config 포함종목을 합산."""
+        max_size = 8
+        held = list(self.portfolio.positions.keys())
+        watchlist: list[str] = []
+
+        # 1. 보유종목 최우선
+        for t in held:
+            if t not in watchlist:
+                watchlist.append(t)
+
+        # 2. 스크리너 결과
         if self.screener:
             result = self.screener.get_last_result()
             if result and result.candidates:
-                held = list(self.portfolio.positions.keys())
-                watchlist = self.screener.get_watchlist(held_tickers=held, max_tickers=8)
-                if watchlist:
+                for c in result.candidates:
+                    ticker = c["ticker"]
+                    if ticker not in watchlist:
+                        watchlist.append(ticker)
                     # TICKER_NAMES 동적 확장
-                    for c in result.candidates:
-                        if c["ticker"] not in TICKER_NAMES and c.get("name"):
-                            TICKER_NAMES[c["ticker"]] = c["name"]
-                    return watchlist
+                    if ticker not in TICKER_NAMES and c.get("name"):
+                        TICKER_NAMES[ticker] = c["name"]
 
-        # 폴백: 전략 파일에서 추출
-        strategy = self.llm_engine.load_strategy()
-        tickers = re.findall(r'\b(\d{6})\b', strategy)
-        if not tickers:
-            tickers = ["005930", "000660", "373220", "006400"]
-        return list(set(tickers))
+        # 3. config include_tickers
+        screening_cfg = self.screener.config if self.screener else {}
+        for t in screening_cfg.get("include_tickers", []):
+            if t not in watchlist:
+                watchlist.append(t)
+
+        # 4. 전략 파일에서 추출 (위에서 부족할 때)
+        if len(watchlist) < max_size:
+            strategy = self.llm_engine.load_strategy()
+            for t in re.findall(r'\b(\d{6})\b', strategy):
+                if t not in watchlist:
+                    watchlist.append(t)
+                if len(watchlist) >= max_size:
+                    break
+
+        # 5. 최소 폴백
+        if not watchlist:
+            watchlist = ["005930", "000660", "005380", "006400",
+                         "034020", "051910", "064350", "000720"]
+
+        return watchlist[:max_size]
 
     def _prefetch_historical_data(self):
         """시작 시 관심종목 + 보유종목의 히스토리 데이터가 부족하면 사전 수집."""
@@ -341,10 +391,26 @@ class TradingSystem:
             return
 
         held_tickers = list(self.portfolio.positions.keys())
-        prices = self.data_pipeline.collect_prices_only(held_tickers + self._watchlist)
+        prices = self.data_pipeline.collect_prices_only(list(set(held_tickers + self._watchlist)))
 
         # 포트폴리오 가격 업데이트
         self.portfolio.update_prices(prices)
+
+        # 리스크 기반 자동 청산 체크 (손절/트레일링스탑/보유기간)
+        risk_exits = self.check_risk_exits()
+        for r in risk_exits:
+            self._process_trade_result(r)
+            if self.telegram.enabled:
+                name = r.get("name", r.get("ticker", ""))
+                ticker = r.get("ticker", "")
+                reason = r.get("reason", "")
+                pnl = r.get("pnl", 0)
+                self.telegram.send_alert_sync(
+                    "risk_exit",
+                    f"⚠️ <b>자동청산</b> {name}({ticker})\n"
+                    f"사유: {reason}\n"
+                    f"손익: {pnl:+,.0f}원",
+                )
 
         logger.info(f"Data collected: {len(prices)} tickers")
 
@@ -391,8 +457,33 @@ class TradingSystem:
                     if not df.empty:
                         ml_predictions[ticker] = self.ml_engine.predict(df)
 
-            # 3. 포트폴리오 현황
+            # 3. 포트폴리오 현황 + 포지션 리스크 컨텍스트
             portfolio_summary = self.portfolio.get_summary()
+
+            # 포지션별 리스크 컨텍스트 추가 (보유일수, 손절거리, 트레일링, 비중)
+            t_params = self.config_manager.trading_params
+            sl_pct = t_params.get("stop_loss_pct", -0.07)
+            ts_pct = t_params.get("trailing_stop_pct", 0.06)
+            max_hold = t_params.get("hold_period_days", {}).get("max", 20)
+            total_asset = self.portfolio.total_asset or 1
+
+            for ticker, pos_dict in portfolio_summary.get("positions", {}).items():
+                pos = self.portfolio.positions.get(ticker)
+                if not pos:
+                    continue
+                bought = datetime.fromisoformat(pos.bought_at)
+                days_held = (datetime.now() - bought).days
+                weight = pos.market_value / total_asset
+                dist_to_sl = pos.pnl_pct - sl_pct  # 양수 = 손절까지 여유
+                trailing_dd = (pos.peak_price - pos.current_price) / pos.peak_price if pos.peak_price > 0 else 0
+
+                pos_dict["days_held"] = days_held
+                pos_dict["max_hold_days"] = max_hold
+                pos_dict["portfolio_weight"] = f"{weight:.1%}"
+                pos_dict["peak_price"] = pos.peak_price
+                pos_dict["dist_to_stop_loss"] = f"{dist_to_sl:+.1%}"
+                pos_dict["trailing_drawdown"] = f"{trailing_dd:.1%}"
+                pos_dict["trailing_stop_pct"] = f"{ts_pct:.0%}"
 
             # 목표 달성률 추가
             targets = self.config_manager.trading_params.get("portfolio_targets", {})
@@ -403,6 +494,15 @@ class TradingSystem:
                 "current_pnl": f"{current_pnl:.2%}",
                 "progress": f"{(current_pnl / monthly_target * 100):.0f}%" if monthly_target > 0 else "N/A",
             }
+
+            # 포트폴리오 드로다운 상태 추가 (LLM에게 리스크 인식 제공)
+            drawdown = self.portfolio.portfolio_drawdown
+            if drawdown > 0.02:  # 2% 이상 낙폭만 표시
+                portfolio_summary["drawdown_status"] = {
+                    "hwm": self.portfolio.high_water_mark,
+                    "drawdown": f"{drawdown:.1%}",
+                    "warning": "고점 대비 낙폭 발생 — 신규 매수 시 신중하게 판단하세요." if drawdown >= 0.05 else "",
+                }
 
             # 4. LLM 분석 (스크리닝 결과 + 예측 피드백 + 백테스트 피드백 주입)
             screening_context = self._build_screening_context()
@@ -422,6 +522,8 @@ class TradingSystem:
 
             # 5. Config 자동 조정
             config_adjustments = signal.get("config_adjustments", [])
+            # LLM이 문자열 리스트로 반환하는 경우 필터링 (dict만 유효)
+            config_adjustments = [a for a in config_adjustments if isinstance(a, dict)]
             if config_adjustments:
                 results = self.config_manager.apply_adjustments(config_adjustments)
                 for r in results:
@@ -481,31 +583,35 @@ class TradingSystem:
                 if not actions:
                     logger.info("All actions blocked by circuit breaker")
 
-                # 익절 매도 분리: 수익 중인 SELL은 확인 대기
+                # 대형 주문만 확인 대기, 나머지는 즉시 실행
                 auto_actions = []
                 confirm_actions = []
                 for action in actions:
                     ticker = action.get("ticker", "")
-                    if (action.get("type", "").upper() == "SELL"
-                            and ticker in self.portfolio.positions):
+                    if action.get("type", "").upper() == "SELL" and ticker in self.portfolio.positions:
                         pos = self.portfolio.positions[ticker]
                         cp = current_prices.get(ticker, pos.current_price)
-                        if cp > pos.avg_price:  # 수익 중 → 확인 필요
+                        sell_amount = cp * pos.quantity * action.get("ratio", 1.0)
+                        # 대형 매도만 확인 (safety_guard 임계값 기준)
+                        if self.safety_guard.needs_confirmation(sell_amount):
                             confirm_actions.append(action)
                             continue
                     auto_actions.append(action)
 
-                # 확인 불필요 주문 즉시 실행
+                # 즉시 실행 (매수, 소형 매도, 손절 매도 모두)
                 if auto_actions:
                     auto_signal = {**filtered, "actions": auto_actions}
                     results = self.executor.execute_signal(auto_signal, current_prices)
                     for result in results:
                         self._process_trade_result(result)
 
-                # 익절 매도 확인 요청
+                # 대형 매도만 확인 요청
                 for action in confirm_actions:
                     ticker = action["ticker"]
-                    pos = self.portfolio.positions[ticker]
+                    pos = self.portfolio.positions.get(ticker)
+                    if not pos:
+                        logger.warning(f"Position {ticker} already closed, skipping confirm")
+                        continue
                     cp = current_prices.get(ticker, pos.current_price)
                     pnl = (cp - pos.avg_price) * pos.quantity
                     pnl_pct = (cp - pos.avg_price) / pos.avg_price * 100
@@ -541,6 +647,12 @@ class TradingSystem:
                 except Exception as e:
                     logger.warning(f"Failed to send analysis to Telegram: {e}")
 
+            # 9. LLM vs 규칙전략 알파 추적
+            try:
+                self._log_alpha_comparison(actions, eval_prices)
+            except Exception as e:
+                logger.debug(f"Alpha tracking failed (non-critical): {e}")
+
             logger.info(
                 f"Analysis cycle complete | "
                 f"Risk: {signal.get('risk_assessment', '?')} | "
@@ -552,6 +664,124 @@ class TradingSystem:
             logger.exception(f"LLM analysis cycle failed: {e}")
             self.circuit_breaker.record_llm_failure()
 
+    def check_risk_exits(self) -> list[dict]:
+        """리스크 기반 자동 청산 — 손절/트레일링스탑/보유기간 초과.
+
+        cycle_data_collection()에서 가격 업데이트 직후 호출.
+        해당 조건 발생 시 텔레그램 확인 없이 즉시 매도.
+        """
+        params = self.config_manager.trading_params
+        stop_loss_pct = params.get("stop_loss_pct", -0.07)
+        trailing_stop_pct = params.get("trailing_stop_pct", 0.06)
+        max_hold_days = params.get("hold_period_days", {}).get("max", 20)
+
+        results = []
+        for ticker, pos in list(self.portfolio.positions.items()):
+            reason = None
+
+            # 1. 하드 손절
+            if pos.pnl_pct <= stop_loss_pct:
+                reason = f"하드손절 ({pos.pnl_pct:.1%} ≤ {stop_loss_pct:.0%})"
+
+            # 2. 트레일링 스탑 (수익 구간에서만 적용)
+            if reason is None and pos.peak_price > pos.avg_price:
+                drawdown = (pos.peak_price - pos.current_price) / pos.peak_price
+                if drawdown >= trailing_stop_pct:
+                    reason = (
+                        f"트레일링스탑 (고점{pos.peak_price:,.0f}"
+                        f"→현재{pos.current_price:,.0f}, -{drawdown:.1%})"
+                    )
+
+            # 3. 보유기간 초과
+            if reason is None:
+                bought = datetime.fromisoformat(pos.bought_at)
+                days_held = (datetime.now() - bought).days
+                if days_held >= max_hold_days:
+                    reason = f"보유기간초과 ({days_held}일 ≥ {max_hold_days}일)"
+
+            if reason:
+                logger.warning(f"Risk exit triggered: {pos.name}({ticker}) — {reason}")
+                result = self._execute_risk_exit(ticker, pos, reason)
+                if result:
+                    results.append(result)
+
+        # 4. 집중도 경고 (자동 매도는 아니지만 텔레그램 알림)
+        # 2종목 이하면 비중 초과는 불가피하므로 경고 스킵
+        num_positions = len(self.portfolio.positions)
+        if num_positions >= 3:
+            max_weight = self.safety_guard.rules.get("max_position_ratio", 0.15) + 0.05
+            total_asset = self.portfolio.total_asset or 1
+            if not hasattr(self, "_concentration_alerted"):
+                self._concentration_alerted = {}
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            for ticker, pos in self.portfolio.positions.items():
+                weight = pos.market_value / total_asset
+                if weight > max_weight:
+                    # 하루 1회만 알림 (종목별 쿨다운)
+                    if self._concentration_alerted.get(ticker) == today_str:
+                        continue
+                    self._concentration_alerted[ticker] = today_str
+                    logger.warning(
+                        f"Concentration alert: {pos.name}({ticker}) "
+                        f"weight {weight:.1%} > {max_weight:.1%}"
+                    )
+                    if self.telegram.enabled:
+                        self.telegram.send_alert_sync(
+                            "concentration_alert",
+                            f"⚠️ <b>집중도 경고</b> {pos.name}({ticker})\n"
+                            f"포트폴리오 비중: {weight:.1%} (한도 {max_weight:.1%})\n"
+                            f"일부 매도를 검토하세요.",
+                        )
+
+        # 5. 포트폴리오 낙폭 경고 (HWM 대비 드로다운)
+        drawdown = self.portfolio.portfolio_drawdown
+        dd_alert_pct = params.get("portfolio_drawdown_alert_pct", 0.05)  # 기본 5%
+        if drawdown >= dd_alert_pct:
+            logger.warning(
+                f"Portfolio drawdown alert: {drawdown:.1%} from HWM "
+                f"{self.portfolio.high_water_mark:,.0f}"
+            )
+            if self.telegram.enabled and not getattr(self, "_dd_alerted", False):
+                self.telegram.send_alert_sync(
+                    "drawdown_alert",
+                    f"⚠️ <b>포트폴리오 낙폭 경고</b>\n"
+                    f"고점(HWM): {self.portfolio.high_water_mark:,.0f}원\n"
+                    f"현재 총자산: {self.portfolio.total_asset:,.0f}원\n"
+                    f"낙폭: {drawdown:.1%}\n"
+                    f"신규 매수를 자제하고 리스크를 점검하세요.",
+                )
+                self._dd_alerted = True  # 중복 알림 방지
+        else:
+            self._dd_alerted = False  # 드로다운 회복 시 알림 리셋
+
+        return results
+
+    def _execute_risk_exit(self, ticker: str, pos, reason: str) -> dict | None:
+        """리스크 청산 즉시 실행 — 쿨다운/확인 우회."""
+        try:
+            # PnL을 매도 전에 계산 (live 매도 결과에는 pnl이 없으므로)
+            pre_pnl = pos.pnl
+            pre_pnl_pct = pos.pnl_pct
+            result = self.executor._execute_sell(
+                ticker=ticker,
+                name=pos.name,
+                ratio=1.0,
+                urgency="high",
+                limit_price=None,
+                current_price=pos.current_price,
+                reason=f"[AUTO] {reason}",
+                signal_json="",
+            )
+            if result:
+                result["reason"] = reason
+                if "pnl" not in result:
+                    result["pnl"] = pre_pnl
+                    result["pnl_pct"] = f"{pre_pnl_pct:.2%}"
+            return result
+        except Exception as e:
+            logger.error(f"Risk exit execution failed for {ticker}: {e}")
+            return None
+
     def _process_trade_result(self, result: dict) -> None:
         """매매 결과 처리 — 알림 + 시뮬레이션 추적 + live 계좌 동기화."""
         status = result.get("status", "")
@@ -561,12 +791,12 @@ class TradingSystem:
             if self.telegram.enabled:
                 self.telegram.send_alert_sync(
                     "trade_executed",
-                    self._format_trade_msg(result),
+                    f"[SIM] {self._format_trade_msg(result)}",
                 )
 
         elif status == "SUBMITTED":
-            # Live 주문 접수됨 — 포트폴리오는 즉시 반영하지 않음
-            # 다음 계좌 동기화 시 실제 체결 결과로 반영
+            # Live 주문 접수됨 — trade_history에 기록 + 계좌 동기화
+            self.portfolio._record_trade(result, result.get("signal_json", ""))
             if self.telegram.enabled:
                 mode_tag = "[LIVE]"
                 order_no = result.get("order_no", "")
@@ -644,17 +874,16 @@ class TradingSystem:
             "action_data": action,
         }
 
-        # 텔레그램 확인 요청 (비동기이므로 sync wrapper)
+        # 텔레그램 확인 요청 (스레드에서도 동작하도록 run_coroutine_threadsafe 사용)
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.ensure_future(
-                    self.telegram.request_sell_confirmation(order_info)
+            loop = self._get_event_loop()
+            if loop and loop.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    self.telegram.request_sell_confirmation(order_info),
+                    loop,
                 )
             else:
-                loop.run_until_complete(
-                    self.telegram.request_sell_confirmation(order_info)
-                )
+                asyncio.run(self.telegram.request_sell_confirmation(order_info))
             logger.info(f"Sell confirmation requested: {name}({ticker}) PnL: {pnl:+,.0f}원")
         except Exception as e:
             logger.warning(f"Failed to request sell confirmation: {e}")
@@ -706,17 +935,18 @@ class TradingSystem:
         except Exception as e:
             logger.debug(f"KOSPI check skipped (API unavailable): {e}")
 
-        # 일일 손실 체크 — 전일 종가 기준 vs 현재 자산으로 실시간 계산
-        snapshots = self.portfolio.get_daily_snapshots(days=2)
+        # 일일 손실 체크 — 전일(거래일) 종가 기준 vs 현재 자산
+        snapshots = self.portfolio.get_daily_snapshots(days=7)  # 주말/공휴일 고려
         today_str = datetime.now().strftime("%Y-%m-%d")
-        # 전일 스냅샷 찾기 (오늘 것 제외)
+        # 가장 최근 전일 스냅샷 찾기 (오늘 것 제외)
         prev_asset = None
         for snap in snapshots:
             if snap.get("date") != today_str:
                 prev_asset = snap.get("total_asset", 0)
                 break
-        if prev_asset is None:
-            prev_asset = self.portfolio.initial_capital
+        # 전일 스냅샷이 없으면 일일 손실 체크 스킵 (initial_capital과 비교하면 오탐)
+        if prev_asset is None or prev_asset <= 0:
+            prev_asset = self.portfolio.total_asset  # 손실 0%로 처리
         if prev_asset > 0:
             daily_pnl_pct = (self.portfolio.total_asset - prev_asset) / prev_asset
             self.circuit_breaker.check_daily_loss(daily_pnl_pct)
@@ -817,8 +1047,8 @@ class TradingSystem:
         start_date = (datetime.now() - relativedelta(months=6)).strftime("%Y%m%d")
 
         param_grid = {
-            "rsi_oversold": [25, 30, 35],
-            "take_profit_pct": [0.05, 0.10, 0.15],
+            "rsi_oversold": [35, 40, 45],
+            "take_profit_pct": [0.07, 0.10, 0.15],
             "stop_loss_pct": [0.03, 0.05, 0.07],
             "position_size_pct": [0.08, 0.10],
         }
@@ -840,20 +1070,21 @@ class TradingSystem:
                     train_m = split_result["train_metrics"]
                     overfit = split_result["overfit_ratio"]
 
-                    # 과적합 비율 검증: 0.3~5.0 범위 + test 샤프 양수일 때만 저장
-                    if 0.3 <= overfit <= 5.0 and test_m.get("sharpe_ratio", 0) > 0:
+                    # 과적합 비율 검증: 0.3~5.0 범위 + test 수익률 양수일 때만 저장
+                    test_return = test_m.get("total_return", 0)
+                    if 0.3 <= overfit <= 5.0 and test_return > 0:
                         self._save_optimized_params(strategy_name, best_params, {
                             "train_return": train_m.get("total_return", 0),
-                            "test_return": test_m.get("total_return", 0),
+                            "test_return": test_return,
                             "train_sharpe": train_m.get("sharpe_ratio", 0),
                             "test_sharpe": test_m.get("sharpe_ratio", 0),
                             "overfit_ratio": overfit,
                         })
-                        logger.info(f"Optimized {strategy_name}: {best_params} (overfit={overfit:.2f})")
+                        logger.info(f"Optimized {strategy_name}: {best_params} (overfit={overfit:.2f}, test_return={test_return:.2%})")
                     else:
                         logger.warning(
                             f"Skipping optimization for {strategy_name}: "
-                            f"overfit ratio too low ({overfit:.2f})"
+                            f"overfit={overfit:.2f}, test_return={test_return:.2%}"
                         )
 
                 # 2. 최적화된 파라미터로 전체 기간 백테스트
@@ -923,20 +1154,29 @@ class TradingSystem:
             if self.portfolio.initial_capital == 0 and account["total_asset"] > 0:
                 self.portfolio.initial_capital = account["total_asset"]
 
-            # 보유종목 동기화 — 기존 시뮬레이션 포지션 제거 후 실제 데이터로 교체
+            # 보유종목 동기화 — 기존 포지션의 peak_price 보존
+            old_peaks = {t: p.peak_price for t, p in self.portfolio.positions.items()}
             self.portfolio.positions.clear()
             for pos_data in account["positions"]:
-                self.portfolio.positions[pos_data["ticker"]] = Position(
-                    ticker=pos_data["ticker"],
+                ticker = pos_data["ticker"]
+                cur_price = pos_data["current_price"]
+                # 기존 peak_price 유지, 없으면 현재가로 초기화
+                prev_peak = old_peaks.get(ticker, cur_price)
+                self.portfolio.positions[ticker] = Position(
+                    ticker=ticker,
                     name=pos_data["name"],
                     quantity=pos_data["quantity"],
                     avg_price=pos_data["avg_price"],
-                    current_price=pos_data["current_price"],
+                    current_price=cur_price,
+                    peak_price=max(prev_peak, cur_price),
                 )
                 # TICKER_NAMES에 추가
                 if pos_data["ticker"] not in TICKER_NAMES and pos_data["name"]:
                     TICKER_NAMES[pos_data["ticker"]] = pos_data["name"]
 
+            # HWM 갱신
+            if self.portfolio.total_asset > self.portfolio.high_water_mark:
+                self.portfolio.high_water_mark = self.portfolio.total_asset
             self.portfolio._save_state()
             logger.info(f"Portfolio synced from broker: {len(account['positions'])} positions")
             return account
@@ -1168,8 +1408,8 @@ class TradingSystem:
                 return [f"지원 전략: {list(STRATEGY_REGISTRY.keys())}"]
 
             param_grid = {
-                "rsi_oversold": [25, 30, 35],
-                "take_profit_pct": [0.05, 0.10, 0.15],
+                "rsi_oversold": [35, 40, 45],
+                "take_profit_pct": [0.07, 0.10, 0.15],
                 "stop_loss_pct": [0.03, 0.05, 0.07],
                 "position_size_pct": [0.08, 0.10],
             }
@@ -1218,10 +1458,11 @@ class TradingSystem:
             messages.append("📊 <b>최적 파라미터 전체 기간 결과</b>\n" + format_telegram_report(full_result))
 
             # 최적 파라미터 저장 — overfit 가드 적용
-            if 0.3 <= overfit <= 5.0 and test_m.get("sharpe_ratio", 0) > 0:
+            test_return = test_m.get("total_return", 0)
+            if 0.3 <= overfit <= 5.0 and test_return > 0:
                 self._save_optimized_params(strategy_name, bp, {
                     "train_return": train_m.get("total_return", 0),
-                    "test_return": test_m.get("total_return", 0),
+                    "test_return": test_return,
                     "train_sharpe": train_m.get("sharpe_ratio", 0),
                     "test_sharpe": test_m.get("sharpe_ratio", 0),
                     "overfit_ratio": overfit,
@@ -1232,7 +1473,7 @@ class TradingSystem:
                 )
             else:
                 messages.append(
-                    f"⚠️ 과적합 비율({overfit:.2f}) 또는 test 샤프({test_m.get('sharpe_ratio', 0):.2f})가 "
+                    f"⚠️ 과적합 비율({overfit:.2f}) 또는 test 수익률({test_return:+.2%})이 "
                     f"기준 미달로 파라미터를 저장하지 않았습니다."
                 )
 
@@ -1324,6 +1565,64 @@ class TradingSystem:
             return entry.get("params") if entry else None
         except Exception:
             return None
+
+    _ALPHA_LOG_PATH = Path(__file__).parent / "data" / "alpha_comparison.jsonl"
+
+    def _log_alpha_comparison(self, llm_actions: list[dict], prices: dict) -> None:
+        """LLM 판단 vs 규칙전략 신호 비교 기록 — 알파 추적용."""
+        from simulation.strategies import STRATEGY_REGISTRY
+
+        held_tickers = set(self.portfolio.positions.keys())
+        watch_tickers = set(self._watchlist)
+        all_tickers = held_tickers | watch_tickers
+
+        # LLM 판단 요약
+        llm_signals = {}
+        for action in llm_actions:
+            ticker = action.get("ticker", "")
+            llm_signals[ticker] = action.get("type", "HOLD").upper()
+
+        # 규칙전략 신호 생성
+        rule_signals = {}
+        for ticker in all_tickers:
+            df = self.data_pipeline.get_daily_df_with_indicators(ticker)
+            if df.empty or len(df) < 2:
+                continue
+            row = df.iloc[-1]
+            prev = df.iloc[-2]
+            ctx = {}
+
+            for name, factory in STRATEGY_REGISTRY.items():
+                strategy = factory(self._load_optimized_params(name))
+                entry = strategy.check_entry(row, prev, ctx)
+                exit_signal, exit_reason = strategy.check_exit(row, prev, ctx)
+
+                if ticker not in rule_signals:
+                    rule_signals[ticker] = {}
+                if entry:
+                    rule_signals[ticker][name] = "BUY"
+                elif ticker in held_tickers and exit_signal:
+                    rule_signals[ticker][name] = f"SELL({exit_reason})"
+
+        # 비교 기록
+        record = {
+            "timestamp": datetime.now().isoformat(),
+            "llm": llm_signals,
+            "rules": rule_signals,
+            "prices": {t: prices.get(t, 0) for t in all_tickers},
+        }
+
+        with open(self._ALPHA_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        # 불일치 로깅
+        for ticker in all_tickers:
+            llm_act = llm_signals.get(ticker, "HOLD")
+            rule_acts = rule_signals.get(ticker, {})
+            if rule_acts:
+                rule_summary = ", ".join(f"{k}:{v}" for k, v in rule_acts.items())
+                if llm_act != "HOLD" or any("BUY" in v or "SELL" in v for v in rule_acts.values()):
+                    logger.info(f"Alpha compare {ticker}: LLM={llm_act} vs Rules=[{rule_summary}]")
 
     def _build_backtest_feedback(self) -> str:
         """최근 백테스트 결과를 LLM 프롬프트용 피드백 텍스트로 생성."""
@@ -1729,10 +2028,15 @@ class TradingSystem:
         self.portfolio.save_daily_snapshot()
         logger.info("AI Trading System stopped")
 
+    def _get_event_loop(self):
+        """메인 이벤트 루프 반환 (스레드에서 async 호출용)."""
+        return self._main_loop
+
     def run(self):
         """동기 메인 실행."""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        self._main_loop = loop  # 스레드에서 참조할 수 있도록 저장
 
         # 시그널 핸들러
         for sig in (signal.SIGINT, signal.SIGTERM):

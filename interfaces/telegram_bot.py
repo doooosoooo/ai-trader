@@ -64,6 +64,8 @@ class TelegramBot:
         self._app.add_handler(CommandHandler("mode", self._cmd_mode))
         self._app.add_handler(CommandHandler("mode_confirm_live", self._cmd_mode_confirm_live))
         self._app.add_handler(CommandHandler("reset", self._cmd_reset))
+        self._app.add_handler(CommandHandler("setcapital", self._cmd_setcapital))
+        self._app.add_handler(CommandHandler("orders", self._cmd_orders))
         self._app.add_handler(CommandHandler("trades", self._cmd_trades))
         self._app.add_handler(CommandHandler("analysis", self._cmd_analysis))
         self._app.add_handler(CommandHandler("screen", self._cmd_screen))
@@ -137,23 +139,31 @@ class TelegramBot:
     # --- 알림 발송 ---
 
     async def send_alert(self, level: str, message: str) -> bool:
-        """알림 발송."""
+        """알림 발송. circuit_breaker 등 중요 알림은 최대 3회 재시도."""
         if not self.enabled or not self.chat_id:
             return False
 
         if level not in self.alert_levels and level != "circuit_breaker":
             return False
 
-        try:
-            await self._app.bot.send_message(
-                chat_id=self.chat_id,
-                text=message,
-                parse_mode="HTML",
-            )
-            return True
-        except Exception as e:
-            logger.error(f"Telegram alert failed: {e}")
-            return False
+        critical_levels = {"circuit_breaker", "risk_exit", "error"}
+        max_retries = 3 if level in critical_levels else 1
+
+        for attempt in range(max_retries):
+            try:
+                await self._app.bot.send_message(
+                    chat_id=self.chat_id,
+                    text=message,
+                    parse_mode="HTML",
+                )
+                return True
+            except Exception as e:
+                logger.error(f"Telegram alert failed (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)  # 1초, 2초 대기 후 재시도
+
+        logger.error(f"Telegram alert PERMANENTLY failed [{level}]: {message[:100]}")
+        return False
 
     def send_alert_sync(self, level: str, message: str) -> bool:
         """동기 알림 발송 (콜백용)."""
@@ -317,12 +327,19 @@ class TelegramBot:
             signal = order_info.get("signal", {"actions": [order_info.get("action_data", {})]})
             sell_signal = {**signal, "actions": [order_info["action_data"]]}
             ticker = order_info["ticker"]
-            # 실시간 현재가 조회 (요청 당시 가격이 아닌 최신 가격 사용)
-            fresh_prices = self.system.data_pipeline.collect_prices_only([ticker])
+            # blocking I/O는 run_in_executor로 감싸서 이벤트루프 블로킹 방지
+            loop = asyncio.get_event_loop()
+            fresh_prices = await loop.run_in_executor(
+                None, lambda: self.system.data_pipeline.collect_prices_only([ticker])
+            )
             current_prices = fresh_prices if fresh_prices.get(ticker) else {ticker: order_info["price"]}
-            results = self.system.executor.execute_signal(sell_signal, current_prices)
+            results = await loop.run_in_executor(
+                None, lambda: self.system.executor.execute_signal(sell_signal, current_prices)
+            )
             for result in results:
-                self.system._process_trade_result(result)
+                await loop.run_in_executor(
+                    None, lambda r=result: self.system._process_trade_result(r)
+                )
 
             await self.send_alert(
                 "trade_executed",
@@ -364,6 +381,7 @@ class TelegramBot:
             "/portfolio - 포트폴리오 현황 (매입가·손익)\n"
             "/today - 오늘 매매 내역\n"
             "/trades - 최근 매매 내역 (전체)\n"
+            "/orders - 당일 주문 체결 현황 (실시간)\n"
             "/analysis - 마지막 LLM 분석 결과 (now: 즉시 실행)\n"
             "/screen - 종목 스크리닝 결과 (now: 즉시 실행)\n"
             "/backtest - 백테스트 (compare/optimize)\n"
@@ -372,6 +390,7 @@ class TelegramBot:
             "/pause - 거래 일시 중지\n"
             "/resume - 거래 재개\n"
             "/mode <simulation|live> - 모드 전환\n"
+            "/setcapital - 초기자본 설정 (auto/±금액/reset)\n"
             "/reset - 서킷브레이커 리셋\n\n"
             "자연어로 전략 변경도 가능합니다.\n"
             "예: '단타로 전환해', '현금비중 50%로 올려'"
@@ -507,7 +526,7 @@ class TelegramBot:
             return
 
         summary = self.system.portfolio.get_summary()
-        mode = self.system.config_manager.settings.get("mode", "simulation")
+        mode = self.system.config_manager.get_mode()
         mode_label = "🔵시뮬레이션" if mode == "simulation" else "🔴실거래"
 
         msg = (
@@ -593,6 +612,125 @@ class TelegramBot:
             await update.message.reply_text(f"🔄 {msg}")
         else:
             await update.message.reply_text("시스템 미연결")
+
+    async def _cmd_setcapital(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """초기자본 수동 설정. /setcapital <금액> 또는 /setcapital auto."""
+        if not await self._check_auth(update):
+            return
+        if not self.system:
+            await update.message.reply_text("시스템 미연결")
+            return
+
+        args = context.args
+        portfolio = self.system.portfolio
+        old_capital = portfolio.initial_capital
+
+        if not args:
+            # 인자 없으면 현재 값 + 사용법 안내
+            await update.message.reply_text(
+                f"💰 <b>초기자본 설정</b>\n\n"
+                f"현재 초기자본: {old_capital:,.0f}원\n"
+                f"현재 총자산: {portfolio.total_asset:,.0f}원\n"
+                f"투자원금(현금+매입금액): {portfolio.cash + sum(p.quantity * p.avg_price for p in portfolio.positions.values()):,.0f}원\n\n"
+                f"사용법:\n"
+                f"/setcapital auto — 투자원금 기준 자동 설정\n"
+                f"/setcapital 50000000 — 5000만원으로 설정\n"
+                f"/setcapital +20000000 — 입금/이체 시 2000만원 추가\n"
+                f"/setcapital -5000000 — 출금 시 500만원 차감\n"
+                f"/setcapital reset — 총자산 기준 리셋 (수익률 0%부터)",
+                parse_mode="HTML",
+            )
+            return
+
+        arg = args[0].strip().lower()
+
+        if arg == "auto":
+            # 투자원금(현금 + 매입금액) 기준
+            new_capital = portfolio.cash + sum(
+                p.quantity * p.avg_price for p in portfolio.positions.values()
+            )
+        elif arg == "reset":
+            # 현재 총자산 기준 (수익률 0%부터 시작)
+            new_capital = portfolio.total_asset
+        elif arg.startswith("+") or arg.startswith("-"):
+            # +/- 증감: 입금, 이체, 출금 시 초기자본 조정
+            try:
+                delta = float(arg.replace(",", ""))
+                new_capital = old_capital + delta
+                if new_capital <= 0:
+                    await update.message.reply_text(
+                        f"변경 후 초기자본이 {new_capital:,.0f}원이 됩니다. 0 이하는 불가합니다."
+                    )
+                    return
+            except ValueError:
+                await update.message.reply_text("잘못된 금액입니다. 예: /setcapital +20000000")
+                return
+        else:
+            try:
+                new_capital = float(arg.replace(",", ""))
+                if new_capital <= 0:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text("잘못된 금액입니다. 숫자 또는 auto/reset을 입력하세요.")
+                return
+
+        portfolio.initial_capital = new_capital
+        if new_capital > portfolio.high_water_mark:
+            portfolio.high_water_mark = new_capital
+        portfolio._save_state()
+        pnl = portfolio.total_asset - new_capital
+        pnl_pct = pnl / new_capital * 100 if new_capital > 0 else 0
+
+        # +/- 변경인 경우 delta 표시 포함
+        delta_str = ""
+        diff = new_capital - old_capital
+        if diff != 0:
+            delta_str = f" ({diff:+,.0f})"
+
+        await update.message.reply_text(
+            f"✅ 초기자본 변경 완료\n\n"
+            f"이전: {old_capital:,.0f}원\n"
+            f"변경: {new_capital:,.0f}원{delta_str}\n"
+            f"총자산: {portfolio.total_asset:,.0f}원\n"
+            f"수익률: {pnl:+,.0f}원 ({pnl_pct:+.2f}%)"
+        )
+
+    async def _cmd_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """당일 주문 체결 현황 (KIS API 실시간 조회)."""
+        if not await self._check_auth(update):
+            return
+        if not self.system:
+            await update.message.reply_text("시스템 미연결")
+            return
+
+        await update.message.reply_text("주문 현황 조회 중...")
+        try:
+            loop = asyncio.get_event_loop()
+            orders = await loop.run_in_executor(
+                None, self.system.market_client.get_today_orders
+            )
+        except Exception as e:
+            await update.message.reply_text(f"조회 실패: {e}")
+            return
+
+        if not orders:
+            await update.message.reply_text("오늘 주문 내역이 없습니다.")
+            return
+
+        msg = "📋 <b>당일 주문 현황</b>\n\n"
+        for o in orders:
+            status = "✅체결" if o["filled"] else f"⏳미체결({o['ccld_qty']}/{o['ord_qty']})"
+            side_emoji = "🟢" if o["side"] == "매수" else "🔴"
+            time_str = f"{o['order_time'][:2]}:{o['order_time'][2:4]}" if len(o['order_time']) >= 4 else ""
+            msg += (
+                f"{side_emoji} {o['side']} <b>{o['name']}</b>({o['ticker']})\n"
+                f"  주문: {o['ord_qty']}주 × {o['ord_price']:,}원\n"
+            )
+            if o["ccld_qty"] > 0:
+                msg += f"  체결: {o['ccld_qty']}주 × {o['ccld_price']:,}원 = {o['ccld_amount']:,}원\n"
+            msg += f"  {status} | {time_str} | #{o['order_no']}\n\n"
+
+        await update.message.reply_html(msg)
 
     async def _cmd_trades(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """최근 매매 내역 조회."""
@@ -976,15 +1114,21 @@ class TelegramBot:
                 return
             order_info = pending["order_info"]
             try:
-                # 실시간 현재가 조회 (요청 당시 가격이 아닌 최신 가격 사용)
                 signal = order_info.get("signal", {"actions": [order_info.get("action_data", {})]})
                 sell_signal = {**signal, "actions": [order_info["action_data"]]}
                 ticker = order_info["ticker"]
-                fresh_prices = self.system.data_pipeline.collect_prices_only([ticker])
+                loop = asyncio.get_event_loop()
+                fresh_prices = await loop.run_in_executor(
+                    None, lambda: self.system.data_pipeline.collect_prices_only([ticker])
+                )
                 current_prices = fresh_prices if fresh_prices.get(ticker) else {ticker: order_info["price"]}
-                results = self.system.executor.execute_signal(sell_signal, current_prices)
+                results = await loop.run_in_executor(
+                    None, lambda: self.system.executor.execute_signal(sell_signal, current_prices)
+                )
                 for result in results:
-                    self.system._process_trade_result(result)
+                    await loop.run_in_executor(
+                        None, lambda r=result: self.system._process_trade_result(r)
+                    )
                 await query.edit_message_text(
                     f"💰 익절 실행 완료\n"
                     f"{order_info['name']}({ticker}) "

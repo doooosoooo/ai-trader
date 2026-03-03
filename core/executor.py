@@ -223,7 +223,7 @@ class OrderExecutor:
         if self.config.get("broker", {}).get("account_type") == "virtual":
             tr_id = "VTTC0802U"  # 모의 매수
 
-        ord_type = "01"  # 지정가 (안전)
+        ord_type = "00"  # 지정가 (KIS: 00=지정가, 01=시장가)
 
         body = {
             "CANO": self.auth.account_no[:8],
@@ -231,7 +231,7 @@ class OrderExecutor:
             "PDNO": ticker,
             "ORD_DVSN": ord_type,
             "ORD_QTY": str(quantity),
-            "ORD_UNPR": str(price),
+            "ORD_UNPR": str(int(price)),
         }
 
         try:
@@ -280,7 +280,7 @@ class OrderExecutor:
         if self.config.get("broker", {}).get("account_type") == "virtual":
             tr_id = "VTTC0801U"  # 모의 매도
 
-        ord_type = "01"  # 지정가
+        ord_type = "00"  # 지정가 (KIS: 00=지정가, 01=시장가)
 
         # 포지션 이름 가져오기
         pos = self.portfolio.positions.get(ticker)
@@ -292,7 +292,7 @@ class OrderExecutor:
             "PDNO": ticker,
             "ORD_DVSN": ord_type,
             "ORD_QTY": str(quantity),
-            "ORD_UNPR": str(price),
+            "ORD_UNPR": str(int(price)),
         }
 
         try:
@@ -307,6 +307,12 @@ class OrderExecutor:
                 order_no = data.get("output", {}).get("ODNO", "")
                 self.safety_guard.record_trade(ticker)
                 logger.info(f"Live SELL order submitted: {ticker} x{quantity} @{price} (주문번호: {order_no})")
+                # PnL 계산 (포지션 매입가 기준)
+                pnl = None
+                pnl_pct = None
+                if pos and pos.avg_price > 0:
+                    pnl = (price - pos.avg_price) * quantity - fee
+                    pnl_pct = f"{(price - pos.avg_price) / pos.avg_price:.2%}"
                 return {
                     "timestamp": datetime.now().isoformat(),
                     "ticker": ticker,
@@ -316,6 +322,8 @@ class OrderExecutor:
                     "price": price,
                     "amount": quantity * price,
                     "fee": fee,
+                    "pnl": pnl,
+                    "pnl_pct": pnl_pct,
                     "reason": reason,
                     "status": "SUBMITTED",
                     "order_no": order_no,

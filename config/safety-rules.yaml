@@ -15,7 +15,7 @@ emergency_stop_loss_pct: -0.10     # 총자산 -10% → 전체 거래 중단
 
 # 실행 규칙
 trading_hours_only: true           # 장 시간에만 거래
-require_confirmation_above: 3000000  # 300만원 이상 → Telegram 확인 요청
+require_confirmation_above: 10000000  # 1000만원 이상 → Telegram 확인 요청
 cool_down_minutes: 5               # 같은 종목 연속매매 최소 간격
 market_order_max_amount: 1000000   # 시장가 주문 최대 100만원
 

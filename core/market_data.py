@@ -386,12 +386,9 @@ class MarketDataClient:
         cash = _safe_int(summary.get("dnca_tot_amt", 0))
 
         if total_asset > 0 and invested > 0:
-            # total_asset이 있으면 cash를 역산 — 이중 계산 방지
-            derived_cash = total_asset - invested
-            if cash == 0 or abs(cash - total_asset) < abs(cash - derived_cash):
-                # cash가 0이거나, cash가 total_asset에 가까운 경우(=잘못된 값)
-                # → total_asset에서 역산
-                cash = derived_cash
+            # tot_evlu_amt(총평가금액)이 가장 정확 → cash를 항상 역산
+            # dnca_tot_amt는 결제완료 예수금만 포함하여 미결제 매도대금이 빠짐
+            cash = total_asset - invested
         elif total_asset == 0 and cash > 0:
             total_asset = cash + invested
         elif total_asset == 0 and cash == 0:
@@ -416,6 +413,59 @@ class MarketDataClient:
             "total_asset": total_asset,
             "positions": positions,
         }
+
+    def get_today_orders(self) -> list[dict]:
+        """당일 주문 체결 조회."""
+        from datetime import datetime
+        path = "/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
+        today = datetime.now().strftime("%Y%m%d")
+        tr_id = "TTTC8001R"
+        if self.auth.account_type == "virtual":
+            tr_id = "VTTC8001R"
+
+        params = {
+            "CANO": self.auth.account_no[:8],
+            "ACNT_PRDT_CD": self.auth.account_product_code,
+            "INQR_STRT_DT": today,
+            "INQR_END_DT": today,
+            "SLL_BUY_DVSN_CD": "00",
+            "INQR_DVSN": "01",
+            "PDNO": "",
+            "CCLD_DVSN": "00",
+            "ORD_GNO_BRNO": "",
+            "ODNO": "",
+            "INQR_DVSN_3": "00",
+            "INQR_DVSN_1": "",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+        }
+
+        try:
+            data = self._get(path, tr_id, params)
+        except RuntimeError as e:
+            logger.warning(f"Order inquiry failed: {e}")
+            return []
+
+        orders = []
+        for o in data.get("output1", []):
+            ord_qty = _safe_int(o.get("ord_qty", 0))
+            if ord_qty <= 0:
+                continue
+            ccld_qty = _safe_int(o.get("tot_ccld_qty", 0))
+            orders.append({
+                "ticker": o.get("pdno", ""),
+                "name": o.get("prdt_name", ""),
+                "side": "매수" if o.get("sll_buy_dvsn_cd") == "02" else "매도",
+                "ord_qty": ord_qty,
+                "ccld_qty": ccld_qty,
+                "ord_price": _safe_int(o.get("ord_unpr", 0)),
+                "ccld_price": _safe_int(o.get("avg_prvs", 0)),
+                "ccld_amount": _safe_int(o.get("tot_ccld_amt", 0)),
+                "order_no": o.get("odno", ""),
+                "order_time": o.get("ord_tmd", ""),
+                "filled": ccld_qty >= ord_qty,
+            })
+        return orders
 
     def get_kospi_index(self) -> dict:
         """코스피 지수 조회."""

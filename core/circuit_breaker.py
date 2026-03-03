@@ -49,7 +49,8 @@ class CircuitBreaker:
 
     @property
     def is_sell_allowed(self) -> bool:
-        return self.state in (CircuitState.NORMAL, CircuitState.WARNING, CircuitState.HALTED)
+        # HALTED에서 매도 차단 — 급락장에서 LLM이 패닉 매도하는 것 방지
+        return self.state in (CircuitState.NORMAL, CircuitState.WARNING)
 
     def check_kospi(self, kospi_change_pct: float) -> CircuitState:
         """코스피 급락 체크."""
@@ -162,7 +163,8 @@ class CircuitBreaker:
             CircuitState.EMERGENCY: 3,
         }
 
-        if state_priority[new_state] > state_priority[self.state]:
+        state_changed = state_priority[new_state] > state_priority[self.state]
+        if state_changed:
             old_state = self.state
             self.state = new_state
             self._halted_at = datetime.now()
@@ -176,8 +178,8 @@ class CircuitBreaker:
         }
         self.triggers.append(trigger_record)
 
-        # Telegram 긴급 알림
-        if self._notify:
+        # Telegram 알림 — state 변경 시에만 (반복 스팸 방지)
+        if state_changed and self._notify:
             try:
                 self._notify(
                     level="circuit_breaker",
