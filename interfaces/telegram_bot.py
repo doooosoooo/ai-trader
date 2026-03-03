@@ -139,7 +139,7 @@ class TelegramBot:
     # --- 알림 발송 ---
 
     async def send_alert(self, level: str, message: str) -> bool:
-        """알림 발송. circuit_breaker 등 중요 알림은 최대 3회 재시도."""
+        """알림 발송. 4096자 초과 시 자동 분할. 중요 알림은 최대 3회 재시도."""
         if not self.enabled or not self.chat_id:
             return False
 
@@ -149,21 +149,56 @@ class TelegramBot:
         critical_levels = {"circuit_breaker", "risk_exit", "error"}
         max_retries = 3 if level in critical_levels else 1
 
-        for attempt in range(max_retries):
-            try:
-                await self._app.bot.send_message(
-                    chat_id=self.chat_id,
-                    text=message,
-                    parse_mode="HTML",
-                )
-                return True
-            except Exception as e:
-                logger.error(f"Telegram alert failed (attempt {attempt + 1}/{max_retries}): {e}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)  # 1초, 2초 대기 후 재시도
+        # 4096자 초과 시 분할 전송
+        chunks = self._split_message(message, max_len=4090)
 
-        logger.error(f"Telegram alert PERMANENTLY failed [{level}]: {message[:100]}")
-        return False
+        for chunk in chunks:
+            for attempt in range(max_retries):
+                try:
+                    await self._app.bot.send_message(
+                        chat_id=self.chat_id,
+                        text=chunk,
+                        parse_mode="HTML",
+                    )
+                    break
+                except Exception as e:
+                    # HTML 파싱 에러 시 plain text로 폴백
+                    if "Can't parse entities" in str(e):
+                        logger.warning(f"HTML parse failed, falling back to plain text: {e}")
+                        try:
+                            await self._app.bot.send_message(
+                                chat_id=self.chat_id,
+                                text=chunk,
+                            )
+                        except Exception as e2:
+                            logger.error(f"Plain text fallback also failed: {e2}")
+                        break
+                    logger.error(f"Telegram alert failed (attempt {attempt + 1}/{max_retries}): {e}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2 ** attempt)
+            else:
+                logger.error(f"Telegram alert PERMANENTLY failed [{level}]: {chunk[:100]}")
+                return False
+
+        return True
+
+    @staticmethod
+    def _split_message(text: str, max_len: int = 4090) -> list[str]:
+        """긴 메시지를 텔레그램 한도에 맞게 분할."""
+        if len(text) <= max_len:
+            return [text]
+        chunks = []
+        while text:
+            if len(text) <= max_len:
+                chunks.append(text)
+                break
+            # 줄바꿈 기준으로 자르기
+            cut = text.rfind("\n", 0, max_len)
+            if cut <= 0:
+                cut = max_len
+            chunks.append(text[:cut])
+            text = text[cut:].lstrip("\n")
+        return chunks
 
     def send_alert_sync(self, level: str, message: str) -> bool:
         """동기 알림 발송 (콜백용)."""
@@ -887,7 +922,7 @@ class TelegramBot:
             )
             return
 
-        msg = self.system._format_screening_msg(result)
+        msg = self.system.notifier.format_screening_msg(result)
         await update.message.reply_html(msg)
 
     async def _cmd_backtest(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -914,7 +949,9 @@ class TelegramBot:
             strategy_name = "swing"
         elif args[0] == "results":
             # 최근 백테스트 결과 조회 (DB에서)
-            feedback = self.system._build_backtest_feedback()
+            feedback = self.system.analysis_store.build_backtest_feedback(
+                self.system._watchlist, list(self.system.portfolio.positions.keys()),
+            )
             if feedback:
                 await update.message.reply_text(f"📊 최근 백테스트 결과\n\n{feedback}")
             else:

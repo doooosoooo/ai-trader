@@ -1,6 +1,7 @@
 """텔레그램 메시지 포맷 + 알림 서비스."""
 
 import asyncio
+import html
 from datetime import datetime
 
 from loguru import logger
@@ -36,8 +37,8 @@ class NotificationService:
 
         risk = signal.get("risk_assessment", "?")
         risk_emoji = {"LOW": "🟢", "MEDIUM": "🟡", "HIGH": "🔴"}.get(risk, "⚪")
-        outlook = signal.get("market_outlook", "없음")
-        reasoning = signal.get("reasoning", "없음")
+        outlook = html.escape(signal.get("market_outlook", "없음"))
+        reasoning = html.escape(signal.get("reasoning", "없음"))
 
         msg = (
             f"📊 LLM 분석 결과 {mode_tag} [{now}]\n"
@@ -53,8 +54,8 @@ class NotificationService:
             for a in all_actions:
                 action_type = a.get("type", "HOLD")
                 ticker = a.get("ticker", "")
-                name = a.get("name", ticker_display(ticker) if ticker else "")
-                reason = a.get("reason", "")
+                name = html.escape(a.get("name", ticker_display(ticker) if ticker else ""))
+                reason = html.escape(a.get("reason", ""))
                 emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪"}.get(action_type, "⚪")
                 ratio_str = ""
                 if a.get("ratio"):
@@ -71,12 +72,8 @@ class NotificationService:
         if executed > 0:
             msg += f"\n⚡ 매매 실행: {executed}건"
 
-        # 판단 근거
+        # 판단 근거 (4096자 초과 시 send_alert에서 자동 분할)
         if reasoning and reasoning != "없음":
-            # 텔레그램 메시지 한도(4096자) 내에서 최대한 표시
-            remaining = 4000 - len(msg)
-            if len(reasoning) > remaining:
-                reasoning = reasoning[:remaining] + "..."
             msg += f"\n\n💬 근거:\n{reasoning}"
 
         return msg
