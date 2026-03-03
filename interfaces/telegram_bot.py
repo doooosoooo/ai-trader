@@ -338,7 +338,7 @@ class TelegramBot:
             )
             for result in results:
                 await loop.run_in_executor(
-                    None, lambda r=result: self.system._process_trade_result(r)
+                    None, lambda r=result: self.system.risk_manager.process_trade_result(r)
                 )
 
             await self.send_alert(
@@ -1127,7 +1127,7 @@ class TelegramBot:
                 )
                 for result in results:
                     await loop.run_in_executor(
-                        None, lambda r=result: self.system._process_trade_result(r)
+                        None, lambda r=result: self.system.risk_manager.process_trade_result(r)
                     )
                 await query.edit_message_text(
                     f"💰 익절 실행 완료\n"
@@ -1159,7 +1159,7 @@ class TelegramBot:
                     prices = self.system.data_pipeline.collect_prices_only([ticker])
                     results = self.system.executor.execute_signal(signal, prices)
                     for result in results:
-                        self.system._process_trade_result(result)
+                        self.system.risk_manager.process_trade_result(result)
                     await query.edit_message_text(
                         f"✅ 주문 승인 — 실행 완료\n"
                         f"{order.get('name', '')} {order.get('action', '')} "
