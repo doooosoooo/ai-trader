@@ -44,11 +44,12 @@ def adjust_price_to_tick(price: float, direction: str = "down") -> int:
 class OrderExecutor:
     """주문 실행기 — 실전/모의 모드에 따라 KIS API 호출 또는 가상 체결."""
 
-    def __init__(self, auth, config: dict, portfolio, safety_guard):
+    def __init__(self, auth, config: dict, portfolio, safety_guard, market_client=None):
         self.auth = auth  # KISAuth 인스턴스
         self.config = config
         self.portfolio = portfolio
         self.safety_guard = safety_guard
+        self.market_client = market_client  # 미체결 주문 조회용
         self.mode = config.get("system", {}).get("mode", "simulation")
 
     def execute_signal(self, signal: dict, current_prices: dict) -> list[dict]:
@@ -179,6 +180,26 @@ class OrderExecutor:
         quantity = int(pos.quantity * ratio)
         if quantity <= 0:
             quantity = pos.quantity  # 최소 1주
+
+        # 라이브 모드: 미체결 매도 주문이 있으면 중복 매도 방지
+        if self.mode != "simulation" and self.market_client:
+            try:
+                orders = self.market_client.get_today_orders()
+                pending_sell_qty = sum(
+                    o["ord_qty"] - o["ccld_qty"]
+                    for o in orders
+                    if o["ticker"] == ticker and o["side"] == "매도" and not o["filled"]
+                )
+                if pending_sell_qty > 0:
+                    available = pos.quantity - pending_sell_qty
+                    if available <= 0:
+                        logger.warning(f"Already pending sell {pending_sell_qty} for {ticker}, skipping")
+                        return None
+                    if quantity > available:
+                        logger.warning(f"Adjusting sell qty: {quantity} → {available} (pending: {pending_sell_qty})")
+                        quantity = available
+            except Exception as e:
+                logger.warning(f"Pending order check failed, proceeding with portfolio qty: {e}")
 
         price = limit_price or current_price
         if price <= 0:

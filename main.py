@@ -142,6 +142,7 @@ class TradingSystem:
 
         self.executor = OrderExecutor(
             self.kis_auth, settings, self.portfolio, self.safety_guard,
+            market_client=self.market_client,
         )
 
         # Data
@@ -315,9 +316,10 @@ class TradingSystem:
 
         # 판단 근거
         if reasoning and reasoning != "없음":
-            # 너무 길면 자르기
-            if len(reasoning) > 200:
-                reasoning = reasoning[:200] + "..."
+            # 텔레그램 메시지 한도(4096자) 내에서 최대한 표시
+            remaining = 4000 - len(msg)
+            if len(reasoning) > remaining:
+                reasoning = reasoning[:remaining] + "..."
             msg += f"\n\n💬 근거:\n{reasoning}"
 
         return msg
