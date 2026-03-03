@@ -838,8 +838,9 @@ class TelegramBot:
 
         risk = signal.get("risk_assessment", "?")
         risk_emoji = {"LOW": "🟢", "MEDIUM": "🟡", "HIGH": "🔴"}.get(risk, "⚪")
-        outlook = signal.get("market_outlook", "없음")
-        reasoning = signal.get("reasoning", "없음")
+        from html import escape as _esc
+        outlook = _esc(signal.get("market_outlook", "없음"))
+        reasoning = _esc(signal.get("reasoning", "없음"))
 
         msg = (
             f"📊 <b>마지막 LLM 분석</b> {mode_tag}\n"
@@ -870,8 +871,8 @@ class TelegramBot:
             msg += "\n📋 <b>종목 판단:</b>\n"
             for a in all_actions:
                 action_type = a.get("type", "HOLD")
-                name = a.get("name", a.get("ticker", ""))
-                reason = a.get("reason", "")
+                name = _esc(a.get("name", a.get("ticker", "")))
+                reason = _esc(a.get("reason", ""))
                 emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪"}.get(action_type, "⚪")
                 ratio_str = ""
                 if a.get("ratio"):
@@ -1030,7 +1031,7 @@ class TelegramBot:
                 msg += f"<code>{key}</code>: {val}{range_str}\n"
             msg += (
                 f"\n{'─' * 24}\n"
-                "변경: /param <키> <값>\n"
+                "변경: /param &lt;키&gt; &lt;값&gt;\n"
                 "예: /param take_profit_pct 0.20\n"
                 "범위 초과 시 확인 후 강제 적용 가능"
             )
