@@ -130,7 +130,11 @@ class StockScreener:
             )
 
             self._last_result = result
-            self._save_to_db(result)
+            # 0건이면 DB 캐시 보존 (이전 좋은 결과 유지)
+            if candidates:
+                self._save_to_db(result)
+            else:
+                logger.warning("Screening returned 0 candidates — keeping previous DB cache")
 
             logger.info(
                 f"Screening complete: {len(candidates)} candidates selected"
@@ -196,32 +200,45 @@ class StockScreener:
         min_per = filters.get("min_per", 0)
         exclude = set(self.config.get("exclude_tickers", []))
 
+        reject_reasons = {"excluded": 0, "preferred": 0, "market_cap": 0,
+                          "trading_value": 0, "price": 0, "volume": 0, "per": 0}
         passed = []
         for s in stocks:
             ticker = s["ticker"]
             if ticker in exclude:
+                reject_reasons["excluded"] += 1
                 continue
             # 우선주 제외 (코드 마지막자리 5, 7, 8, 9 등)
             if not ticker[-1].isdigit() or ticker[-1] in ("5", "7", "8", "9"):
                 if ticker[-1] != "0":
+                    reject_reasons["preferred"] += 1
                     continue
 
             if s["market_cap"] < min_cap:
+                reject_reasons["market_cap"] += 1
                 continue
             if s["trading_value"] < min_trade_val:
+                reject_reasons["trading_value"] += 1
                 continue
             if s["close_price"] < min_price:
+                reject_reasons["price"] += 1
                 continue
             if s["volume"] <= 0:
+                reject_reasons["volume"] += 1
                 continue
             # PER 필터 (0 이하 = 적자, 100 이상 = 극단적 고평가)
             per = s.get("per", 0)
             if per is not None and per != 0:
                 if per <= min_per or per > max_per:
+                    reject_reasons["per"] += 1
                     continue
 
             passed.append(s)
 
+        logger.info(
+            f"Stage1 filter breakdown: {len(stocks)} total → {len(passed)} passed | "
+            f"rejected: {dict((k, v) for k, v in reject_reasons.items() if v > 0)}"
+        )
         return passed
 
     # ------------------------------------------------------------------

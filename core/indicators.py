@@ -169,6 +169,10 @@ def get_indicator_summary(df: pd.DataFrame, params: dict | None = None) -> dict:
         except (ValueError, TypeError):
             return default
 
+    # RSI 변화 방향
+    prev_rsi = prev.get("rsi", 50)
+    rsi_delta = rsi_val - prev_rsi if prev_rsi else 0
+
     return {
         "price": _safe_int(latest.get("close", 0)),
         "change_1d": f"{latest.get('return_1d', 0) or 0:.2%}",
@@ -176,9 +180,17 @@ def get_indicator_summary(df: pd.DataFrame, params: dict | None = None) -> dict:
         "ma20": _safe_int(latest.get("ma20", 0)),
         "ma60": _safe_int(latest.get("ma60", 0)),
         "rsi": _safe_round(rsi_val, 1),
+        "rsi_prev": _safe_round(prev_rsi, 1),
+        "rsi_delta": _safe_round(rsi_delta, 1),
         "rsi_signal": rsi_signal,
-        "macd_signal": macd_signal,
+        "macd_line": _safe_round(latest.get("macd", 0), 2),
+        "macd_signal_line": _safe_round(latest.get("macd_signal", 0), 2),
         "macd_hist": _safe_round(macd_hist, 2),
+        "macd_hist_prev": _safe_round(macd_prev, 2),
+        "macd_signal": macd_signal,
+        "stoch_k": _safe_round(latest.get("stoch_k", 0), 1),
+        "stoch_d": _safe_round(latest.get("stoch_d", 0), 1),
+        "bb_pct": _safe_round(bb_pct, 3),
         "bb_signal": bb_signal,
         "volume_ratio": _safe_round(vol_ratio, 2),
         "volume_signal": vol_signal,

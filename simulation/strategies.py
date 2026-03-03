@@ -215,21 +215,24 @@ def max_hold_exceeded(days: int) -> Condition:
 # ──────────────────────────────────────────────
 
 def create_swing_strategy(params: dict | None = None) -> Strategy:
-    """스윙 전략: RSI 과매도 + 거래량 급증 + 골든크로스.
+    """스윙 전략: RSI 과매도 진입 → 데드크로스/익절/손절 청산.
 
-    config/strategies/swing.md 기반.
+    RSI < 45 로 저점 매수, 거래량 급증 조건은 선택적.
     """
     p = params or {}
-    tp = p.get("take_profit_pct", 0.15)
+    tp = p.get("take_profit_pct", 0.10)
     sl = p.get("stop_loss_pct", 0.05)
     max_days = p.get("max_hold_days", 14)
 
+    entry = [rsi_below(p.get("rsi_oversold", 45))]
+    # 거래량 필터는 명시적으로 설정했을 때만 적용
+    vol_mult = p.get("volume_surge_multiplier")
+    if vol_mult is not None and vol_mult > 1.0:
+        entry.append(volume_surge(vol_mult))
+
     return Strategy(
         name="swing",
-        entry_conditions=[
-            rsi_below(p.get("rsi_oversold", 35)),
-            volume_surge(p.get("volume_surge_multiplier", 2.0)),
-        ],
+        entry_conditions=entry,
         exit_conditions=[
             take_profit_reached(tp),
             stop_loss_reached(sl),
@@ -240,7 +243,7 @@ def create_swing_strategy(params: dict | None = None) -> Strategy:
         max_positions=p.get("max_positions", 5),
         take_profit_pct=tp,
         stop_loss_pct=sl,
-        min_hold_days=p.get("min_hold_days", 3),
+        min_hold_days=p.get("min_hold_days", 2),
         max_hold_days=max_days,
     )
 

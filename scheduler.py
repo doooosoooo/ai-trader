@@ -116,12 +116,20 @@ class TradingScheduler:
             name="주간 리포트",
         )
 
-        # 주간 백테스트 (토요일 02:00) — 주말 새벽에 자동 실행
+        # 일일 백테스트 (매일 18:00) — 장 마감 후 자동 실행
         self.scheduler.add_job(
             self._safe_run(self.system.cycle_backtest, check_hours=False, check_trading_day=False),
-            CronTrigger(hour=2, minute=0, day_of_week="sat"),
-            id="weekly_backtest",
-            name="주간 백테스트",
+            CronTrigger(hour=18, minute=0),
+            id="daily_backtest",
+            name="일일 백테스트",
+        )
+
+        # 장외 LLM 분석 (매 2시간, 장중 제외) — 최신 데이터 기반 분석 유지
+        self.scheduler.add_job(
+            self._safe_run(self.system.cycle_llm_analysis, check_hours=False, check_trading_day=False),
+            CronTrigger(hour="0,2,4,6,8,16,18,20,22", minute=30),
+            id="offhours_analysis",
+            name="장외 LLM 분석",
         )
 
     def _safe_run(self, func, check_hours=True, check_trading_day=True):

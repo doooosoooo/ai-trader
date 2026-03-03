@@ -22,6 +22,7 @@ class Position:
         avg_price: float,
         current_price: float = 0,
         bought_at: str = "",
+        peak_price: float = 0,
     ):
         self.ticker = ticker
         self.name = name
@@ -29,6 +30,7 @@ class Position:
         self.avg_price = avg_price
         self.current_price = current_price or avg_price
         self.bought_at = bought_at or datetime.now().isoformat()
+        self.peak_price = peak_price or self.current_price
 
     @property
     def market_value(self) -> float:
@@ -74,6 +76,7 @@ class Portfolio:
         self.positions: dict[str, Position] = {}
         self.cash: float = 0.0
         self.initial_capital: float = 0.0
+        self.high_water_mark: float = 0.0
         self._load_state()
 
     def _init_db(self) -> None:
@@ -92,7 +95,8 @@ class Portfolio:
                     quantity INTEGER NOT NULL,
                     avg_price REAL NOT NULL,
                     current_price REAL NOT NULL DEFAULT 0,
-                    bought_at TEXT NOT NULL
+                    bought_at TEXT NOT NULL,
+                    peak_price REAL NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS trade_history (
@@ -132,18 +136,34 @@ class Portfolio:
                 conn.execute("ALTER TABLE trade_history ADD COLUMN mode TEXT NOT NULL DEFAULT 'simulation'")
                 logger.info("Migrated trade_history: added mode column")
 
+            state_cols = [r[1] for r in conn.execute("PRAGMA table_info(portfolio_state)").fetchall()]
+            if "high_water_mark" not in state_cols:
+                conn.execute("ALTER TABLE portfolio_state ADD COLUMN high_water_mark REAL NOT NULL DEFAULT 0")
+                # 기존 데이터: HWM을 현재 total_asset으로 초기화
+                conn.execute("UPDATE portfolio_state SET high_water_mark = cash + initial_capital WHERE high_water_mark = 0")
+                logger.info("Migrated portfolio_state: added high_water_mark column")
+
+            pos_cols = [r[1] for r in conn.execute("PRAGMA table_info(positions)").fetchall()]
+            if "peak_price" not in pos_cols:
+                conn.execute("ALTER TABLE positions ADD COLUMN peak_price REAL NOT NULL DEFAULT 0")
+                # 기존 포지션: peak_price를 current_price로 초기화
+                conn.execute("UPDATE positions SET peak_price = current_price WHERE peak_price = 0")
+                logger.info("Migrated positions: added peak_price column")
+
     def _load_state(self) -> None:
         with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute("SELECT cash, initial_capital FROM portfolio_state WHERE id = 1").fetchone()
+            row = conn.execute("SELECT cash, initial_capital, high_water_mark FROM portfolio_state WHERE id = 1").fetchone()
             if row:
                 self.cash = row[0]
                 self.initial_capital = row[1]
+                self.high_water_mark = row[2] if row[2] else 0.0
 
-            rows = conn.execute("SELECT ticker, name, quantity, avg_price, current_price, bought_at FROM positions").fetchall()
+            rows = conn.execute("SELECT ticker, name, quantity, avg_price, current_price, bought_at, peak_price FROM positions").fetchall()
             for r in rows:
                 self.positions[r[0]] = Position(
                     ticker=r[0], name=r[1], quantity=r[2],
                     avg_price=r[3], current_price=r[4], bought_at=r[5],
+                    peak_price=r[6],
                 )
         logger.info(f"Portfolio loaded: cash={self.cash:,.0f}, positions={len(self.positions)}")
 
@@ -152,20 +172,20 @@ class Portfolio:
         try:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute("""
-                INSERT INTO portfolio_state (id, cash, initial_capital, updated_at)
-                VALUES (1, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET cash=?, initial_capital=?, updated_at=?
+                INSERT INTO portfolio_state (id, cash, initial_capital, updated_at, high_water_mark)
+                VALUES (1, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET cash=?, initial_capital=?, updated_at=?, high_water_mark=?
             """, (
-                self.cash, self.initial_capital, datetime.now().isoformat(),
-                self.cash, self.initial_capital, datetime.now().isoformat(),
+                self.cash, self.initial_capital, datetime.now().isoformat(), self.high_water_mark,
+                self.cash, self.initial_capital, datetime.now().isoformat(), self.high_water_mark,
             ))
 
             conn.execute("DELETE FROM positions")
             for pos in self.positions.values():
                 conn.execute("""
-                    INSERT INTO positions (ticker, name, quantity, avg_price, current_price, bought_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (pos.ticker, pos.name, pos.quantity, pos.avg_price, pos.current_price, pos.bought_at))
+                    INSERT INTO positions (ticker, name, quantity, avg_price, current_price, bought_at, peak_price)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (pos.ticker, pos.name, pos.quantity, pos.avg_price, pos.current_price, pos.bought_at, pos.peak_price))
             conn.commit()
         except Exception as e:
             conn.rollback()
@@ -178,6 +198,7 @@ class Portfolio:
         """초기 자본금 설정."""
         self.cash = capital
         self.initial_capital = capital
+        self.high_water_mark = capital
         self._save_state()
         logger.info(f"Portfolio initialized: {capital:,.0f} KRW")
 
@@ -205,11 +226,23 @@ class Portfolio:
             return 1.0
         return self.cash / self.total_asset
 
+    @property
+    def portfolio_drawdown(self) -> float:
+        """HWM 대비 현재 낙폭 (0.0 = 고점, 0.1 = 고점 대비 10% 하락)."""
+        if self.high_water_mark <= 0:
+            return 0.0
+        return max(0.0, (self.high_water_mark - self.total_asset) / self.high_water_mark)
+
     def update_prices(self, prices: dict[str, float]) -> None:
-        """보유 종목 현재가 업데이트."""
+        """보유 종목 현재가 업데이트 + peak_price/HWM 갱신."""
         for ticker, price in prices.items():
             if ticker in self.positions:
                 self.positions[ticker].current_price = price
+                if price > self.positions[ticker].peak_price:
+                    self.positions[ticker].peak_price = price
+        # 포트폴리오 고점(HWM) 갱신
+        if self.total_asset > self.high_water_mark:
+            self.high_water_mark = self.total_asset
         self._save_state()
 
     def execute_buy(
@@ -381,6 +414,8 @@ class Portfolio:
             "initial_capital": self.initial_capital,
             "total_pnl": self.total_pnl,
             "total_pnl_pct": f"{self.total_pnl_pct:.2%}",
+            "high_water_mark": self.high_water_mark,
+            "portfolio_drawdown": f"{self.portfolio_drawdown:.1%}",
             "positions": {t: p.to_dict() for t, p in self.positions.items()},
             "num_positions": len(self.positions),
         }
