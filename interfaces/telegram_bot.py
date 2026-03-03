@@ -40,6 +40,7 @@ class TelegramBot:
         self._pending_confirmations: dict[str, dict] = {}
         self._pending_param_changes: dict[str, dict] = {}  # force param 확인 대기
         self._pending_sell_confirmations: dict[str, dict] = {}  # 익절 확인 대기
+        self._loop = None  # 메인 이벤트 루프 참조 (스레드에서 async 호출용)
         self._load_pending_sells()  # 재시작 시 복구
 
         if not TELEGRAM_AVAILABLE:
@@ -77,6 +78,7 @@ class TelegramBot:
         await self._app.initialize()
         await self._app.start()
         await self._app.updater.start_polling()
+        self._loop = asyncio.get_event_loop()  # 메인 루프 참조 저장
         logger.info("Telegram bot started")
 
         # 재시작 시 복원된 pending sell에 대해 타임아웃 태스크 재스케줄링
@@ -201,20 +203,23 @@ class TelegramBot:
         return chunks
 
     def send_alert_sync(self, level: str, message: str) -> bool:
-        """동기 알림 발송 (콜백용)."""
+        """동기 알림 발송 — 스케줄러 스레드에서도 안전하게 동작."""
         if not self.enabled or not self.chat_id or not self._app:
-            logger.info(f"[Alert:{level}] {message}")
+            logger.info(f"[Alert:{level}] {message[:200]}")
             return False
 
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.ensure_future(self.send_alert(level, message))
+            loop = self._loop
+            if loop and loop.is_running():
+                # 스케줄러 스레드 등 외부 스레드에서 호출 시
+                asyncio.run_coroutine_threadsafe(self.send_alert(level, message), loop)
             else:
+                # 이벤트 루프가 없거나 미실행 시 (드문 케이스)
+                loop = asyncio.get_event_loop()
                 loop.run_until_complete(self.send_alert(level, message))
             return True
-        except Exception:
-            logger.info(f"[Alert:{level}] {message}")
+        except Exception as e:
+            logger.warning(f"[Alert:{level}] send failed: {e}")
             return False
 
     async def send_trade_alert(self, trade: dict):

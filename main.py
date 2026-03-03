@@ -158,20 +158,14 @@ class TradingSystem:
         # 시작 시 히스토리 데이터 사전 수집
         self._prefetch_historical_data()
 
-        # 시작 시 분석 결과가 없거나 오래됐으면 자동 실행
-        run_initial_analysis = False
+        # 초기 분석은 run_async에서 봇 시작 후 실행 (알림 전송을 위해)
+        self._need_initial_analysis = False
         if not self._last_analysis:
-            run_initial_analysis = True
+            self._need_initial_analysis = True
         elif self._last_analysis.get("timestamp"):
             last_ts = datetime.fromisoformat(self._last_analysis["timestamp"])
             if (datetime.now() - last_ts).total_seconds() > 7200:  # 2시간 이상 경과
-                run_initial_analysis = True
-        if run_initial_analysis:
-            logger.info("Running initial LLM analysis (no recent result)...")
-            try:
-                self.cycle_llm_analysis()
-            except Exception as e:
-                logger.warning(f"Initial LLM analysis failed: {e}")
+                self._need_initial_analysis = True
 
         watchlist_display = [ticker_display(t) for t in self._watchlist]
         logger.info(f"System initialized | Mode: {self.config_manager.get_mode()} | Watchlist: {watchlist_display}")
@@ -1033,6 +1027,15 @@ class TradingSystem:
         )
 
         logger.info("AI Trading System is running")
+
+        # 봇 시작 후 초기 분석 실행 (알림 전송 가능 상태)
+        if self._need_initial_analysis:
+            logger.info("Running initial LLM analysis (no recent result)...")
+            try:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, self.cycle_llm_analysis)
+            except Exception as e:
+                logger.warning(f"Initial LLM analysis failed: {e}")
 
         # 메인 루프
         try:
