@@ -888,11 +888,12 @@ class TelegramBot:
             msg += f"\n⚡ 매매 실행: {executed}건\n"
 
         if reasoning and reasoning != "없음":
-            if len(reasoning) > 300:
-                reasoning = reasoning[:300] + "..."
             msg += f"\n💬 <b>판단 근거:</b>\n{reasoning}"
 
-        await update.message.reply_html(msg)
+        # 4096자 초과 시 분할 전송
+        chunks = self._split_message(msg, max_len=4090)
+        for chunk in chunks:
+            await update.message.reply_html(chunk)
 
     async def _cmd_screen(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """종목 스크리닝 결과 조회. /screen now 로 즉시 실행."""
