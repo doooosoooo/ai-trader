@@ -256,11 +256,18 @@ class OrderExecutor:
         }
 
         try:
-            hashkey = self.auth.get_hashkey(body)
-            headers = self.auth.build_headers(tr_id, hashkey)
             url = f"{self.auth.base_url}/uapi/domestic-stock/v1/trading/order-cash"
-            resp = requests.post(url, json=body, headers=headers, timeout=10)
-            resp.raise_for_status()
+            for attempt in range(2):
+                hashkey = self.auth.get_hashkey(body)
+                headers = self.auth.build_headers(tr_id, hashkey)
+                resp = requests.post(url, json=body, headers=headers, timeout=10)
+                if resp.status_code in (401, 403) and attempt == 0:
+                    logger.warning(f"Live BUY {resp.status_code}, refreshing token...")
+                    self.auth.invalidate_token()
+                    import time; time.sleep(1)
+                    continue
+                resp.raise_for_status()
+                break
             data = resp.json()
 
             if data.get("rt_cd") == "0":
@@ -317,11 +324,18 @@ class OrderExecutor:
         }
 
         try:
-            hashkey = self.auth.get_hashkey(body)
-            headers = self.auth.build_headers(tr_id, hashkey)
             url = f"{self.auth.base_url}/uapi/domestic-stock/v1/trading/order-cash"
-            resp = requests.post(url, json=body, headers=headers, timeout=10)
-            resp.raise_for_status()
+            for attempt in range(2):
+                hashkey = self.auth.get_hashkey(body)
+                headers = self.auth.build_headers(tr_id, hashkey)
+                resp = requests.post(url, json=body, headers=headers, timeout=10)
+                if resp.status_code in (401, 403) and attempt == 0:
+                    logger.warning(f"Live SELL {resp.status_code}, refreshing token...")
+                    self.auth.invalidate_token()
+                    import time; time.sleep(1)
+                    continue
+                resp.raise_for_status()
+                break
             data = resp.json()
 
             if data.get("rt_cd") == "0":

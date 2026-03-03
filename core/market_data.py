@@ -75,18 +75,35 @@ class KISAuth:
             "appkey": self.app_key,
             "appsecret": self.app_secret,
         }
-        try:
-            resp = requests.post(url, json=body, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-            self._access_token = data["access_token"]
-            # 토큰 유효시간 — 보통 24시간, 여유 있게 23시간으로 설정
-            self._token_expires = datetime.now() + timedelta(hours=23)
-            logger.info("KIS API token issued successfully")
-            return self._access_token
-        except Exception as e:
-            logger.error(f"KIS token issue failed: {e}")
-            raise
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                resp = requests.post(url, json=body, timeout=10)
+                resp.raise_for_status()
+                data = resp.json()
+                self._access_token = data["access_token"]
+                # 토큰 유효시간 — 보통 24시간, 여유 있게 23시간으로 설정
+                self._token_expires = datetime.now() + timedelta(hours=23)
+                logger.info("KIS API token issued successfully")
+                return self._access_token
+            except Exception as e:
+                wait = 2 ** attempt  # 1, 2, 4초
+                logger.warning(
+                    f"KIS token issue failed (attempt {attempt + 1}/{max_retries}, "
+                    f"retry in {wait}s): {e}"
+                )
+                if attempt < max_retries - 1:
+                    time.sleep(wait)
+                else:
+                    logger.error(f"KIS token issue permanently failed: {e}")
+                    raise
+
+    def invalidate_token(self):
+        """토큰 무효화 — 403 등으로 토큰이 만료된 것으로 판단 시 호출."""
+        with self._token_lock:
+            self._access_token = ""
+            self._token_expires = datetime.min
+            logger.info("KIS token invalidated, will re-issue on next request")
 
     def get_hashkey(self, body: dict) -> str:
         """POST 요청용 hashkey 생성."""
@@ -125,22 +142,32 @@ class MarketDataClient:
 
     def _get(self, path: str, tr_id: str, params: dict) -> dict:
         url = f"{self.auth.base_url}{path}"
-        headers = self.auth.build_headers(tr_id)
-        try:
-            resp = requests.get(url, headers=headers, params=params, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
-            rt_cd = data.get("rt_cd", "")
-            if rt_cd != "0":
-                error_msg = data.get("msg1", "unknown")
-                logger.error(f"KIS API error [{path}] rt_cd={rt_cd}: {error_msg}")
-                raise RuntimeError(f"KIS API error [{rt_cd}]: {error_msg}")
-            return data
-        except RuntimeError:
-            raise
-        except Exception as e:
-            logger.error(f"KIS API GET failed [{path}]: {e}")
-            raise
+        for attempt in range(2):  # 최대 1회 토큰 갱신 재시도
+            headers = self.auth.build_headers(tr_id)
+            try:
+                resp = requests.get(url, headers=headers, params=params, timeout=15)
+                # 403/401 → 토큰 만료 가능성, 갱신 후 재시도
+                if resp.status_code in (401, 403) and attempt == 0:
+                    logger.warning(f"KIS API {resp.status_code} [{path}], refreshing token...")
+                    self.auth.invalidate_token()
+                    time.sleep(1)
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                rt_cd = data.get("rt_cd", "")
+                if rt_cd != "0":
+                    error_msg = data.get("msg1", "unknown")
+                    logger.error(f"KIS API error [{path}] rt_cd={rt_cd}: {error_msg}")
+                    raise RuntimeError(f"KIS API error [{rt_cd}]: {error_msg}")
+                return data
+            except RuntimeError:
+                raise
+            except requests.exceptions.HTTPError:
+                raise
+            except Exception as e:
+                logger.error(f"KIS API GET failed [{path}]: {e}")
+                raise
+        raise RuntimeError(f"KIS API GET failed [{path}] after token refresh")
 
     def get_current_price(self, ticker: str) -> dict:
         """현재가 조회 (국내 주식)."""
