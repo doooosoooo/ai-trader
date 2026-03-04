@@ -1,12 +1,16 @@
 """리스크 기반 자동 청산 + 매매 결과 처리."""
 
 import asyncio
+import json
 import time
 from datetime import datetime
+from pathlib import Path
 
 from loguru import logger
 
 from core.notification import NotificationService
+
+_ALERT_STATE_FILE = Path(__file__).parent.parent / "data" / "storage" / "alert_state.json"
 
 
 class RiskManager:
@@ -40,9 +44,33 @@ class RiskManager:
         self.sim_tracker = sim_tracker
         self.sync_account_fn = sync_account_fn
 
-        # 집중도/드로다운 알림 상태
+        # 집중도/드로다운 알림 상태 — 파일 영속화 (PM2 재시작 시 스팸 방지)
         self._concentration_alerted: dict[str, str] = {}
         self._dd_alerted = False
+        self._load_alert_state()
+
+    def _load_alert_state(self) -> None:
+        """영속화된 알림 상태 복원."""
+        try:
+            if _ALERT_STATE_FILE.exists():
+                data = json.loads(_ALERT_STATE_FILE.read_text())
+                self._concentration_alerted = data.get("concentration_alerted", {})
+                self._dd_alerted = data.get("dd_alerted", False)
+        except Exception as e:
+            logger.warning(f"Alert state load failed: {e}")
+
+    def _save_alert_state(self) -> None:
+        """알림 상태 저장."""
+        try:
+            _ALERT_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "concentration_alerted": self._concentration_alerted,
+                "dd_alerted": self._dd_alerted,
+                "updated_at": datetime.now().isoformat(),
+            }
+            _ALERT_STATE_FILE.write_text(json.dumps(data, ensure_ascii=False))
+        except Exception as e:
+            logger.warning(f"Alert state save failed: {e}")
 
     def check_risk_exits(self) -> list[dict]:
         """리스크 기반 자동 청산 — 손절/트레일링스탑/보유기간 초과.
@@ -99,6 +127,7 @@ class RiskManager:
                     if self._concentration_alerted.get(ticker) == today_str:
                         continue
                     self._concentration_alerted[ticker] = today_str
+                    self._save_alert_state()
                     logger.warning(
                         f"Concentration alert: {pos.name}({ticker}) "
                         f"weight {weight:.1%} > {max_weight:.1%}"
@@ -129,8 +158,11 @@ class RiskManager:
                     f"신규 매수를 자제하고 리스크를 점검하세요.",
                 )
                 self._dd_alerted = True  # 중복 알림 방지
+                self._save_alert_state()
         else:
-            self._dd_alerted = False  # 드로다운 회복 시 알림 리셋
+            if self._dd_alerted:
+                self._dd_alerted = False  # 드로다운 회복 시 알림 리셋
+                self._save_alert_state()
 
         return results
 
@@ -160,13 +192,18 @@ class RiskManager:
             logger.error(f"Risk exit execution failed for {ticker}: {e}")
             return None
 
-    def process_trade_result(self, result: dict) -> None:
-        """매매 결과 처리 — 알림 + 시뮬레이션 추적 + live 계좌 동기화."""
+    def process_trade_result(self, result: dict, suppress_notification: bool = False) -> None:
+        """매매 결과 처리 — 알림 + 시뮬레이션 추적 + live 계좌 동기화.
+
+        Args:
+            suppress_notification: True이면 trade_executed 알림을 보내지 않음
+                (분석 사이클에서 호출 시 llm_analysis 메시지에 통합되므로 중복 방지)
+        """
         status = result.get("status", "")
 
         if status == "SIMULATED":
             self.sim_tracker.record_trade(result)
-            if self.telegram.enabled:
+            if self.telegram.enabled and not suppress_notification:
                 self.telegram.send_alert_sync(
                     "trade_executed",
                     f"[SIM] {NotificationService.format_trade_msg(result)}",
@@ -175,7 +212,7 @@ class RiskManager:
         elif status == "SUBMITTED":
             # Live 주문 접수됨 — trade_history에 기록 + 계좌 동기화
             self.portfolio._record_trade(result, result.get("signal_json", ""))
-            if self.telegram.enabled:
+            if self.telegram.enabled and not suppress_notification:
                 mode_tag = "[LIVE]"
                 order_no = result.get("order_no", "")
                 self.telegram.send_alert_sync(

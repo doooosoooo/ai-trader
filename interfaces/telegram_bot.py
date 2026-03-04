@@ -378,7 +378,7 @@ class TelegramBot:
             )
             for result in results:
                 await loop.run_in_executor(
-                    None, lambda r=result: self.system.risk_manager.process_trade_result(r)
+                    None, lambda r=result: self.system.risk_manager.process_trade_result(r, suppress_notification=True)
                 )
 
             await self.send_alert(
@@ -821,7 +821,7 @@ class TelegramBot:
             await update.message.reply_text("🔄 LLM 분석 즉시 실행 중... (1~2분 소요)")
             try:
                 loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, self.system.cycle_llm_analysis)
+                await loop.run_in_executor(None, lambda: self.system.cycle_llm_analysis(suppress_notification=True))
             except Exception as e:
                 await update.message.reply_text(f"분석 실행 실패: {e}")
                 return
@@ -916,7 +916,7 @@ class TelegramBot:
             await update.message.reply_text("🔍 종목 스크리닝 실행 중... (30초~1분 소요)")
             try:
                 loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, self.system.cycle_screening)
+                await loop.run_in_executor(None, lambda: self.system.cycle_screening(suppress_notification=True))
             except Exception as e:
                 await update.message.reply_text(f"스크리닝 실패: {e}")
                 return
@@ -1171,7 +1171,7 @@ class TelegramBot:
                 )
                 for result in results:
                     await loop.run_in_executor(
-                        None, lambda r=result: self.system.risk_manager.process_trade_result(r)
+                        None, lambda r=result: self.system.risk_manager.process_trade_result(r, suppress_notification=True)
                     )
                 await query.edit_message_text(
                     f"💰 익절 실행 완료\n"

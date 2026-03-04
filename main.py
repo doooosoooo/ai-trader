@@ -308,8 +308,13 @@ class TradingSystem:
 
         logger.info(f"Data collected: {len(prices)} tickers")
 
-    def cycle_llm_analysis(self):
-        """LLM 분석 사이클 — 핵심 매매 판단 루프."""
+    def cycle_llm_analysis(self, suppress_notification: bool = False):
+        """LLM 분석 사이클 — 핵심 매매 판단 루프.
+
+        Args:
+            suppress_notification: True이면 텔레그램 알림을 보내지 않음
+                (텔레그램 커맨드에서 직접 호출 시 커맨드 응답으로 대체)
+        """
         if self._paused:
             logger.info("System paused, skipping LLM analysis")
             return
@@ -495,11 +500,12 @@ class TradingSystem:
                     auto_actions.append(action)
 
                 # 즉시 실행 (매수, 소형 매도, 손절 매도 모두)
+                # 분석 사이클 내 매매는 llm_analysis 메시지에 통합되므로 개별 알림 억제
                 if auto_actions:
                     auto_signal = {**filtered, "actions": auto_actions}
                     results = self.executor.execute_signal(auto_signal, current_prices)
                     for result in results:
-                        self.risk_manager.process_trade_result(result)
+                        self.risk_manager.process_trade_result(result, suppress_notification=True)
 
                 # 대형 매도만 확인 요청
                 for action in confirm_actions:
@@ -537,7 +543,7 @@ class TradingSystem:
                 prices=eval_prices,
                 mode=self.config_manager.get_mode(),
             )
-            if self.telegram.enabled:
+            if self.telegram.enabled and not suppress_notification:
                 try:
                     analysis_msg = self.notifier.format_analysis_msg(signal, actions)
                     self.telegram.send_alert_sync("llm_analysis", analysis_msg)
@@ -633,8 +639,13 @@ class TradingSystem:
         # 시스템 리소스 체크
         self.circuit_breaker.check_system_resources()
 
-    def cycle_screening(self):
-        """종목 스크리닝 사이클."""
+    def cycle_screening(self, suppress_notification: bool = False):
+        """종목 스크리닝 사이클.
+
+        Args:
+            suppress_notification: True이면 텔레그램 알림을 보내지 않음
+                (텔레그램 커맨드에서 직접 호출 시 커맨드 응답으로 대체)
+        """
         if not self.screener:
             logger.info("Screener disabled, skipping")
             return
@@ -649,8 +660,8 @@ class TradingSystem:
             # 새 종목 히스토리 프리페치
             self._prefetch_historical_data()
 
-            # 텔레그램 알림
-            if result.candidates:
+            # 텔레그램 알림 (수동 호출 시 억제)
+            if result.candidates and not suppress_notification:
                 msg = self.notifier.format_screening_msg(result)
                 self.telegram.send_alert_sync("screening_result", msg)
 

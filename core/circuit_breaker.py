@@ -1,12 +1,16 @@
 """서킷브레이커 — LLM/ML과 무관한 시스템 레벨 비상 정지."""
 
+import json
 import os
 import psutil
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Callable
 
 from loguru import logger
+
+_STATE_FILE = Path(__file__).parent.parent / "data" / "storage" / "circuit_state.json"
 
 
 class CircuitState(str, Enum):
@@ -37,6 +41,34 @@ class CircuitBreaker:
         self._api_failure_count = 0
         self._llm_failure_count = 0
         self._halted_at: datetime | None = None
+        self._load_state()
+
+    def _load_state(self) -> None:
+        """영속화된 상태 복원 (PM2 재시작 시 알림 스팸 방지)."""
+        try:
+            if _STATE_FILE.exists():
+                data = json.loads(_STATE_FILE.read_text())
+                self.state = CircuitState(data.get("state", "normal"))
+                if data.get("halted_at"):
+                    self._halted_at = datetime.fromisoformat(data["halted_at"])
+                self.triggers = data.get("triggers", [])[-10:]
+                logger.info(f"Circuit breaker state restored: {self.state.value}")
+        except Exception as e:
+            logger.warning(f"Circuit breaker state load failed, starting NORMAL: {e}")
+
+    def _save_state(self) -> None:
+        """현재 상태를 파일에 저장."""
+        try:
+            _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "state": self.state.value,
+                "halted_at": self._halted_at.isoformat() if self._halted_at else None,
+                "triggers": self.triggers[-10:],
+                "updated_at": datetime.now().isoformat(),
+            }
+            _STATE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+        except Exception as e:
+            logger.warning(f"Circuit breaker state save failed: {e}")
 
     @property
     def is_trading_allowed(self) -> bool:
@@ -178,6 +210,10 @@ class CircuitBreaker:
         }
         self.triggers.append(trigger_record)
 
+        # 상태 영속화
+        if state_changed:
+            self._save_state()
+
         # Telegram 알림 — state 변경 시에만 (반복 스팸 방지)
         if state_changed and self._notify:
             try:
@@ -195,6 +231,7 @@ class CircuitBreaker:
         self._api_failure_count = 0
         self._llm_failure_count = 0
         self._halted_at = None
+        self._save_state()
         msg = f"서킷브레이커 수동 리셋: {old_state} → NORMAL"
         logger.info(msg)
         return msg
@@ -205,6 +242,7 @@ class CircuitBreaker:
             self.state = CircuitState.NORMAL
             self._api_failure_count = 0
             self._llm_failure_count = 0
+            self._save_state()
             logger.info("Circuit breaker daily reset")
 
     def get_status(self) -> dict:

@@ -412,9 +412,10 @@ class MarketDataClient:
         # 예수금: dnca_tot_amt 사용. 0이면 total_asset에서 역산
         cash = _safe_int(summary.get("dnca_tot_amt", 0))
 
-        if total_asset > 0 and invested > 0:
+        if total_asset > 0:
             # tot_evlu_amt(총평가금액)이 가장 정확 → cash를 항상 역산
             # dnca_tot_amt는 결제완료 예수금만 포함하여 미결제 매도대금이 빠짐
+            # invested==0일 때도 적용 (미결제 매도대금이 dnca_tot_amt에 미반영되는 문제 방지)
             cash = total_asset - invested
         elif total_asset == 0 and cash > 0:
             total_asset = cash + invested

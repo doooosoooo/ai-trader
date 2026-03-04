@@ -268,7 +268,7 @@ BUY ratio: 매수할 비중, SELL ratio: 보유분 중 매도할 비율 (1.0 = �
         if ml_predictions:
             parts.extend([
                 "## ML 예측 결과",
-                json.dumps(ml_predictions, ensure_ascii=False, indent=2),
+                json.dumps(ml_predictions, ensure_ascii=False, indent=2, default=str),
                 "",
             ])
 
