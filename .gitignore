@@ -6,7 +6,7 @@ __pycache__/
 *.pyc
 
 # Data & Models
-data/storage/*.db
+data/storage/
 data/*.db
 data/*.json
 data/*.jsonl
