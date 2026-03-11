@@ -85,7 +85,7 @@ class CircuitBreaker:
         return self.state in (CircuitState.NORMAL, CircuitState.WARNING)
 
     def check_kospi(self, kospi_change_pct: float) -> CircuitState:
-        """코스피 급락 체크."""
+        """코스피 급락 체크 + 회복 시 자동 복구."""
         threshold = self.safety_rules.get("market_conditions", {}).get(
             "kospi_drop_threshold", -0.03
         )
@@ -102,6 +102,19 @@ class CircuitBreaker:
                 CircuitState.WARNING,
                 f"코스피 {kospi_change_pct:.2%} 하락 (기준: {threshold:.1%})",
             )
+        elif self.state == CircuitState.HALTED and kospi_change_pct > -0.01:
+            # 코스피가 -1% 이내로 회복되면 HALTED → NORMAL 자동 복구
+            old_state = self.state
+            self.state = CircuitState.NORMAL
+            self._halted_at = None
+            self._save_state()
+            msg = f"코스피 {kospi_change_pct:.2%}로 회복 → 서킷브레이커 자동 해제"
+            logger.info(f"Circuit breaker: {old_state} → NORMAL | {msg}")
+            if self._notify:
+                try:
+                    self._notify(level="circuit_breaker", message=f"🟢 {msg}")
+                except Exception:
+                    pass
         return self.state
 
     def record_api_failure(self) -> CircuitState:

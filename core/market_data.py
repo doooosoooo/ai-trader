@@ -479,6 +479,10 @@ class MarketDataClient:
             ord_qty = _safe_int(o.get("ord_qty", 0))
             if ord_qty <= 0:
                 continue
+            ord_price = _safe_int(o.get("ord_unpr", 0))
+            if ord_price <= 0:
+                # 취소/정정 확인 레코드 (ord_unpr=0) — 건너뜀
+                continue
             ccld_qty = _safe_int(o.get("tot_ccld_qty", 0))
             orders.append({
                 "ticker": o.get("pdno", ""),
@@ -486,7 +490,7 @@ class MarketDataClient:
                 "side": "매수" if o.get("sll_buy_dvsn_cd") == "02" else "매도",
                 "ord_qty": ord_qty,
                 "ccld_qty": ccld_qty,
-                "ord_price": _safe_int(o.get("ord_unpr", 0)),
+                "ord_price": ord_price,
                 "ccld_price": _safe_int(o.get("avg_prvs", 0)),
                 "ccld_amount": _safe_int(o.get("tot_ccld_amt", 0)),
                 "order_no": o.get("odno", ""),
@@ -494,6 +498,59 @@ class MarketDataClient:
                 "filled": ccld_qty >= ord_qty,
             })
         return orders
+
+    def cancel_order(self, order_no: str, order_qty: int, ticker: str) -> dict:
+        """미체결 주문 취소 (KIS API).
+
+        Args:
+            order_no: 원주문번호 (ORGN_ODNO)
+            order_qty: 잔여 수량
+            ticker: 종목코드 (로깅용)
+
+        Returns:
+            {"success": bool, "message": str, "order_no": str}
+        """
+        tr_id = "VTTC0803U" if self.auth.account_type == "virtual" else "TTTC0803U"
+
+        body = {
+            "CANO": self.auth.account_no[:8],
+            "ACNT_PRDT_CD": self.auth.account_product_code,
+            "KRX_FWDG_ORD_ORGNO": "",
+            "ORGN_ODNO": order_no,
+            "ORD_DVSN": "00",
+            "RVSE_CNCL_DVSN_CD": "02",
+            "ORD_QTY": str(order_qty),
+            "ORD_UNPR": "0",
+            "QTY_ALL_ORD_YN": "Y",
+        }
+
+        url = f"{self.auth.base_url}/uapi/domestic-stock/v1/trading/order-rvsecncl"
+        for attempt in range(2):
+            hashkey = self.auth.get_hashkey(body)
+            headers = self.auth.build_headers(tr_id, hashkey)
+            try:
+                resp = requests.post(url, json=body, headers=headers, timeout=10)
+                if resp.status_code in (401, 403) and attempt == 0:
+                    logger.warning(f"Cancel order {resp.status_code}, refreshing token...")
+                    self.auth.invalidate_token()
+                    time.sleep(1)
+                    continue
+                resp.raise_for_status()
+                break
+            except Exception as e:
+                if attempt == 1:
+                    logger.error(f"Cancel order failed for {ticker} #{order_no}: {e}")
+                    return {"success": False, "message": str(e), "order_no": order_no}
+
+        data = resp.json()
+        if data.get("rt_cd") == "0":
+            cancel_no = data.get("output", {}).get("ODNO", "")
+            logger.info(f"Order cancelled: {ticker} #{order_no} → cancel #{cancel_no}")
+            return {"success": True, "message": "cancelled", "order_no": cancel_no}
+        else:
+            error_msg = data.get("msg1", "Unknown error")
+            logger.error(f"Cancel order failed: {ticker} #{order_no} — {error_msg}")
+            return {"success": False, "message": error_msg, "order_no": order_no}
 
     def get_kospi_index(self) -> dict:
         """코스피 지수 조회."""

@@ -5,17 +5,17 @@
 screening:
   enabled: true
   markets: ["KOSPI", "KOSDAQ"]
-  kosdaq_top_n: 300                        # KOSDAQ 시총 상위 N개만 대상
-  max_watchlist_size: 8                    # 스크리너 최종 관심종목 수
+  kosdaq_top_n: 500                        # KOSDAQ 시총 상위 N개만 대상
+  max_watchlist_size: 15                   # 스크리너 최종 관심종목 수
   always_include_held: true                # 보유종목 항상 포함
 
   # Stage 1: 사전 필터 (제거 조건)
   filters:
-    min_market_cap: 3_000_000_000_000      # 최소 시가총액 3조원
-    min_trading_value_20d: 10_000_000_000  # 최소 20일 평균 거래대금 100억원
+    min_market_cap: 200_000_000_000        # 최소 시가총액 2천억원
+    min_trading_value_20d: 3_000_000_000   # 최소 20일 평균 거래대금 30억원
     min_price: 1000                        # 최소 주가 1000원
-    max_per: 100                           # PER 100 이상 제외
-    min_per: 0                             # PER 0 이하 제외 (적자기업)
+    max_per: 200                           # PER 200 이상 제외
+    min_per: -50                           # PER -50 이하 제외 (극단적 적자만 제외)
 
   # Stage 2: 스코어링 가중치
   scoring:

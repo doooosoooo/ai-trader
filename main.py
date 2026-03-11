@@ -142,6 +142,8 @@ class TradingSystem:
         # State
         self._paused = False
         self._running = False
+        self._last_report_notify: datetime | None = None  # 마지막 정기 리포트 알림 시각
+        self._cancelled_order_nos: set[str] = set()  # 취소 완료/실패한 주문번호 (반복 방지)
         self._last_analysis: dict | None = self.analysis_store.load_last_analysis()  # 마지막 LLM 분석 결과
         # 스크리닝 캐시가 없거나 오래됐으면 시작 시 즉시 실행
         if self.screener:
@@ -172,7 +174,8 @@ class TradingSystem:
 
     def _get_watchlist(self) -> list[str]:
         """스크리닝 결과 + 보유종목 + config 포함종목을 합산."""
-        max_size = 8
+        screening_max = self.screener.config.get("max_watchlist_size", 8) if self.screener else 8
+        max_size = screening_max
         held = list(self.portfolio.positions.keys())
         watchlist: list[str] = []
 
@@ -327,6 +330,13 @@ class TradingSystem:
             logger.info(f"Circuit breaker {self.circuit_breaker.state.value} — analysis with restricted trading")
 
         try:
+            # 0. 라이브 모드: 분석 전 계좌 동기화 (체결 반영)
+            if self.config_manager.get_mode() == "live":
+                try:
+                    self.account_manager.sync_account_from_broker()
+                except Exception as e:
+                    logger.warning(f"Pre-analysis account sync failed: {e}")
+
             # 1. 데이터 수집
             held_tickers = list(self.portfolio.positions.keys())
             data = self.data_pipeline.collect_all_for_analysis(
@@ -371,7 +381,7 @@ class TradingSystem:
                 if not pos:
                     continue
                 bought = datetime.fromisoformat(pos.bought_at)
-                days_held = (datetime.now() - bought).days
+                days_held = (datetime.now().date() - bought.date()).days
                 weight = pos.market_value / total_asset
                 dist_to_sl = pos.pnl_pct - sl_pct  # 양수 = 손절까지 여유
                 trailing_dd = (pos.peak_price - pos.current_price) / pos.peak_price if pos.peak_price > 0 else 0
@@ -383,6 +393,26 @@ class TradingSystem:
                 pos_dict["dist_to_stop_loss"] = f"{dist_to_sl:+.1%}"
                 pos_dict["trailing_drawdown"] = f"{trailing_dd:.1%}"
                 pos_dict["trailing_stop_pct"] = f"{ts_pct:.0%}"
+
+            # 최근 매매 이력 추가 (쿨다운/재매수 금지 판단용)
+            recent_trades = self.portfolio.get_trade_history(limit=30)
+            from datetime import timedelta
+            three_days_ago = (datetime.now() - timedelta(days=3)).isoformat()
+            recent_sells = [
+                {
+                    "ticker": t["ticker"],
+                    "name": t.get("name", ""),
+                    "action": t["action"],
+                    "price": t["price"],
+                    "quantity": t["quantity"],
+                    "timestamp": t["timestamp"],
+                    "pnl_pct": t.get("pnl_pct"),
+                }
+                for t in recent_trades
+                if t["timestamp"] >= three_days_ago
+            ]
+            if recent_sells:
+                portfolio_summary["recent_trades_3days"] = recent_sells
 
             # 목표 달성률 추가
             targets = self.config_manager.trading_params.get("portfolio_targets", {})
@@ -544,11 +574,34 @@ class TradingSystem:
                 mode=self.config_manager.get_mode(),
             )
             if self.telegram.enabled and not suppress_notification:
-                try:
-                    analysis_msg = self.notifier.format_analysis_msg(signal, actions)
-                    self.telegram.send_alert_sync("llm_analysis", analysis_msg)
-                except Exception as e:
-                    logger.warning(f"Failed to send analysis to Telegram: {e}")
+                has_trades = any(a.get("type", "").upper() in ("BUY", "SELL") for a in actions)
+                # 장중(09:00~15:30): 2시간 주기, 장외: 08:00·16:30 각 1회만
+                from datetime import time as dtime
+                now_time = datetime.now().time()
+                is_market_hours = dtime(9, 0) <= now_time <= dtime(15, 30)
+                if is_market_hours:
+                    due_for_report = (
+                        self._last_report_notify is None
+                        or (datetime.now() - self._last_report_notify).total_seconds() >= 7200
+                    )
+                else:
+                    # 장전 08:00~09:00, 장후 16:00~17:00 구간에서만 1회
+                    is_pre_market = dtime(8, 0) <= now_time < dtime(9, 0)
+                    is_post_market = dtime(16, 0) <= now_time < dtime(17, 0)
+                    due_for_report = (
+                        (is_pre_market or is_post_market)
+                        and (
+                            self._last_report_notify is None
+                            or (datetime.now() - self._last_report_notify).total_seconds() >= 3600
+                        )
+                    )
+                if has_trades or due_for_report:
+                    try:
+                        analysis_msg = self.notifier.format_analysis_msg(signal, actions)
+                        self.telegram.send_alert_sync("llm_analysis", analysis_msg)
+                        self._last_report_notify = datetime.now()
+                    except Exception as e:
+                        logger.warning(f"Failed to send analysis to Telegram: {e}")
 
             # 9. LLM vs 규칙전략 알파 추적
             try:
@@ -638,6 +691,112 @@ class TradingSystem:
 
         # 시스템 리소스 체크
         self.circuit_breaker.check_system_resources()
+
+    def cycle_unfilled_order_check(self):
+        """미체결 주문 관리 사이클.
+
+        - 매수: 현재가 > 주문가 + threshold% → 취소
+        - 매도: 현재가 < 주문가 - threshold% → 취소
+        - 15:20 이후: 모든 미체결 일괄 취소
+        """
+        if self._paused:
+            return
+        if self.config_manager.get_mode() == "simulation":
+            return
+
+        from datetime import time as dtime
+        now = datetime.now()
+        is_near_close = now.time() >= dtime(15, 20)
+
+        try:
+            orders = self.market_client.get_today_orders()
+        except Exception as e:
+            logger.warning(f"Unfilled order check — query failed: {e}")
+            return
+
+        unfilled = [o for o in orders if not o["filled"]]
+        if not unfilled:
+            return
+
+        t_params = self.config_manager.trading_params
+        threshold = t_params.get("unfilled_cancel_threshold_pct", 0.01)
+        resubmit = t_params.get("unfilled_resubmit", False)
+
+        cancelled = 0
+        resubmitted = 0
+
+        for order in unfilled:
+            remaining = order["ord_qty"] - order["ccld_qty"]
+            if remaining <= 0:
+                continue
+
+            order_no = order["order_no"]
+            ticker = order["ticker"]
+            ord_price = order["ord_price"]
+
+            # 이미 취소 시도 실패한 주문은 스킵 (이번 사이클 내에서)
+            if order_no in self._cancelled_order_nos:
+                continue
+
+            if is_near_close:
+                result = self.executor.cancel_unfilled_order(order, current_price=0, resubmit=False)
+                if result["action"] == "cancelled":
+                    cancelled += 1
+                    self._cancelled_order_nos.add(order_no)
+                    logger.info(f"EOD cancel: {order['side']} {order['name']}({ticker}) "
+                                f"#{order_no} {remaining}주 @{ord_price:,}")
+                elif result["action"] == "failed":
+                    self._cancelled_order_nos.add(order_no)
+                continue
+
+            try:
+                price_data = self.market_client.get_current_price(ticker)
+                current_price = price_data["price"]
+            except Exception:
+                continue
+
+            if current_price <= 0:
+                continue
+
+            should_cancel = False
+            if order["side"] == "매수" and current_price > ord_price * (1 + threshold):
+                should_cancel = True
+                logger.info(f"BUY drift: {order['name']}({ticker}) ord@{ord_price:,} → now@{current_price:,} "
+                            f"(+{(current_price / ord_price - 1):.2%})")
+            elif order["side"] == "매도" and current_price < ord_price * (1 - threshold):
+                should_cancel = True
+                logger.info(f"SELL drift: {order['name']}({ticker}) ord@{ord_price:,} → now@{current_price:,} "
+                            f"({(current_price / ord_price - 1):.2%})")
+
+            if should_cancel:
+                result = self.executor.cancel_unfilled_order(order, current_price, resubmit=resubmit)
+                if result["action"] == "cancelled":
+                    cancelled += 1
+                    self._cancelled_order_nos.add(order_no)
+                elif result["action"] == "resubmitted":
+                    cancelled += 1
+                    resubmitted += 1
+                    self._cancelled_order_nos.add(order_no)
+                elif result["action"] == "failed":
+                    self._cancelled_order_nos.add(order_no)
+
+        if cancelled > 0:
+            parts = [f"🔄 미체결 관리: {cancelled}건 취소"]
+            if resubmitted > 0:
+                parts.append(f", {resubmitted}건 재주문")
+            if is_near_close:
+                parts.append(" (장마감 전)")
+            msg = "".join(parts)
+            logger.info(msg)
+            if self.telegram.enabled:
+                self.telegram.send_alert_sync("unfilled_order", msg)
+
+            try:
+                import time as _time
+                _time.sleep(1)
+                self.account_manager.sync_account_from_broker()
+            except Exception as e:
+                logger.warning(f"Post-cancel sync failed: {e}")
 
     def cycle_screening(self, suppress_notification: bool = False):
         """종목 스크리닝 사이클.
@@ -769,6 +928,7 @@ class TradingSystem:
         """장 시작 전 초기화."""
         logger.info("Market opening — initializing")
         self.circuit_breaker.daily_reset()
+        self._cancelled_order_nos.clear()
         self.config_manager.reload()
         self._watchlist = self._get_watchlist()
 

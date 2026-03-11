@@ -65,6 +65,23 @@ class TradingScheduler:
             misfire_grace_time=30,
         )
 
+        # 미체결 주문 관리 (매 2분)
+        self.scheduler.add_job(
+            self._safe_run(self.system.cycle_unfilled_order_check),
+            IntervalTrigger(minutes=2),
+            id="unfilled_order_check",
+            name="미체결 주문 관리",
+            misfire_grace_time=30,
+        )
+
+        # 장마감 전 미체결 일괄 취소 (15:22) — 안전망
+        self.scheduler.add_job(
+            self._safe_run(self.system.cycle_unfilled_order_check, check_hours=False),
+            CronTrigger(hour=15, minute=22, day_of_week="mon-fri"),
+            id="eod_unfilled_cancel",
+            name="장마감 미체결 취소",
+        )
+
         # 장전 종목 스크리닝 (08:45) — on_market_open 전에 완료
         self.scheduler.add_job(
             self._safe_run(self.system.cycle_screening, check_hours=False),
@@ -188,11 +205,11 @@ class TradingScheduler:
 
     def pause_trading_jobs(self):
         """매매 관련 잡만 일시 중지."""
-        for job_id in ("llm_analysis", "data_collection"):
+        for job_id in ("llm_analysis", "data_collection", "unfilled_order_check"):
             self.scheduler.pause_job(job_id)
         logger.info("Trading jobs paused")
 
     def resume_trading_jobs(self):
-        for job_id in ("llm_analysis", "data_collection"):
+        for job_id in ("llm_analysis", "data_collection", "unfilled_order_check"):
             self.scheduler.resume_job(job_id)
         logger.info("Trading jobs resumed")

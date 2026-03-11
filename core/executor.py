@@ -375,6 +375,63 @@ class OrderExecutor:
             logger.error(f"Live SELL exception: {e}")
             return {"ticker": ticker, "name": name, "action": "SELL", "status": "FAILED", "error": str(e)}
 
+    def cancel_unfilled_order(
+        self,
+        order: dict,
+        current_price: int,
+        resubmit: bool = False,
+    ) -> dict:
+        """미체결 주문 취소 (+ 선택적 재주문).
+
+        Args:
+            order: get_today_orders() 반환 dict
+            current_price: 현재가
+            resubmit: True이면 취소 후 현재가로 재주문
+        """
+        if self.mode == "simulation":
+            logger.info(f"[SIM] Would cancel {order['side']} {order['name']}({order['ticker']}) "
+                        f"#{order['order_no']}")
+            return {"action": "cancelled", "order": order, "simulated": True}
+
+        remaining = order["ord_qty"] - order["ccld_qty"]
+        if remaining <= 0:
+            return {"action": "already_filled", "order": order}
+
+        result = self.market_client.cancel_order(
+            order_no=order["order_no"],
+            order_qty=remaining,
+            ticker=order["ticker"],
+        )
+
+        if not result["success"]:
+            return {"action": "failed", "order": order, "error": result["message"]}
+
+        if resubmit and current_price > 0:
+            import time as _time
+            _time.sleep(0.5)
+
+            if order["side"] == "매수":
+                price = adjust_price_to_tick(current_price, "down")
+                new_result = self._live_buy(
+                    ticker=order["ticker"], name=order["name"],
+                    quantity=remaining, price=price, urgency="limit",
+                    fee=self._calculate_fee(remaining * price, "buy"),
+                    reason=f"[재주문] #{order['order_no']} 취소 후 재접수",
+                    signal_json="",
+                )
+            else:
+                price = adjust_price_to_tick(current_price, "up")
+                new_result = self._live_sell(
+                    ticker=order["ticker"], quantity=remaining,
+                    price=price, urgency="limit",
+                    fee=self._calculate_fee(remaining * price, "sell"),
+                    reason=f"[재주문] #{order['order_no']} 취소 후 재접수",
+                    signal_json="",
+                )
+            return {"action": "resubmitted", "order": order, "new_order": new_result, "new_price": price}
+
+        return {"action": "cancelled", "order": order}
+
     def _calculate_fee(self, amount: float, side: str) -> float:
         """수수료 계산 (증권사 기본 수수료율).
 

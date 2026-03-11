@@ -48,4 +48,5 @@ telegram:
   - concentration_alert
   - drawdown_alert
   - backtest_result
+  - unfilled_order
   confirmation_timeout_seconds: 300

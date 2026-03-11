@@ -103,7 +103,7 @@ class RiskManager:
             # 3. 보유기간 초과
             if reason is None:
                 bought = datetime.fromisoformat(pos.bought_at)
-                days_held = (datetime.now() - bought).days
+                days_held = (datetime.now().date() - bought.date()).days
                 if days_held >= max_hold_days:
                     reason = f"보유기간초과 ({days_held}일 ≥ {max_hold_days}일)"
 
