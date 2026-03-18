@@ -2,7 +2,7 @@ holding_period_days:
   min: 3
   max: 40
 take_profit_pct: 0.25
-stop_loss_pct: -0.12
+stop_loss_pct: -0.05
 trailing_stop_pct: 0.1
 position_size_pct: 0.13
 max_cash_ratio: 0.2

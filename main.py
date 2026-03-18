@@ -414,14 +414,14 @@ class TradingSystem:
             if recent_sells:
                 portfolio_summary["recent_trades_3days"] = recent_sells
 
-            # 목표 달성률 추가
+            # 월간 목표 달성률 추가 (월초 자산 대비 당월 수익률)
             targets = self.config_manager.trading_params.get("portfolio_targets", {})
             monthly_target = targets.get("monthly_target_pct", 5.0) / 100
-            current_pnl = self.portfolio.total_pnl_pct
+            monthly_pnl_pct = self.portfolio.get_monthly_pnl_pct()
             portfolio_summary["target_progress"] = {
                 "monthly_target": f"{monthly_target:.1%}",
-                "current_pnl": f"{current_pnl:.2%}",
-                "progress": f"{(current_pnl / monthly_target * 100):.0f}%" if monthly_target > 0 else "N/A",
+                "current_monthly_pnl": f"{monthly_pnl_pct:.2%}",
+                "progress": f"{(monthly_pnl_pct / monthly_target * 100):.0f}%" if monthly_target > 0 else "N/A",
             }
 
             # 포트폴리오 드로다운 상태 추가 (LLM에게 리스크 인식 제공)

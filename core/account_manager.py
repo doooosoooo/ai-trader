@@ -43,14 +43,16 @@ class AccountManager:
             if self.portfolio.initial_capital == 0 and account["total_asset"] > 0:
                 self.portfolio.initial_capital = account["total_asset"]
 
-            # 보유종목 동기화 — 기존 포지션의 peak_price 보존
-            old_peaks = {t: p.peak_price for t, p in self.portfolio.positions.items()}
+            # 보유종목 동기화 — 기존 포지션의 peak_price, bought_at 보존
+            old_positions = {t: p for t, p in self.portfolio.positions.items()}
             self.portfolio.positions.clear()
             for pos_data in account["positions"]:
                 ticker = pos_data["ticker"]
                 cur_price = pos_data["current_price"]
-                # 기존 peak_price 유지, 없으면 현재가로 초기화
-                prev_peak = old_peaks.get(ticker, cur_price)
+                old_pos = old_positions.get(ticker)
+                # 기존 peak_price, bought_at 유지
+                prev_peak = old_pos.peak_price if old_pos else cur_price
+                prev_bought = old_pos.bought_at if old_pos else ""
                 self.portfolio.positions[ticker] = Position(
                     ticker=ticker,
                     name=pos_data["name"],
@@ -58,6 +60,7 @@ class AccountManager:
                     avg_price=pos_data["avg_price"],
                     current_price=cur_price,
                     peak_price=max(prev_peak, cur_price),
+                    bought_at=prev_bought,
                 )
                 # TICKER_NAMES에 추가
                 if pos_data["ticker"] not in TICKER_NAMES and pos_data["name"]:

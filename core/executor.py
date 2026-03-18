@@ -118,6 +118,16 @@ class OrderExecutor:
         reason: str,
         signal_json: str,
     ) -> dict | None:
+        # 실시간 현재가 조회 (분석 시점 가격과 괴리 방지)
+        if self.mode != "simulation" and self.market_client:
+            try:
+                live = self.market_client.get_current_price(ticker)
+                live_price = live.get("price", 0)
+                if live_price > 0:
+                    current_price = live_price
+            except Exception as e:
+                logger.warning(f"Live price fetch failed for {ticker}, using analysis price: {e}")
+
         if current_price <= 0:
             logger.error(f"Invalid current price for {ticker}: {current_price}")
             return None
@@ -200,6 +210,16 @@ class OrderExecutor:
                         quantity = available
             except Exception as e:
                 logger.warning(f"Pending order check failed, proceeding with portfolio qty: {e}")
+
+        # 실시간 현재가 조회 (분석 시점 가격과 괴리 방지)
+        if self.mode != "simulation" and self.market_client:
+            try:
+                live = self.market_client.get_current_price(ticker)
+                live_price = live.get("price", 0)
+                if live_price > 0:
+                    current_price = live_price
+            except Exception as e:
+                logger.warning(f"Live price fetch failed for {ticker}, using analysis price: {e}")
 
         price = limit_price or current_price
         if price <= 0:

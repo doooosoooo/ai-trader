@@ -233,6 +233,19 @@ class Portfolio:
             return 0.0
         return max(0.0, (self.high_water_mark - self.total_asset) / self.high_water_mark)
 
+    def get_monthly_pnl_pct(self) -> float:
+        """월초 자산 대비 당월 수익률. daily_snapshot에서 당월 1일 기준 자산을 가져옴."""
+        from datetime import datetime
+        month_start = datetime.now().strftime("%Y-%m-01")
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT total_asset FROM daily_snapshot WHERE date >= ? ORDER BY date ASC LIMIT 1",
+                (month_start,),
+            ).fetchone()
+        if not row or row[0] <= 0:
+            return 0.0
+        return (self.total_asset - row[0]) / row[0]
+
     def update_prices(self, prices: dict[str, float]) -> None:
         """보유 종목 현재가 업데이트 + peak_price/HWM 갱신."""
         for ticker, price in prices.items():
