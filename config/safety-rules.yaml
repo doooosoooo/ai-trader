@@ -6,7 +6,7 @@
 
 # 포지션 관리
 max_position_ratio: 0.15           # 종목당 최대 총자산의 15%
-max_positions: 5                   # 동시 보유 최대 5종목
+max_positions: 6                   # 동시 보유 최대 6종목
 max_single_order_amount: 5000000   # 단일 주문 최대 500만원
 
 # 손실 관리
