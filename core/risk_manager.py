@@ -100,7 +100,15 @@ class RiskManager:
                         f"→현재{pos.current_price:,.0f}, -{drawdown:.1%})"
                     )
 
-            # 3. 보유기간 초과
+            # 3. 조기 익절 (3거래일 미만이라도 +5% 이상이면서 고점 대비 하락 시)
+            if reason is None and pos.pnl_pct >= 0.05:
+                if pos.peak_price > 0 and pos.current_price < pos.peak_price * 0.95:
+                    reason = (
+                        f"조기익절 (수익 {pos.pnl_pct:.1%}, "
+                        f"고점{pos.peak_price:,.0f}→현재{pos.current_price:,.0f} 하락반전)"
+                    )
+
+            # 4. 보유기간 초과
             if reason is None:
                 bought = datetime.fromisoformat(pos.bought_at)
                 days_held = (datetime.now().date() - bought.date()).days
