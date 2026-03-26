@@ -278,26 +278,39 @@ class Backtester:
 
     def load_data(
         self, tickers: list[str], start_date: str, end_date: str,
+        timeframe: str = "daily",
     ) -> dict[str, pd.DataFrame]:
-        """DB에서 OHLCV 데이터 로드."""
-        # 하이픈 제거 (20240301 형식 통일)
+        """DB에서 OHLCV 데이터 로드.
+
+        Args:
+            timeframe: "daily" (일봉) 또는 "minute" (분봉)
+        """
         start = start_date.replace("-", "")
         end = end_date.replace("-", "")
 
         data = {}
         with sqlite3.connect(self.db_path) as conn:
             for ticker in tickers:
-                df = pd.read_sql_query(
-                    "SELECT * FROM daily_ohlcv "
-                    "WHERE ticker = ? AND date >= ? AND date <= ? "
-                    "ORDER BY date",
-                    conn, params=(ticker, start, end),
-                )
+                if timeframe == "minute":
+                    df = pd.read_sql_query(
+                        "SELECT ticker, datetime as date, open, high, low, close, volume "
+                        "FROM minute_ohlcv "
+                        "WHERE ticker = ? AND datetime >= ? AND datetime <= ? "
+                        "ORDER BY datetime",
+                        conn, params=(ticker, start, end + "999999"),
+                    )
+                else:
+                    df = pd.read_sql_query(
+                        "SELECT * FROM daily_ohlcv "
+                        "WHERE ticker = ? AND date >= ? AND date <= ? "
+                        "ORDER BY date",
+                        conn, params=(ticker, start, end),
+                    )
                 if not df.empty:
                     data[ticker] = df
-                    logger.debug(f"Loaded {len(df)} bars for {ticker} ({start}~{end})")
+                    logger.debug(f"Loaded {len(df)} {timeframe} bars for {ticker} ({start}~{end})")
                 else:
-                    logger.warning(f"No data for {ticker} in range {start}~{end}")
+                    logger.warning(f"No {timeframe} data for {ticker} in range {start}~{end}")
 
         return data
 
@@ -308,6 +321,7 @@ class Backtester:
         start_date: str = "",
         end_date: str = "",
         indicator_params: dict | None = None,
+        timeframe: str = "daily",
     ) -> BacktestResult:
         """백테스트 실행.
 
@@ -316,9 +330,12 @@ class Backtester:
         3. 날짜별 순회: 청산 → 진입 → 자산곡선
         4. 잔여 포지션 강제 청산
         5. 성과지표 계산
+
+        Args:
+            timeframe: "daily" (일봉) 또는 "minute" (분봉)
         """
         # 데이터 로드
-        raw_data = self.load_data(tickers, start_date, end_date)
+        raw_data = self.load_data(tickers, start_date, end_date, timeframe)
         if not raw_data:
             logger.error("No data loaded for backtesting")
             return BacktestResult(

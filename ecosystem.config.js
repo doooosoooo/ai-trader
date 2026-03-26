@@ -24,5 +24,24 @@ module.exports = {
 
       // 크론 — 장 시간 외 자동 중지/시작은 scheduler가 내부적으로 처리
     },
+    {
+      name: "ai-optimizer",
+      script: "optimizer_main.py",
+      interpreter: "/home/ubuntu/ai-trader/.venv/bin/python",
+      cwd: "/home/ubuntu/ai-trader",
+      env: {
+        PYTHONPATH: "/home/ubuntu/ai-trader",
+      },
+      autorestart: true,
+      max_restarts: 5,
+      restart_delay: 10000,
+
+      log_date_format: "YYYY-MM-DD HH:mm:ss",
+      error_file: "/home/ubuntu/ai-trader/logs/optimizer-error.log",
+      out_file: "/home/ubuntu/ai-trader/logs/optimizer-out.log",
+      merge_logs: true,
+
+      max_memory_restart: "800M",
+    },
   ],
 };

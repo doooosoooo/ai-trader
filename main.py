@@ -288,7 +288,15 @@ class TradingSystem:
             return
 
         held_tickers = list(self.portfolio.positions.keys())
-        prices = self.data_pipeline.collect_prices_only(list(set(held_tickers + self._watchlist)))
+        all_tickers = list(set(held_tickers + self._watchlist))
+        prices = self.data_pipeline.collect_prices_only(all_tickers)
+
+        # 분봉 데이터 수집 (보유종목 + 워치리스트, 상위 10종목)
+        try:
+            for ticker in all_tickers[:10]:
+                self.data_pipeline.price_collector.collect_minute(ticker, interval="5")
+        except Exception as e:
+            logger.debug(f"Minute bar collection skipped: {e}")
 
         # 포트폴리오 가격 업데이트
         self.portfolio.update_prices(prices)

@@ -151,6 +151,36 @@ class PriceCollector:
             logger.error(f"Investor trends failed for {ticker}: {e}")
             return {}
 
+    def collect_minute(self, ticker: str, interval: str = "1") -> pd.DataFrame:
+        """분봉 데이터 수집 및 저장.
+
+        Args:
+            ticker: 종목코드
+            interval: 분봉 간격 (1, 3, 5, 10, 15, 30, 60)
+        """
+        try:
+            records = self.market.get_minute_ohlcv(ticker, interval)
+            if not records:
+                return pd.DataFrame()
+
+            today = datetime.now().strftime("%Y%m%d")
+            with sqlite3.connect(self.db_path) as conn:
+                for r in records:
+                    dt_str = f"{today}{r['time']}"  # YYYYMMDDHHMMSS
+                    conn.execute("""
+                        INSERT OR REPLACE INTO minute_ohlcv
+                        (ticker, datetime, open, high, low, close, volume)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (ticker, dt_str, r["open"], r["high"],
+                          r["low"], r["close"], r["volume"]))
+
+            logger.debug(f"Collected {len(records)} minute bars for {ticker} (interval={interval}m)")
+            return pd.DataFrame(records)
+
+        except Exception as e:
+            logger.error(f"Minute collection failed for {ticker}: {e}")
+            return pd.DataFrame()
+
     def get_stored_daily(self, ticker: str, days: int = 120) -> pd.DataFrame:
         """DB에서 저장된 일봉 데이터 로드."""
         with sqlite3.connect(self.db_path) as conn:
