@@ -7,7 +7,7 @@ schedule:
 
 optimization:
   default_capital: 60_000_000    # 백테스트 초기 자본 (현재 자산 수준)
-  default_start: "20240901"      # 기본 시작일 (6개월)
+  default_start: "20210101"      # 기본 시작일 (5년치)
   sort_by: "sharpe_ratio"        # 정렬 기준 (sharpe_ratio, total_return)
   max_workers: 1                 # 동시 실행 수 (CPU 보호)
 
@@ -18,25 +18,8 @@ optimization:
     max_overfit_ratio: 3.0        # 과적합 비율 상한
     min_test_return: 0.0          # 테스트 기간 수익률 > 0
 
-# 파라미터 탐색 그리드
+# 파라미터 탐색 그리드 (항상 넓은 그리드 사용)
 grids:
-  # daily 모드: 빠른 탐색 (약 200 조합, ~2분)
-  swing:
-    rsi_oversold: [30, 35, 40]
-    take_profit_pct: [0.08, 0.15, 0.25]
-    stop_loss_pct: [0.03, 0.05, 0.07]
-    position_size_pct: [0.08, 0.13]
-    max_hold_days: [14, 30]
-
-  daytrading:
-    take_profit_pct: [0.03, 0.05, 0.08]
-    stop_loss_pct: [0.015, 0.025]
-    volume_surge_multiplier: [1.5, 2.5]
-    position_size_pct: [0.05, 0.10]
-    max_hold_days: [2, 3]
-
-# deep 모드: 심층 탐색 (주말/장외)
-grids_deep:
   swing:
     rsi_oversold: [25, 30, 35, 40, 45]
     take_profit_pct: [0.05, 0.08, 0.10, 0.15, 0.20, 0.25]
@@ -51,12 +34,8 @@ grids_deep:
     position_size_pct: [0.03, 0.05, 0.08, 0.10]
     max_hold_days: [1, 2, 3, 5]
 
-# 대상 종목 (비어있으면 현재 워치리스트 사용)
-tickers:
-  - "005930"   # 삼성전자
-  - "000660"   # SK하이닉스
-  - "373220"   # LG에너지솔루션
-  - "006400"   # 삼성SDI
-  - "055550"   # 신한지주
-  - "012450"   # 한화에어로스페이스
-  - "009540"   # HD한국조선해양
+# 대상 종목: DB에서 데이터가 충분한(200봉 이상) 전체 종목 자동 사용
+# 수동 지정하려면 아래 주석 해제
+# tickers:
+#   - "005930"
+#   - "000660"

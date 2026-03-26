@@ -32,6 +32,10 @@ pm2-*.log
 *.swp
 *.swo
 
+# Credentials
+*.credentials.csv
+*_credentials.csv
+
 # OS
 .DS_Store
 Thumbs.db

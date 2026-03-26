@@ -71,16 +71,14 @@ def refresh_db_snapshot():
 
 
 def get_available_tickers(config: dict) -> list[str]:
-    """설정 파일에서 대상 종목 목록 가져오기."""
-    tickers = config.get("tickers", [])
-    if tickers:
-        return tickers
-
-    # 설정에 없으면 DB에서 데이터가 충분한 종목 조회
+    """DB에서 데이터가 충분한 전체 종목 목록 가져오기 (풀마켓 모드)."""
+    # DB에서 충분한 데이터(최소 200봉)가 있는 종목 전부 사용
+    min_bars = 200
     with sqlite3.connect(str(OPTIMIZER_DB)) as conn:
         rows = conn.execute(
             "SELECT ticker, COUNT(*) as cnt FROM daily_ohlcv "
-            "GROUP BY ticker HAVING cnt >= 60 ORDER BY cnt DESC"
+            "GROUP BY ticker HAVING cnt >= ? ORDER BY cnt DESC",
+            (min_bars,),
         ).fetchall()
     return [r[0] for r in rows]
 
@@ -189,10 +187,11 @@ def format_suggestion_message(
         msg += "\n\n"
 
     msg += (
-        f"<b>과거 테스트 결과:</b>\n"
-        f"  📊 수익률: <b>{best_ret:+.1%}</b> (현재 전략 대비 {best_ret - cur_ret:+.1%}p)\n"
+        f"<b>같은 기간 비교 ({period}):</b>\n"
+        f"  현재 전략: <b>{cur_ret:+.1%}</b>\n"
+        f"  제안 전략: <b>{best_ret:+.1%}</b> ({best_ret - cur_ret:+.1%}p)\n"
         f"  📉 최대 손실: {best_mdd:.1%}\n\n"
-        f"⚠️ 과거 데이터({period}) 기반이라 실전과 다를 수 있습니다.\n"
+        f"⚠️ 과거 데이터 기반이라 실전과 다를 수 있습니다.\n"
         f"아래 버튼으로 적용 여부를 선택하세요."
     )
     return msg
@@ -237,7 +236,7 @@ def run_optimization(mode: str = "daily"):
     current_params = build_current_params()
 
     # 4. 전략별 최적화
-    grids = config.get("grids_deep" if mode == "deep" else "grids", {})
+    grids = config.get("grids", {})
     strategies_to_test = ["swing"]
     if mode == "deep":
         strategies_to_test = list(grids.keys())
@@ -256,19 +255,6 @@ def run_optimization(mode: str = "daily"):
             total_combos *= len(v)
         logger.info(f"Strategy: {strategy_name} | Grid: {total_combos} combinations")
 
-        # 현재 파라미터로 기준선 백테스트
-        try:
-            current_strategy = factory(current_params)
-            current_result = bt.run(tickers, current_strategy, start_date, end_date)
-            current_metrics = current_result.metrics
-            logger.info(
-                f"Baseline ({strategy_name}): return={current_metrics.get('total_return', 0):+.2%}, "
-                f"sharpe={current_metrics.get('sharpe_ratio', 0):.2f}"
-            )
-        except Exception as e:
-            logger.error(f"Baseline backtest failed: {e}")
-            continue
-
         # Train/Test 분할 최적화
         try:
             split_result = train_test_split(
@@ -284,6 +270,7 @@ def run_optimization(mode: str = "daily"):
             test_metrics = split_result["test_metrics"]
             train_metrics = split_result["train_metrics"]
             overfit_ratio = split_result["overfit_ratio"]
+            test_period = split_result["test_period"]  # "YYYYMMDD~YYYYMMDD"
 
             logger.info(
                 f"Best params: {best_params} | "
@@ -296,7 +283,22 @@ def run_optimization(mode: str = "daily"):
             logger.error(f"Optimization error for {strategy_name}: {e}")
             continue
 
-        # 5. 개선 여부 판단
+        # 같은 테스트 기간에서 현재 파라미터 기준선 백테스트
+        try:
+            test_start, test_end = test_period.split("~")
+            current_strategy = factory(current_params)
+            current_result = bt.run(tickers, current_strategy, test_start, test_end)
+            current_metrics = current_result.metrics
+            logger.info(
+                f"Baseline on test period ({strategy_name}): "
+                f"return={current_metrics.get('total_return', 0):+.2%}, "
+                f"sharpe={current_metrics.get('sharpe_ratio', 0):.2f}"
+            )
+        except Exception as e:
+            logger.error(f"Baseline backtest failed: {e}")
+            continue
+
+        # 5. 개선 여부 판단 (같은 테스트 기간 기준)
         min_sharpe_imp = thresholds.get("min_sharpe_improvement", 0.2)
         min_return_imp = thresholds.get("min_return_improvement", 0.03)
         max_overfit = thresholds.get("max_overfit_ratio", 3.0)
@@ -313,14 +315,8 @@ def run_optimization(mode: str = "daily"):
         test_positive = test_return > min_test_ret
 
         if (sharpe_improved or return_improved) and overfit_ok and test_positive:
-            logger.info(f"✅ Improvement found for {strategy_name}! Sending suggestion...")
-
-            msg = format_suggestion_message(
-                strategy_name, current_params, best_params,
-                current_metrics, test_metrics, overfit_ratio, period,
-            )
-            # 결과 저장
             import json
+
             suggestion = {
                 "timestamp": datetime.now().isoformat(),
                 "strategy": strategy_name,
@@ -330,7 +326,30 @@ def run_optimization(mode: str = "daily"):
                 "test_metrics": {k: v for k, v in test_metrics.items() if isinstance(v, (int, float))},
                 "overfit_ratio": overfit_ratio,
             }
-            send_telegram_suggestion(msg, config, suggestion_data=suggestion)
+
+            # 이전 제안과 동일하면 중복 알림 스킵
+            prev_params = None
+            if RESULTS_PATH.exists():
+                try:
+                    with open(RESULTS_PATH) as f:
+                        prev = json.load(f)
+                    prev_params = prev.get("suggested_params")
+                except Exception:
+                    pass
+
+            if prev_params == best_params:
+                logger.info(f"Same suggestion as before for {strategy_name}, skipping notification")
+            else:
+                logger.info(f"✅ Improvement found for {strategy_name}! Sending suggestion...")
+                # 테스트 기간을 읽기 좋은 형식으로 변환
+                ts, te = test_period.split("~")
+                test_period_display = f"{ts[:4]}.{ts[4:6]}.{ts[6:]}~{te[:4]}.{te[4:6]}.{te[6:]}"
+                msg = format_suggestion_message(
+                    strategy_name, current_params, best_params,
+                    current_metrics, test_metrics, overfit_ratio, test_period_display,
+                )
+                send_telegram_suggestion(msg, config, suggestion_data=suggestion)
+
             with open(RESULTS_PATH, "w") as f:
                 json.dump(suggestion, f, indent=2, ensure_ascii=False)
         else:

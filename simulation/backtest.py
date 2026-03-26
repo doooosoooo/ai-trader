@@ -436,27 +436,36 @@ class Backtester:
             for ticker, price, reason in tickers_to_sell:
                 portfolio.sell(ticker, price, date, reason)
 
-            # --- 2. 신규 진입 체크 ---
+            # --- 2. 신규 진입 체크 (스크리닝 시뮬레이션) ---
             if len(portfolio.positions) < strategy.max_positions:
+                # 매수 후보 스코어링: 거래량·모멘텀·RSI 기반
+                candidates = []
                 for ticker, df in ticker_data.items():
                     if ticker in portfolio.positions:
                         continue
-                    if len(portfolio.positions) >= strategy.max_positions:
-                        break
-
                     idx = ticker_date_idx.get(ticker, {}).get(date)
                     if idx is None or idx < 1:
                         continue
-
                     row = df.iloc[idx]
                     prev = df.iloc[idx - 1]
-                    ctx = {}  # 진입 시에는 포지션 컨텍스트 없음
+                    ctx = {}
+                    if not strategy.check_entry(row, prev, ctx):
+                        continue
+                    # 스코어: 거래량 비율 + 20일 수익률 (높을수록 우선)
+                    vol_ratio = row.get("volume_ratio", 1.0) if "volume_ratio" in row.index else 1.0
+                    ret_20d = row.get("return_20d", 0) if "return_20d" in row.index else 0
+                    score = vol_ratio * 0.5 + (ret_20d * 100) * 0.5
+                    candidates.append((ticker, row, score))
 
-                    if strategy.check_entry(row, prev, ctx):
-                        portfolio.buy(
-                            ticker, ticker_names.get(ticker, ticker),
-                            row["close"], date, strategy.position_size_pct,
-                        )
+                # 스코어 상위 종목부터 진입
+                candidates.sort(key=lambda x: x[2], reverse=True)
+                for ticker, row, _ in candidates:
+                    if len(portfolio.positions) >= strategy.max_positions:
+                        break
+                    portfolio.buy(
+                        ticker, ticker_names.get(ticker, ticker),
+                        row["close"], date, strategy.position_size_pct,
+                    )
 
             # --- 3. 자산곡선 기록 ---
             portfolio.mark_to_market(current_prices)
