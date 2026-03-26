@@ -1190,6 +1190,51 @@ class TelegramBot:
             await query.edit_message_text("📈 홀드 — 익절을 보류합니다.")
             return
 
+        # optimizer 제안 적용/거부
+        if data == "opt_apply":
+            try:
+                import yaml
+                pending_path = Path(__file__).parent.parent / "data" / "storage" / "pending_optimizer_suggestion.json"
+                if not pending_path.exists():
+                    await query.edit_message_text("⏰ 제안이 만료되었습니다.")
+                    return
+                with open(pending_path) as f:
+                    suggestion = json.load(f)
+                params = suggestion.get("suggested_params", {})
+                # trading-params.yaml 업데이트
+                tp_path = Path(__file__).parent.parent / "config" / "trading-params.yaml"
+                with open(tp_path) as f:
+                    tp = yaml.safe_load(f)
+                if "take_profit_pct" in params:
+                    tp["take_profit_pct"] = params["take_profit_pct"]
+                if "stop_loss_pct" in params:
+                    tp["stop_loss_pct"] = -abs(params["stop_loss_pct"])
+                if "position_size_pct" in params:
+                    tp["position_size_pct"] = params["position_size_pct"]
+                if "max_hold_days" in params:
+                    tp.setdefault("holding_period_days", {})["max"] = params["max_hold_days"]
+                if "rsi_oversold" in params:
+                    tp.setdefault("indicators", {})["rsi_oversold"] = params["rsi_oversold"]
+                with open(tp_path, "w") as f:
+                    yaml.dump(tp, f, default_flow_style=False, allow_unicode=True)
+                pending_path.unlink()
+                await query.edit_message_text(
+                    f"✅ 파라미터가 적용되었습니다!\n\n"
+                    f"다음 분석 사이클부터 반영됩니다.\n"
+                    f"즉시 반영하려면 PM2 재시작이 필요합니다."
+                )
+                logger.info(f"Optimizer suggestion applied: {params}")
+            except Exception as e:
+                await query.edit_message_text(f"❌ 적용 실패: {e}")
+            return
+
+        if data == "opt_reject":
+            pending_path = Path(__file__).parent.parent / "data" / "storage" / "pending_optimizer_suggestion.json"
+            if pending_path.exists():
+                pending_path.unlink()
+            await query.edit_message_text("❌ 제안을 무시했습니다. 현재 전략을 유지합니다.")
+            return
+
         # 기존: 주문 승인/거부
         if data.startswith("approve_"):
             conf_id = data.replace("approve_", "")

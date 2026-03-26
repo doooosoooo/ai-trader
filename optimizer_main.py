@@ -97,10 +97,11 @@ def build_current_params() -> dict:
     }
 
 
-def send_telegram_suggestion(message: str, config: dict):
-    """텔레그램 메시지 직접 전송 (send-only, polling 없음)."""
+def send_telegram_suggestion(message: str, config: dict, suggestion_data: dict | None = None):
+    """텔레그램 메시지 + 적용/거부 버튼 전송."""
     try:
         import os
+        import json
         import telegram
 
         token = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -112,14 +113,41 @@ def send_telegram_suggestion(message: str, config: dict):
 
         bot = telegram.Bot(token=token)
         import asyncio
-        asyncio.run(bot.send_message(
-            chat_id=chat_id,
-            text=message,
-            parse_mode="HTML",
-        ))
+
+        # 제안 데이터를 파일에 저장 (텔레그램 콜백에서 읽기 위해)
+        if suggestion_data:
+            pending_path = BASE_DIR / "data" / "storage" / "pending_optimizer_suggestion.json"
+            with open(pending_path, "w") as f:
+                json.dump(suggestion_data, f, indent=2, ensure_ascii=False)
+
+            # 인라인 버튼 추가
+            keyboard = telegram.InlineKeyboardMarkup([
+                [
+                    telegram.InlineKeyboardButton("✅ 적용", callback_data="opt_apply"),
+                    telegram.InlineKeyboardButton("❌ 무시", callback_data="opt_reject"),
+                ]
+            ])
+            asyncio.run(bot.send_message(
+                chat_id=chat_id, text=message,
+                parse_mode="HTML", reply_markup=keyboard,
+            ))
+        else:
+            asyncio.run(bot.send_message(
+                chat_id=chat_id, text=message, parse_mode="HTML",
+            ))
+
         logger.info("Optimization suggestion sent via Telegram")
     except Exception as e:
         logger.error(f"Telegram send failed: {e}")
+
+
+PARAM_LABELS = {
+    "rsi_oversold": ("매수 RSI 기준", "", "이하일 때 매수 신호"),
+    "take_profit_pct": ("익절 기준", "%", "수익 시 매도"),
+    "stop_loss_pct": ("손절 기준", "%", "손실 시 매도"),
+    "position_size_pct": ("1종목 투자 비중", "%", "총 자산 대비"),
+    "max_hold_days": ("최대 보유일", "일", "이후 자동 매도"),
+}
 
 
 def format_suggestion_message(
@@ -131,46 +159,41 @@ def format_suggestion_message(
     overfit_ratio: float,
     period: str,
 ) -> str:
-    """최적화 제안 텔레그램 메시지 포맷."""
+    """최적화 제안을 쉬운 한국어로 포맷."""
     cur_ret = current_metrics.get("total_return", 0)
     best_ret = best_metrics.get("total_return", 0)
-    cur_sharpe = current_metrics.get("sharpe_ratio", 0)
-    best_sharpe = best_metrics.get("sharpe_ratio", 0)
-    cur_mdd = current_metrics.get("max_drawdown", 0)
     best_mdd = best_metrics.get("max_drawdown", 0)
 
     msg = (
-        f"📈 <b>파라미터 최적화 제안</b> [ai-optimizer]\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"전략: {strategy_name}\n"
-        f"기간: {period}\n\n"
-        f"<b>현재 파라미터:</b>\n"
+        f"📈 <b>더 나은 전략을 찾았습니다!</b>\n"
+        f"━━━━━━━━━━━━━━\n\n"
     )
-    for k, v in current_params.items():
-        if isinstance(v, float):
-            msg += f"  {k}: {v:.2%}\n" if v < 1 else f"  {k}: {v}\n"
-        else:
-            msg += f"  {k}: {v}\n"
 
-    msg += f"\n<b>제안 파라미터:</b>\n"
+    # 변경된 파라미터만 쉬운 한국어로
+    changes = []
     for k, v in best_params.items():
-        changed = " ⬅️" if current_params.get(k) != v else ""
-        if isinstance(v, float):
-            msg += f"  {k}: {v:.2%}{changed}\n" if v < 1 else f"  {k}: {v}{changed}\n"
+        cur_v = current_params.get(k)
+        if cur_v == v:
+            continue
+        label, unit, desc = PARAM_LABELS.get(k, (k, "", ""))
+        if unit == "%":
+            changes.append(f"  • {label}: {cur_v:.0%} → <b>{v:.0%}</b> ({desc})")
+        elif unit == "일":
+            changes.append(f"  • {label}: {cur_v}일 → <b>{v}일</b> ({desc})")
         else:
-            msg += f"  {k}: {v}{changed}\n"
+            changes.append(f"  • {label}: {cur_v} → <b>{v}</b> ({desc})")
 
-    ret_emoji = "🟢" if best_ret > cur_ret else "🔴"
-    sharpe_emoji = "🟢" if best_sharpe > cur_sharpe else "🔴"
-    mdd_emoji = "🟢" if abs(best_mdd) < abs(cur_mdd) else "🔴"
+    if changes:
+        msg += "<b>변경 내용:</b>\n"
+        msg += "\n".join(changes)
+        msg += "\n\n"
 
     msg += (
-        f"\n<b>성과 비교:</b>\n"
-        f"  {ret_emoji} 수익률: {cur_ret:+.1%} → {best_ret:+.1%} ({best_ret - cur_ret:+.1%}p)\n"
-        f"  {sharpe_emoji} 샤프: {cur_sharpe:.2f} → {best_sharpe:.2f} ({best_sharpe - cur_sharpe:+.2f})\n"
-        f"  {mdd_emoji} MDD: {cur_mdd:.1%} → {best_mdd:.1%}\n"
-        f"  과적합비율: {overfit_ratio:.2f}\n"
-        f"\n⚠️ 적용하려면 trading-params.yaml을 수동 변경하세요."
+        f"<b>과거 테스트 결과:</b>\n"
+        f"  📊 수익률: <b>{best_ret:+.1%}</b> (현재 전략 대비 {best_ret - cur_ret:+.1%}p)\n"
+        f"  📉 최대 손실: {best_mdd:.1%}\n\n"
+        f"⚠️ 과거 데이터({period}) 기반이라 실전과 다를 수 있습니다.\n"
+        f"아래 버튼으로 적용 여부를 선택하세요."
     )
     return msg
 
@@ -296,8 +319,6 @@ def run_optimization(mode: str = "daily"):
                 strategy_name, current_params, best_params,
                 current_metrics, test_metrics, overfit_ratio, period,
             )
-            send_telegram_suggestion(msg, config)
-
             # 결과 저장
             import json
             suggestion = {
@@ -309,6 +330,7 @@ def run_optimization(mode: str = "daily"):
                 "test_metrics": {k: v for k, v in test_metrics.items() if isinstance(v, (int, float))},
                 "overfit_ratio": overfit_ratio,
             }
+            send_telegram_suggestion(msg, config, suggestion_data=suggestion)
             with open(RESULTS_PATH, "w") as f:
                 json.dump(suggestion, f, indent=2, ensure_ascii=False)
         else:
