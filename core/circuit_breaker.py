@@ -41,6 +41,7 @@ class CircuitBreaker:
         self._api_failure_count = 0
         self._llm_failure_count = 0
         self._halted_at: datetime | None = None
+        self._last_trigger: CircuitTrigger | None = None
         self._load_state()
 
     def _load_state(self) -> None:
@@ -103,7 +104,9 @@ class CircuitBreaker:
                 f"코스피 {kospi_change_pct:.2%} 하락 (기준: {threshold:.1%})",
             )
         elif self.state == CircuitState.HALTED and kospi_change_pct > -0.01:
-            # 코스피가 -1% 이내로 회복되면 HALTED → NORMAL 자동 복구
+            # 코스피가 -1% 이내로 회복 — 단, 일일 손실로 HALTED된 경우는 해제하지 않음
+            if self._last_trigger == CircuitTrigger.DAILY_LOSS:
+                return self.state
             old_state = self.state
             self.state = CircuitState.NORMAL
             self._halted_at = None
@@ -209,6 +212,7 @@ class CircuitBreaker:
         }
 
         state_changed = state_priority[new_state] > state_priority[self.state]
+        self._last_trigger = trigger
         if state_changed:
             old_state = self.state
             self.state = new_state
