@@ -104,22 +104,7 @@ class CircuitBreaker:
                 CircuitState.WARNING,
                 f"코스피 {kospi_change_pct:.2%} 하락 (기준: {threshold:.1%})",
             )
-        elif self.state == CircuitState.HALTED and kospi_change_pct > -0.01:
-            # 코스피가 -1% 이내로 회복 — 단, 일일 손실 한도 초과 중이면 해제하지 않음
-            max_daily_loss = self.safety_rules.get("max_daily_loss_pct", -0.03)
-            if self._daily_pnl_pct is not None and self._daily_pnl_pct <= max_daily_loss:
-                return self.state
-            old_state = self.state
-            self.state = CircuitState.NORMAL
-            self._halted_at = None
-            self._save_state()
-            msg = f"코스피 {kospi_change_pct:.2%}로 회복 → 서킷브레이커 자동 해제"
-            logger.info(f"Circuit breaker: {old_state} → NORMAL | {msg}")
-            if self._notify:
-                try:
-                    self._notify(level="circuit_breaker", message=f"🟢 {msg}")
-                except Exception:
-                    pass
+        # HALTED 해제는 check_kospi에서 하지 않음 — check_daily_loss에서 일일 손실 회복 시 해제
         return self.state
 
     def record_api_failure(self) -> CircuitState:
@@ -152,7 +137,7 @@ class CircuitBreaker:
         self._llm_failure_count = 0
 
     def check_daily_loss(self, daily_pnl_pct: float) -> CircuitState:
-        """일일 손실 한도 체크."""
+        """일일 손실 한도 체크. 회복 시 HALTED 자동 해제."""
         self._daily_pnl_pct = daily_pnl_pct
         max_loss = self.safety_rules.get("max_daily_loss_pct", -0.03)
         if daily_pnl_pct <= max_loss:
@@ -161,6 +146,18 @@ class CircuitBreaker:
                 CircuitState.HALTED,
                 f"일일 손실 {daily_pnl_pct:.2%} (한도: {max_loss:.2%})",
             )
+        elif self.state == CircuitState.HALTED and daily_pnl_pct > max_loss:
+            old_state = self.state
+            self.state = CircuitState.NORMAL
+            self._halted_at = None
+            self._save_state()
+            msg = f"일일 손실 회복 {daily_pnl_pct:.2%} (한도: {max_loss:.2%}) → 서킷브레이커 해제"
+            logger.info(f"Circuit breaker: {old_state} → NORMAL | {msg}")
+            if self._notify:
+                try:
+                    self._notify(level="circuit_breaker", message=f"🟢 {msg}")
+                except Exception:
+                    pass
         return self.state
 
     def check_emergency_loss(self, total_pnl_pct: float) -> CircuitState:
