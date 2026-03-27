@@ -141,10 +141,10 @@ class TradingScheduler:
             name="일일 백테스트",
         )
 
-        # 장외 LLM 분석 (매 2시간, 장중 제외) — 최신 데이터 기반 분석 유지
+        # 장외 LLM 분석 (매 2시간, 장중 시간 제외) — 최신 데이터 기반 분석 유지
         self.scheduler.add_job(
             self._safe_run(self.system.cycle_llm_analysis, check_hours=False, check_trading_day=False),
-            CronTrigger(hour="0,2,4,6,8,16,18,20,22", minute=30),
+            CronTrigger(hour="0,2,4,6,8,18,20,22", minute=30),
             id="offhours_analysis",
             name="장외 LLM 분석",
         )
