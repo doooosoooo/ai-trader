@@ -43,7 +43,7 @@ class CircuitBreaker:
         self._halted_at: datetime | None = None
         self._last_trigger: CircuitTrigger | None = None
         self._daily_pnl_pct: float | None = None
-        self._warmup_checks = 0  # 재시작 후 워밍업 (첫 3사이클은 해제 금지)
+        self._kospi_change_pct: float | None = None
         self._load_state()
 
     def _load_state(self) -> None:
@@ -84,13 +84,13 @@ class CircuitBreaker:
 
     @property
     def is_sell_allowed(self) -> bool:
-        # HALTED에서 매도 차단 — 급락장에서 LLM이 패닉 매도하는 것 방지
-        return self.state in (CircuitState.NORMAL, CircuitState.WARNING)
+        # HALTED에서도 매도 허용 — 손절/익절은 실행되어야 함
+        # EMERGENCY에서만 전체 매도 차단
+        return self.state != CircuitState.EMERGENCY
 
     def check_kospi(self, kospi_change_pct: float) -> CircuitState:
-        """코스피 급락 체크. HALTED 되면 당일 끝까지 유지 (on_market_open에서 리셋)."""
-        if self.state == CircuitState.HALTED:
-            return self.state  # 이미 HALTED면 추가 체크 불필요
+        """코스피 급락 체크 + 쿨다운 후 회복 시 해제."""
+        self._kospi_change_pct = kospi_change_pct
         threshold = self.safety_rules.get("market_conditions", {}).get(
             "kospi_drop_threshold", -0.03
         )
@@ -106,7 +106,34 @@ class CircuitBreaker:
                 CircuitState.WARNING,
                 f"코스피 {kospi_change_pct:.2%} 하락 (기준: {threshold:.1%})",
             )
+        elif self.state == CircuitState.HALTED:
+            self._try_release()
         return self.state
+
+    def _try_release(self):
+        """HALTED 해제 시도 — 쿨다운(30분) + 코스피·일일손실 모두 회복 시에만."""
+        # 쿨다운: HALTED 후 최소 30분 유지
+        if self._halted_at and (datetime.now() - self._halted_at).total_seconds() < 1800:
+            return
+        # 코스피 -1% 이내로 회복
+        kospi_ok = self._kospi_change_pct is not None and self._kospi_change_pct > -0.01
+        # 일일 손실 -2% 이내로 회복 (히스테리시스)
+        max_loss = self.safety_rules.get("max_daily_loss_pct", -0.03)
+        release_threshold = max_loss + 0.01
+        daily_ok = self._daily_pnl_pct is None or self._daily_pnl_pct > release_threshold
+
+        if kospi_ok and daily_ok:
+            old_state = self.state
+            self.state = CircuitState.NORMAL
+            self._halted_at = None
+            self._save_state()
+            msg = f"시장 회복 (코스피 {self._kospi_change_pct:.2%}, 일일손익 {self._daily_pnl_pct:.2%}) → 서킷브레이커 해제"
+            logger.info(f"Circuit breaker: {old_state} → NORMAL | {msg}")
+            if self._notify:
+                try:
+                    self._notify(level="circuit_breaker", message=f"🟢 {msg}")
+                except Exception:
+                    pass
 
     def record_api_failure(self) -> CircuitState:
         """KIS API 실패 기록."""
@@ -138,11 +165,7 @@ class CircuitBreaker:
         self._llm_failure_count = 0
 
     def check_daily_loss(self, daily_pnl_pct: float) -> CircuitState:
-        """일일 손실 한도 체크.
-
-        HALTED 해제는 여기서 하지 않음 — on_market_open에서 매일 리셋.
-        장중에는 HALTED가 되면 당일 끝까지 유지.
-        """
+        """일일 손실 한도 체크 + 쿨다운 후 회복 시 해제."""
         self._daily_pnl_pct = daily_pnl_pct
         max_loss = self.safety_rules.get("max_daily_loss_pct", -0.03)
         if daily_pnl_pct <= max_loss:
@@ -151,6 +174,8 @@ class CircuitBreaker:
                 CircuitState.HALTED,
                 f"일일 손실 {daily_pnl_pct:.2%} (한도: {max_loss:.2%})",
             )
+        elif self.state == CircuitState.HALTED:
+            self._try_release()
         return self.state
 
     def check_emergency_loss(self, total_pnl_pct: float) -> CircuitState:
