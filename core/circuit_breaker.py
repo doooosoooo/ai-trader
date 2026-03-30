@@ -100,12 +100,14 @@ class CircuitBreaker:
                 CircuitState.HALTED,
                 f"코스피 {kospi_change_pct:.2%} 급락 (기준: -4%)",
             )
-        elif kospi_change_pct <= threshold:
-            self._trigger(
-                CircuitTrigger.KOSPI_CRASH,
-                CircuitState.WARNING,
-                f"코스피 {kospi_change_pct:.2%} 하락 (기준: {threshold:.1%})",
-            )
+        elif kospi_change_pct <= -0.03:
+            # WARNING은 알림만, 매매 제한 없음
+            if self.state == CircuitState.NORMAL:
+                self._trigger(
+                    CircuitTrigger.KOSPI_CRASH,
+                    CircuitState.WARNING,
+                    f"코스피 {kospi_change_pct:.2%} 하락 주의",
+                )
         elif self.state == CircuitState.HALTED:
             self._try_release()
         return self.state
