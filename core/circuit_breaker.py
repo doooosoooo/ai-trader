@@ -94,11 +94,11 @@ class CircuitBreaker:
         threshold = self.safety_rules.get("market_conditions", {}).get(
             "kospi_drop_threshold", -0.03
         )
-        if kospi_change_pct <= -0.03:
+        if kospi_change_pct <= -0.04:
             self._trigger(
                 CircuitTrigger.KOSPI_CRASH,
                 CircuitState.HALTED,
-                f"코스피 {kospi_change_pct:.2%} 급락 (기준: -3%)",
+                f"코스피 {kospi_change_pct:.2%} 급락 (기준: -4%)",
             )
         elif kospi_change_pct <= threshold:
             self._trigger(
@@ -115,8 +115,8 @@ class CircuitBreaker:
         # 쿨다운: HALTED 후 최소 30분 유지
         if self._halted_at and (datetime.now() - self._halted_at).total_seconds() < 1800:
             return
-        # 코스피 -1% 이내로 회복
-        kospi_ok = self._kospi_change_pct is not None and self._kospi_change_pct > -0.01
+        # 코스피 -3% 이내로 회복
+        kospi_ok = self._kospi_change_pct is not None and self._kospi_change_pct > -0.03
         # 일일 손실 -2% 이내로 회복 (히스테리시스)
         max_loss = self.safety_rules.get("max_daily_loss_pct", -0.03)
         release_threshold = max_loss + 0.01
