@@ -80,7 +80,8 @@ class CircuitBreaker:
 
     @property
     def is_buy_allowed(self) -> bool:
-        return self.state in (CircuitState.NORMAL,)
+        # WARNING은 주의 알림일 뿐, 매수 허용. HALTED/EMERGENCY에서만 차단.
+        return self.state in (CircuitState.NORMAL, CircuitState.WARNING)
 
     @property
     def is_sell_allowed(self) -> bool:
