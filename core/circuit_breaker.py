@@ -88,11 +88,12 @@ class CircuitBreaker:
         return self.state in (CircuitState.NORMAL, CircuitState.WARNING)
 
     def check_kospi(self, kospi_change_pct: float) -> CircuitState:
-        """코스피 급락 체크 + 회복 시 자동 복구."""
+        """코스피 급락 체크. HALTED 되면 당일 끝까지 유지 (on_market_open에서 리셋)."""
+        if self.state == CircuitState.HALTED:
+            return self.state  # 이미 HALTED면 추가 체크 불필요
         threshold = self.safety_rules.get("market_conditions", {}).get(
             "kospi_drop_threshold", -0.03
         )
-        # safety_rules에서 더 엄격한 기준 적용
         if kospi_change_pct <= -0.03:
             self._trigger(
                 CircuitTrigger.KOSPI_CRASH,
@@ -105,7 +106,6 @@ class CircuitBreaker:
                 CircuitState.WARNING,
                 f"코스피 {kospi_change_pct:.2%} 하락 (기준: {threshold:.1%})",
             )
-        # HALTED 해제는 check_kospi에서 하지 않음 — check_daily_loss에서 일일 손실 회복 시 해제
         return self.state
 
     def record_api_failure(self) -> CircuitState:
@@ -138,34 +138,19 @@ class CircuitBreaker:
         self._llm_failure_count = 0
 
     def check_daily_loss(self, daily_pnl_pct: float) -> CircuitState:
-        """일일 손실 한도 체크. 회복 시 HALTED 자동 해제 (히스테리시스 + 워밍업 적용)."""
+        """일일 손실 한도 체크.
+
+        HALTED 해제는 여기서 하지 않음 — on_market_open에서 매일 리셋.
+        장중에는 HALTED가 되면 당일 끝까지 유지.
+        """
         self._daily_pnl_pct = daily_pnl_pct
-        self._warmup_checks += 1
         max_loss = self.safety_rules.get("max_daily_loss_pct", -0.03)
-        # 해제 기준: 한도 + 1%p (예: -3%에서 발동, -2% 이상에서 해제)
-        release_threshold = max_loss + 0.01
         if daily_pnl_pct <= max_loss:
             self._trigger(
                 CircuitTrigger.DAILY_LOSS,
                 CircuitState.HALTED,
                 f"일일 손실 {daily_pnl_pct:.2%} (한도: {max_loss:.2%})",
             )
-        elif self.state == CircuitState.HALTED and daily_pnl_pct > release_threshold:
-            # 재시작 직후 워밍업 (첫 3사이클은 해제 금지 — 가격 데이터 안정화 대기)
-            if self._warmup_checks <= 3:
-                logger.info(f"Circuit breaker: warmup {self._warmup_checks}/3, skip release (pnl={daily_pnl_pct:.2%})")
-                return self.state
-            old_state = self.state
-            self.state = CircuitState.NORMAL
-            self._halted_at = None
-            self._save_state()
-            msg = f"일일 손실 회복 {daily_pnl_pct:.2%} (해제기준: {release_threshold:.2%}) → 서킷브레이커 해제"
-            logger.info(f"Circuit breaker: {old_state} → NORMAL | {msg}")
-            if self._notify:
-                try:
-                    self._notify(level="circuit_breaker", message=f"🟢 {msg}")
-                except Exception:
-                    pass
         return self.state
 
     def check_emergency_loss(self, total_pnl_pct: float) -> CircuitState:
