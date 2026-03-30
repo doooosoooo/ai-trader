@@ -722,10 +722,24 @@ class TelegramBot:
         pnl_pct = pnl / new_capital * 100 if new_capital > 0 else 0
 
         # +/- 변경인 경우 delta 표시 포함
-        delta_str = ""
         diff = new_capital - old_capital
+        delta_str = f" ({diff:+,.0f})" if diff != 0 else ""
+
+        # 입출금 시 전일 스냅샷 보정 (서킷브레이커 오발동 방지)
         if diff != 0:
-            delta_str = f" ({diff:+,.0f})"
+            try:
+                import sqlite3
+                db_path = str(Path(__file__).parent.parent / "data" / "storage" / "trader.db")
+                with sqlite3.connect(db_path) as conn:
+                    # 최근 스냅샷의 total_asset을 입출금 금액만큼 조정
+                    conn.execute(
+                        "UPDATE daily_snapshot SET total_asset = total_asset + ? "
+                        "WHERE date = (SELECT MAX(date) FROM daily_snapshot)",
+                        (diff,),
+                    )
+                logger.info(f"Daily snapshot adjusted by {diff:+,.0f} for capital change")
+            except Exception as e:
+                logger.warning(f"Snapshot adjustment failed: {e}")
 
         await update.message.reply_text(
             f"✅ 초기자본 변경 완료\n\n"

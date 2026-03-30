@@ -43,6 +43,7 @@ class CircuitBreaker:
         self._halted_at: datetime | None = None
         self._last_trigger: CircuitTrigger | None = None
         self._daily_pnl_pct: float | None = None
+        self._warmup_checks = 0  # 재시작 후 워밍업 (첫 3사이클은 해제 금지)
         self._load_state()
 
     def _load_state(self) -> None:
@@ -137,21 +138,28 @@ class CircuitBreaker:
         self._llm_failure_count = 0
 
     def check_daily_loss(self, daily_pnl_pct: float) -> CircuitState:
-        """일일 손실 한도 체크. 회복 시 HALTED 자동 해제."""
+        """일일 손실 한도 체크. 회복 시 HALTED 자동 해제 (히스테리시스 + 워밍업 적용)."""
         self._daily_pnl_pct = daily_pnl_pct
+        self._warmup_checks += 1
         max_loss = self.safety_rules.get("max_daily_loss_pct", -0.03)
+        # 해제 기준: 한도 + 1%p (예: -3%에서 발동, -2% 이상에서 해제)
+        release_threshold = max_loss + 0.01
         if daily_pnl_pct <= max_loss:
             self._trigger(
                 CircuitTrigger.DAILY_LOSS,
                 CircuitState.HALTED,
                 f"일일 손실 {daily_pnl_pct:.2%} (한도: {max_loss:.2%})",
             )
-        elif self.state == CircuitState.HALTED and daily_pnl_pct > max_loss:
+        elif self.state == CircuitState.HALTED and daily_pnl_pct > release_threshold:
+            # 재시작 직후 워밍업 (첫 3사이클은 해제 금지 — 가격 데이터 안정화 대기)
+            if self._warmup_checks <= 3:
+                logger.info(f"Circuit breaker: warmup {self._warmup_checks}/3, skip release (pnl={daily_pnl_pct:.2%})")
+                return self.state
             old_state = self.state
             self.state = CircuitState.NORMAL
             self._halted_at = None
             self._save_state()
-            msg = f"일일 손실 회복 {daily_pnl_pct:.2%} (한도: {max_loss:.2%}) → 서킷브레이커 해제"
+            msg = f"일일 손실 회복 {daily_pnl_pct:.2%} (해제기준: {release_threshold:.2%}) → 서킷브레이커 해제"
             logger.info(f"Circuit breaker: {old_state} → NORMAL | {msg}")
             if self._notify:
                 try:
