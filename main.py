@@ -156,6 +156,7 @@ class TradingSystem:
                     logger.warning(f"Initial screening failed: {e}")
 
         self._watchlist = self._get_watchlist()
+        self._screened_tickers: list[str] | None = None
 
         # 시작 시 히스토리 데이터 사전 수집
         self._prefetch_historical_data()
@@ -302,7 +303,7 @@ class TradingSystem:
         self.portfolio.update_prices(prices)
 
         # 리스크 기반 자동 청산 체크 (손절/트레일링스탑/보유기간/스크리닝탈락)
-        self.risk_manager._watchlist = self._watchlist
+        self.risk_manager._watchlist = getattr(self, '_screened_tickers', None)
         risk_exits = self.risk_manager.check_risk_exits()
         for r in risk_exits:
             self.risk_manager.process_trade_result(r)
@@ -828,6 +829,8 @@ class TradingSystem:
 
             # 관심종목 갱신
             self._watchlist = self._get_watchlist()
+            # 순수 스크리닝 후보 (보유종목 강제 추가 전) — 스크리닝 탈락 판단용
+            self._screened_tickers = [c["ticker"] for c in result.candidates if c["ticker"] not in (result.held_tickers_added or [])]
 
             # 새 종목 히스토리 프리페치
             self._prefetch_historical_data()
