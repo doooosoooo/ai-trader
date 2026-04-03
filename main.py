@@ -156,7 +156,16 @@ class TradingSystem:
                     logger.warning(f"Initial screening failed: {e}")
 
         self._watchlist = self._get_watchlist()
+        # 순수 스크리닝 후보 초기화 (보유종목 강제 추가 전 목록)
         self._screened_tickers: list[str] | None = None
+        if self.screener:
+            cached = self.screener.get_last_result()
+            if cached and cached.candidates:
+                self._screened_tickers = [
+                    c["ticker"] for c in cached.candidates
+                    if c["ticker"] not in (cached.held_tickers_added or [])
+                ]
+                logger.info(f"Screened tickers initialized: {len(self._screened_tickers)} pure candidates")
 
         # 시작 시 히스토리 데이터 사전 수집
         self._prefetch_historical_data()
