@@ -43,6 +43,7 @@ class RiskManager:
         self.telegram = telegram
         self.sim_tracker = sim_tracker
         self.sync_account_fn = sync_account_fn
+        self._watchlist: list[str] | None = None  # 스크리닝 관심종목 (외부에서 설정)
 
         # 집중도/드로다운 알림 상태 — 파일 영속화 (PM2 재시작 시 스팸 방지)
         self._concentration_alerted: dict[str, str] = {}
@@ -108,7 +109,12 @@ class RiskManager:
                         f"고점{pos.peak_price:,.0f}→현재{pos.current_price:,.0f} 하락반전)"
                     )
 
-            # 4. 보유기간 초과
+            # 4. 스크리닝 탈락 + 마이너스 → 즉시 매도 (3거래일 규칙 무시)
+            if reason is None and self._watchlist is not None:
+                if ticker not in self._watchlist and pos.pnl_pct < 0:
+                    reason = f"스크리닝탈락+손실 ({pos.pnl_pct:.1%}, 모멘텀 이탈)"
+
+            # 5. 보유기간 초과
             if reason is None:
                 bought = datetime.fromisoformat(pos.bought_at)
                 days_held = (datetime.now().date() - bought.date()).days

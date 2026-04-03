@@ -301,7 +301,8 @@ class TradingSystem:
         # 포트폴리오 가격 업데이트
         self.portfolio.update_prices(prices)
 
-        # 리스크 기반 자동 청산 체크 (손절/트레일링스탑/보유기간)
+        # 리스크 기반 자동 청산 체크 (손절/트레일링스탑/보유기간/스크리닝탈락)
+        self.risk_manager._watchlist = self._watchlist
         risk_exits = self.risk_manager.check_risk_exits()
         for r in risk_exits:
             self.risk_manager.process_trade_result(r)
