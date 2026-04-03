@@ -401,6 +401,10 @@ class TradingSystem:
                 pos_dict["dist_to_stop_loss"] = f"{dist_to_sl:+.1%}"
                 pos_dict["trailing_drawdown"] = f"{trailing_dd:.1%}"
                 pos_dict["trailing_stop_pct"] = f"{ts_pct:.0%}"
+                # 스크리닝 탈락 여부 (관심종목에서 빠졌으면 모멘텀 이탈)
+                pos_dict["in_watchlist"] = ticker in self._watchlist
+                if not pos_dict["in_watchlist"]:
+                    pos_dict["screening_note"] = "⚠️ 스크리닝 탈락 — 모멘텀 이탈, 매도 검토 대상"
 
             # 최근 매매 이력 추가 (쿨다운/재매수 금지 판단용)
             recent_trades = self.portfolio.get_trade_history(limit=30)
