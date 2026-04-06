@@ -60,7 +60,9 @@ class NotificationService:
                 ratio_str = ""
                 if a.get("ratio"):
                     ratio_str = f" ({a['ratio']:.0%})"
-                msg += f"  {emoji} {action_type} {name}{ratio_str}"
+                st = a.get("strategy_type", "")
+                st_label = {"value": "💎", "swing": "🔄", "daytrading": "⚡"}.get(st, "")
+                msg += f"  {emoji} {action_type} {st_label}{name}{ratio_str}"
                 if reason:
                     msg += f"\n     └ {reason}"
                 msg += "\n"
