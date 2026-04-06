@@ -76,6 +76,7 @@ class OrderExecutor:
             urgency = action.get("urgency", "limit")
             limit_price = action.get("limit_price")
             reason = action.get("reason", "")
+            strategy_type = action.get("strategy_type", "swing")
 
             try:
                 if action_type == "BUY":
@@ -83,6 +84,7 @@ class OrderExecutor:
                         ticker, name, ratio, urgency, limit_price,
                         current_prices.get(ticker, 0), reason,
                         json.dumps(signal, ensure_ascii=False),
+                        strategy_type=strategy_type,
                     )
                 elif action_type == "SELL":
                     result = self._execute_sell(
@@ -117,6 +119,7 @@ class OrderExecutor:
         current_price: float,
         reason: str,
         signal_json: str,
+        strategy_type: str = "swing",
     ) -> dict | None:
         # 실시간 현재가 조회 (분석 시점 가격과 괴리 방지)
         if self.mode != "simulation" and self.market_client:
@@ -166,6 +169,7 @@ class OrderExecutor:
                 "reason": reason,
             }
 
+        self._current_strategy_type = strategy_type
         if self.mode == "simulation":
             return self._simulate_buy(ticker, name, quantity, price, fee, reason, signal_json)
         else:
@@ -239,6 +243,7 @@ class OrderExecutor:
         trade = self.portfolio.execute_buy(
             ticker=ticker, name=name, quantity=quantity,
             price=price, fee=fee, reason=reason, signal_json=signal_json,
+            strategy_type=getattr(self, '_current_strategy_type', 'swing'),
         )
         trade["status"] = "SIMULATED"
         self.safety_guard.record_trade(ticker)

@@ -198,13 +198,26 @@ class NotificationService:
             f"<b>보유 종목 평가</b>\n"
         )
 
+        # 전략 유형별 그룹핑
+        from collections import defaultdict
+        by_type = defaultdict(list)
         for pos in self.portfolio.positions.values():
-            pnl_emoji = "📈" if pos.pnl > 0 else "📉" if pos.pnl < 0 else "➡️"
-            msg += (
-                f"  {pnl_emoji} {pos.name}({pos.ticker})\n"
-                f"    {pos.quantity}주 | 매입 {pos.avg_price:,.0f} → 현재 {pos.current_price:,.0f}\n"
-                f"    평가손익: {pos.pnl:+,.0f}원 ({pos.pnl_pct:+.2%})\n"
-            )
+            by_type[pos.strategy_type].append(pos)
+
+        type_order = ["value", "swing", "daytrading"]
+        for st in type_order:
+            positions = by_type.get(st, [])
+            if not positions:
+                continue
+            type_label = {"value": "💎 가치투자", "swing": "🔄 스윙", "daytrading": "⚡ 단타"}.get(st, st)
+            msg += f"\n<b>{type_label}</b>\n"
+            for pos in positions:
+                pnl_emoji = "📈" if pos.pnl > 0 else "📉" if pos.pnl < 0 else "➡️"
+                msg += (
+                    f"  {pnl_emoji} {pos.name}({pos.ticker})\n"
+                    f"    {pos.quantity}주 | 매입 {pos.avg_price:,.0f} → 현재 {pos.current_price:,.0f}\n"
+                    f"    평가손익: {pos.pnl:+,.0f}원 ({pos.pnl_pct:+.2%})\n"
+                )
 
         msg += (
             f"\n{'─' * 26}\n"

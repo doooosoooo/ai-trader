@@ -87,10 +87,13 @@ class RiskManager:
         results = []
         for ticker, pos in list(self.portfolio.positions.items()):
             reason = None
+            rules = pos.rules  # strategy_type별 규칙 (value/swing/daytrading)
+            pos_sl = rules["stop_loss"]
+            pos_tp = rules["take_profit"]
 
-            # 1. 하드 손절
-            if pos.pnl_pct <= stop_loss_pct:
-                reason = f"하드손절 ({pos.pnl_pct:.1%} ≤ {stop_loss_pct:.0%})"
+            # 1. 하드 손절 (strategy_type별 다른 손절선)
+            if pos.pnl_pct <= pos_sl:
+                reason = f"하드손절 ({pos.pnl_pct:.1%} ≤ {pos_sl:.0%}) [{pos.label}]"
 
             # 2. 트레일링 스탑 (수익 구간에서만 적용)
             if reason is None and pos.peak_price > pos.avg_price:
@@ -98,28 +101,28 @@ class RiskManager:
                 if drawdown >= trailing_stop_pct:
                     reason = (
                         f"트레일링스탑 (고점{pos.peak_price:,.0f}"
-                        f"→현재{pos.current_price:,.0f}, -{drawdown:.1%})"
+                        f"→현재{pos.current_price:,.0f}, -{drawdown:.1%}) [{pos.label}]"
                     )
 
-            # 3. 조기 익절 (3거래일 미만이라도 +5% 이상이면서 고점 대비 하락 시)
+            # 3. 조기 익절 (수익 +5% 이상이면서 고점 대비 -5% 하락 시)
             if reason is None and pos.pnl_pct >= 0.05:
                 if pos.peak_price > 0 and pos.current_price < pos.peak_price * 0.95:
                     reason = (
                         f"조기익절 (수익 {pos.pnl_pct:.1%}, "
-                        f"고점{pos.peak_price:,.0f}→현재{pos.current_price:,.0f} 하락반전)"
+                        f"고점{pos.peak_price:,.0f}→현재{pos.current_price:,.0f} 하락반전) [{pos.label}]"
                     )
 
-            # 4. 스크리닝 탈락 + 마이너스 → 즉시 매도 (3거래일 규칙 무시)
+            # 4. 스크리닝 탈락 + 마이너스 → 즉시 매도 (value 제외)
             if reason is None and self._watchlist is not None:
-                if ticker not in self._watchlist and pos.pnl_pct < 0:
-                    reason = f"스크리닝탈락+손실 ({pos.pnl_pct:.1%}, 모멘텀 이탈)"
+                if rules["screening_dropout_sell"] and ticker not in self._watchlist and pos.pnl_pct < 0:
+                    reason = f"스크리닝탈락+손실 ({pos.pnl_pct:.1%}, 모멘텀 이탈) [{pos.label}]"
 
             # 5. 보유기간 초과
             if reason is None:
                 bought = datetime.fromisoformat(pos.bought_at)
                 days_held = (datetime.now().date() - bought.date()).days
                 if days_held >= max_hold_days:
-                    reason = f"보유기간초과 ({days_held}일 ≥ {max_hold_days}일)"
+                    reason = f"보유기간초과 ({days_held}일 ≥ {max_hold_days}일) [{pos.label}]"
 
             if reason:
                 logger.warning(f"Risk exit triggered: {pos.name}({ticker}) — {reason}")

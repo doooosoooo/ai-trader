@@ -53,6 +53,7 @@ class AccountManager:
                 # 기존 peak_price, bought_at 유지
                 prev_peak = old_pos.peak_price if old_pos else cur_price
                 prev_bought = old_pos.bought_at if old_pos else ""
+                prev_strategy = old_pos.strategy_type if old_pos else "swing"
                 self.portfolio.positions[ticker] = Position(
                     ticker=ticker,
                     name=pos_data["name"],
@@ -61,6 +62,7 @@ class AccountManager:
                     current_price=cur_price,
                     peak_price=max(prev_peak, cur_price),
                     bought_at=prev_bought,
+                    strategy_type=prev_strategy,
                 )
                 # TICKER_NAMES에 추가
                 if pos_data["ticker"] not in TICKER_NAMES and pos_data["name"]:

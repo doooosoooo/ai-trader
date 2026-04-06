@@ -14,6 +14,13 @@ DB_DIR = Path(__file__).parent.parent / "data" / "storage"
 class Position:
     """개별 보유 종목."""
 
+    # 전략 유형별 규칙
+    STRATEGY_RULES = {
+        "value":      {"stop_loss": -0.10, "min_hold_days": 10, "screening_dropout_sell": False, "take_profit": 0.20, "label": "💎가치"},
+        "swing":      {"stop_loss": -0.05, "min_hold_days": 3,  "screening_dropout_sell": True,  "take_profit": 0.10, "label": "🔄스윙"},
+        "daytrading": {"stop_loss": -0.03, "min_hold_days": 0,  "screening_dropout_sell": True,  "take_profit": 0.05, "label": "⚡단타"},
+    }
+
     def __init__(
         self,
         ticker: str,
@@ -23,6 +30,7 @@ class Position:
         current_price: float = 0,
         bought_at: str = "",
         peak_price: float = 0,
+        strategy_type: str = "swing",
     ):
         self.ticker = ticker
         self.name = name
@@ -31,6 +39,15 @@ class Position:
         self.current_price = current_price or avg_price
         self.bought_at = bought_at or datetime.now().isoformat()
         self.peak_price = peak_price or self.current_price
+        self.strategy_type = strategy_type if strategy_type in self.STRATEGY_RULES else "swing"
+
+    @property
+    def rules(self) -> dict:
+        return self.STRATEGY_RULES.get(self.strategy_type, self.STRATEGY_RULES["swing"])
+
+    @property
+    def label(self) -> str:
+        return self.rules["label"]
 
     @property
     def market_value(self) -> float:
@@ -61,6 +78,7 @@ class Position:
             "pnl": self.pnl,
             "pnl_pct": f"{self.pnl_pct:.2%}",
             "bought_at": self.bought_at,
+            "strategy_type": self.strategy_type,
         }
 
 
@@ -146,9 +164,11 @@ class Portfolio:
             pos_cols = [r[1] for r in conn.execute("PRAGMA table_info(positions)").fetchall()]
             if "peak_price" not in pos_cols:
                 conn.execute("ALTER TABLE positions ADD COLUMN peak_price REAL NOT NULL DEFAULT 0")
-                # 기존 포지션: peak_price를 current_price로 초기화
                 conn.execute("UPDATE positions SET peak_price = current_price WHERE peak_price = 0")
                 logger.info("Migrated positions: added peak_price column")
+            if "strategy_type" not in pos_cols:
+                conn.execute("ALTER TABLE positions ADD COLUMN strategy_type TEXT NOT NULL DEFAULT 'swing'")
+                logger.info("Migrated positions: added strategy_type column")
 
     def _load_state(self) -> None:
         with sqlite3.connect(self.db_path) as conn:
@@ -158,12 +178,12 @@ class Portfolio:
                 self.initial_capital = row[1]
                 self.high_water_mark = row[2] if row[2] else 0.0
 
-            rows = conn.execute("SELECT ticker, name, quantity, avg_price, current_price, bought_at, peak_price FROM positions").fetchall()
+            rows = conn.execute("SELECT ticker, name, quantity, avg_price, current_price, bought_at, peak_price, strategy_type FROM positions").fetchall()
             for r in rows:
                 self.positions[r[0]] = Position(
                     ticker=r[0], name=r[1], quantity=r[2],
                     avg_price=r[3], current_price=r[4], bought_at=r[5],
-                    peak_price=r[6],
+                    peak_price=r[6], strategy_type=r[7] or "swing",
                 )
         logger.info(f"Portfolio loaded: cash={self.cash:,.0f}, positions={len(self.positions)}")
 
@@ -183,9 +203,9 @@ class Portfolio:
             conn.execute("DELETE FROM positions")
             for pos in self.positions.values():
                 conn.execute("""
-                    INSERT INTO positions (ticker, name, quantity, avg_price, current_price, bought_at, peak_price)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (pos.ticker, pos.name, pos.quantity, pos.avg_price, pos.current_price, pos.bought_at, pos.peak_price))
+                    INSERT INTO positions (ticker, name, quantity, avg_price, current_price, bought_at, peak_price, strategy_type)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (pos.ticker, pos.name, pos.quantity, pos.avg_price, pos.current_price, pos.bought_at, pos.peak_price, pos.strategy_type))
             conn.commit()
         except Exception as e:
             conn.rollback()
@@ -267,6 +287,7 @@ class Portfolio:
         fee: float = 0,
         reason: str = "",
         signal_json: str = "",
+        strategy_type: str = "swing",
     ) -> dict:
         """매수 실행 기록."""
         amount = quantity * price + fee
@@ -285,6 +306,7 @@ class Portfolio:
             self.positions[ticker] = Position(
                 ticker=ticker, name=name, quantity=quantity,
                 avg_price=price, current_price=price,
+                strategy_type=strategy_type,
             )
 
         trade = {
