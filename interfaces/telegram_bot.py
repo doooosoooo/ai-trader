@@ -467,16 +467,29 @@ class TelegramBot:
         summary = self.system.portfolio.get_summary()
         positions = summary.get("positions", {})
         if positions:
-            msg += f"<b>보유종목 ({len(positions)}개)</b>\n"
+            # 전략 유형별 그룹핑
+            from collections import defaultdict
+            by_type = defaultdict(list)
             for ticker, pos in positions.items():
-                pnl = pos.get("pnl", 0)
-                pnl_pct = pos.get("pnl_pct", "0%")
-                pnl_emoji = "📈" if pnl > 0 else "📉" if pnl < 0 else "➡️"
-                msg += (
-                    f"  {pnl_emoji} {pos['name']}({ticker})\n"
-                    f"     {pos['quantity']}주 | 현재가 {pos['current_price']:,.0f}원\n"
-                    f"     매입 {pos['avg_price']:,.0f}원 → {pnl:+,.0f}원({pnl_pct})\n"
-                )
+                st = pos.get("strategy_type", "swing")
+                by_type[st].append((ticker, pos))
+
+            msg += f"<b>보유종목 ({len(positions)}개)</b>\n"
+            type_labels = {"value": "💎 가치투자", "swing": "🔄 스윙", "daytrading": "⚡ 단타"}
+            for st in ["value", "swing", "daytrading"]:
+                items = by_type.get(st, [])
+                if not items:
+                    continue
+                msg += f"\n<b>{type_labels.get(st, st)}</b>\n"
+                for ticker, pos in items:
+                    pnl = pos.get("pnl", 0)
+                    pnl_pct = pos.get("pnl_pct", "0%")
+                    pnl_emoji = "📈" if pnl > 0 else "📉" if pnl < 0 else "➡️"
+                    msg += (
+                        f"  {pnl_emoji} {pos['name']}({ticker})\n"
+                        f"     {pos['quantity']}주 | 현재가 {pos['current_price']:,.0f}원\n"
+                        f"     매입 {pos['avg_price']:,.0f}원 → {pnl:+,.0f}원({pnl_pct})\n"
+                    )
         else:
             msg += f"<b>보유종목: 없음</b>\n"
 
