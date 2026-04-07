@@ -417,6 +417,33 @@ class TradingSystem:
                 if not pos_dict["in_watchlist"]:
                     pos_dict["screening_note"] = "⚠️ 스크리닝 탈락 — 모멘텀 이탈, 매도 검토 대상"
 
+                # 포지션 교체 점수 계산 (낮을수록 교체 1순위)
+                rotation_score = 0
+                pnl_pct_val = pos.pnl_pct
+                if pnl_pct_val >= 0.05:
+                    rotation_score += 30
+                elif pnl_pct_val >= 0:
+                    rotation_score += 10
+                elif pnl_pct_val >= -0.03:
+                    rotation_score -= 10
+                else:
+                    rotation_score -= 30
+                if ticker in self._watchlist:
+                    rotation_score += 20
+                else:
+                    rotation_score -= 20
+                if pos.strategy_type == "value":
+                    rotation_score += 15
+                if days_held < 1:
+                    rotation_score += 30
+                elif days_held < 3:
+                    rotation_score += 20
+                elif days_held < 7:
+                    rotation_score += 0
+                else:
+                    rotation_score -= 10
+                pos_dict["rotation_score"] = rotation_score
+
             # 최근 매매 이력 추가 (쿨다운/재매수 금지 판단용)
             recent_trades = self.portfolio.get_trade_history(limit=30)
             from datetime import timedelta
