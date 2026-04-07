@@ -52,6 +52,40 @@ class OrderExecutor:
         self.market_client = market_client  # 미체결 주문 조회용
         self.mode = config.get("system", {}).get("mode", "simulation")
 
+    def _auto_classify(self, ticker: str) -> str | None:
+        """PER/PBR 기반 자동 strategy_type 분류.
+
+        - PER 0~15 + PBR 0~1.2 → value (가치주)
+        - PER -50~30 + 거래량 폭발 → daytrading (테마/모멘텀)
+        - 그 외 → swing
+        """
+        import sqlite3
+        from pathlib import Path
+        db_path = Path(__file__).parent.parent / "data" / "storage" / "trader.db"
+        try:
+            with sqlite3.connect(str(db_path)) as conn:
+                row = conn.execute(
+                    "SELECT per, pbr, change_pct, volume FROM current_prices WHERE ticker=?",
+                    (ticker,),
+                ).fetchone()
+            if not row:
+                return None
+            per, pbr, change_pct, volume = row
+            per = per or 0
+            pbr = pbr or 0
+            change_pct = change_pct or 0
+
+            # 가치주: 저PER + 저PBR
+            if 0 < per <= 15 and 0 < pbr <= 1.2:
+                return "value"
+            # 단타: 당일 +5% 이상 급등 (모멘텀)
+            if change_pct >= 5.0:
+                return "daytrading"
+            # 그 외: 스윙
+            return "swing"
+        except Exception:
+            return None
+
     def execute_signal(self, signal: dict, current_prices: dict) -> list[dict]:
         """LLM 시그널을 기반으로 주문 실행.
 
@@ -121,6 +155,22 @@ class OrderExecutor:
         signal_json: str,
         strategy_type: str = "swing",
     ) -> dict | None:
+        # 시초가 30분 매수 차단 (단타 제외) — 시초가 변동성 함정 회피
+        from datetime import time as dtime
+        now_t = datetime.now().time()
+        if strategy_type != "daytrading" and dtime(9, 0) <= now_t < dtime(9, 30):
+            logger.info(f"BUY blocked: {name}({ticker}) — 시초가 30분 매수 금지 ({strategy_type})")
+            return None
+
+        # 코드 기반 자동 분류 (LLM 분류 보정)
+        try:
+            corrected = self._auto_classify(ticker)
+            if corrected and corrected != strategy_type:
+                logger.info(f"strategy_type 보정: {name}({ticker}) {strategy_type} → {corrected}")
+                strategy_type = corrected
+        except Exception as e:
+            logger.debug(f"Auto-classify failed for {ticker}: {e}")
+
         # 실시간 현재가 조회 (분석 시점 가격과 괴리 방지)
         if self.mode != "simulation" and self.market_client:
             try:
@@ -134,6 +184,18 @@ class OrderExecutor:
         if current_price <= 0:
             logger.error(f"Invalid current price for {ticker}: {current_price}")
             return None
+
+        # 5분봉 양봉 확인 (단타 제외) — 떨어지는 칼날 차단
+        if strategy_type != "daytrading" and self.mode != "simulation":
+            try:
+                bars = self.market_client.get_minute_ohlcv(ticker, interval="5")
+                if bars and len(bars) >= 1:
+                    last = bars[0]
+                    if last["close"] < last["open"]:
+                        logger.info(f"BUY blocked: {name}({ticker}) — 5분봉 음봉 (O:{last['open']:,} > C:{last['close']:,})")
+                        return None
+            except Exception as e:
+                logger.debug(f"Minute bar check failed for {ticker}: {e}")
 
         # 주문 금액 계산
         total_asset = self.portfolio.total_asset
