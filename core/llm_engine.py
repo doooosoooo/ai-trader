@@ -82,33 +82,155 @@ class LLMEngine:
         prediction_feedback: str = "",
         backtest_feedback: str = "",
     ) -> dict:
-        """시장 분석 및 매매 판단.
+        """시장 분석 및 매매 판단 — 2단계 분석.
 
-        Returns:
-            파싱된 매매 시그널 dict
+        1단계: 빠른 분류 (8종목+ 관심종목 → SELL/HOLD/CANDIDATE)
+        2단계: CANDIDATE 종목만 깊이 분석 → BUY 또는 HOLD 결정
         """
         strategy = self.load_strategy()
+
+        # 1단계: 빠른 필터링
+        triage = self._stage1_triage(
+            strategy, portfolio, market_data, ml_predictions or {},
+            news_summary, screening_context,
+        )
+
+        # 1단계 결과에서 즉시 처리(SELL) + 후보(CANDIDATE) 분리
+        immediate_actions = triage.get("immediate_actions", [])
+        candidates = triage.get("candidates", [])
+
+        # 2단계: 후보 종목만 깊이 분석
+        deep_actions = []
+        if candidates:
+            deep = self._stage2_deep_analysis(
+                strategy, portfolio, market_data, ml_predictions or {},
+                news_summary, macro_data or {}, candidates,
+                prediction_feedback, backtest_feedback,
+            )
+            deep_actions = deep.get("actions", [])
+
+        # 결과 통합
+        all_actions = immediate_actions + deep_actions
+
+        # HOLD 종목 자동 추가 (보유 중인데 액션이 없는 종목)
+        action_tickers = {a.get("ticker") for a in all_actions}
+        for ticker in portfolio.get("positions", {}):
+            if ticker not in action_tickers:
+                pos = portfolio["positions"][ticker]
+                all_actions.append({
+                    "type": "HOLD",
+                    "ticker": ticker,
+                    "name": pos.get("name", ticker),
+                    "ratio": 0.0,
+                    "reason": "1단계 분류: 변경 없음",
+                })
+
+        signal = {
+            "actions": all_actions,
+            "reasoning": triage.get("reasoning", "") + " | " + (
+                deep.get("reasoning", "") if candidates else ""
+            ),
+            "risk_assessment": triage.get("risk_assessment", "MEDIUM"),
+            "market_outlook": triage.get("market_outlook", ""),
+            "config_adjustments": [],
+        }
+
+        # 판단 근거 로깅
+        self._log_decision(signal, json.dumps(triage, ensure_ascii=False) + "\n---\n" + json.dumps(deep_actions, ensure_ascii=False))
+
+        return signal
+
+    def _stage1_triage(
+        self, strategy: str, portfolio: dict, market_data: dict,
+        ml_predictions: dict, news_summary: str, screening_context: str,
+    ) -> dict:
+        """1단계: 빠른 분류 — SELL 즉시 결정 + CANDIDATE 선별."""
+        system_prompt = """당신은 한국 주식 매매 시스템의 1단계 분류기입니다.
+주어진 종목들을 빠르게 분류만 합니다. 깊이 분석은 2단계에서 합니다.
+
+매도 가능 조건 (사실 기반만):
+- 손절선 도달 (value -10%, swing -5%, daytrading -3%)
+- 익절 목표 도달 (value +20%, swing +10%, daytrading +5%)
+- 트레일링 스탑 (수익 구간에서 고점 대비 -5%)
+
+JSON 형식으로 응답:
+{
+  "reasoning": "전체 시장 한 줄 요약",
+  "market_outlook": "시장 전망",
+  "risk_assessment": "LOW | MEDIUM | HIGH",
+  "immediate_actions": [
+    {"type": "SELL", "ticker": "종목코드", "name": "종목명", "ratio": 1.0, "reason": "매도 사유"}
+  ],
+  "candidates": ["종목코드1", "종목코드2"]
+}
+
+immediate_actions: 즉시 매도해야 할 보유종목 (사실 기반만)
+candidates: 매수 검토 가치가 있는 워치리스트 종목 (최대 5개)"""
+
+        user_message = self._build_triage_prompt(
+            strategy, portfolio, market_data, ml_predictions, news_summary, screening_context,
+        )
+        raw = self._call_llm(system_prompt, user_message)
+        return self._parse_json_response(raw) or {}
+
+    def _stage2_deep_analysis(
+        self, strategy: str, portfolio: dict, market_data: dict,
+        ml_predictions: dict, news_summary: str, macro_data: dict,
+        candidates: list[str], prediction_feedback: str, backtest_feedback: str,
+    ) -> dict:
+        """2단계: 후보 종목 깊이 분석 → BUY 결정."""
+        # 후보 종목만 필터링
+        candidate_market = {t: market_data.get(t, {}) for t in candidates if t in market_data}
+        candidate_ml = {t: ml_predictions.get(t, {}) for t in candidates if t in ml_predictions}
 
         system_prompt = self._build_system_prompt()
         user_message = self._build_analysis_prompt(
             strategy=strategy,
             portfolio=portfolio,
-            market_data=market_data,
-            ml_predictions=ml_predictions or {},
+            market_data=candidate_market,
+            ml_predictions=candidate_ml,
             news_summary=news_summary,
-            macro_data=macro_data or {},
-            screening_context=screening_context,
+            macro_data=macro_data,
+            screening_context=f"## 2단계 분석 대상\n매수 후보로 1단계에서 선별된 종목들입니다: {candidates}",
             prediction_feedback=prediction_feedback,
             backtest_feedback=backtest_feedback,
         )
+        raw = self._call_llm(system_prompt, user_message)
+        return self._parse_signal(raw)
 
-        raw_response = self._call_llm(system_prompt, user_message)
-        signal = self._parse_signal(raw_response)
-
-        # 판단 근거 로깅
-        self._log_decision(signal, raw_response)
-
-        return signal
+    def _build_triage_prompt(
+        self, strategy: str, portfolio: dict, market_data: dict,
+        ml_predictions: dict, news_summary: str, screening_context: str,
+    ) -> str:
+        """1단계 분류용 간단한 프롬프트."""
+        parts = [
+            "## 전략 (요약)",
+            strategy[:2000],
+            "",
+            "## 포트폴리오",
+            json.dumps(portfolio, ensure_ascii=False, indent=2),
+            "",
+        ]
+        if screening_context:
+            parts.extend([screening_context, ""])
+        parts.extend([
+            "## 시장 데이터",
+            json.dumps(market_data, ensure_ascii=False, indent=2),
+            "",
+        ])
+        if ml_predictions:
+            # ML은 요약만
+            ml_summary = {t: {"prediction": v.get("prediction", ""), "confidence": v.get("confidence", 0)}
+                          for t, v in ml_predictions.items()}
+            parts.extend([
+                "## ML 예측 (요약)",
+                json.dumps(ml_summary, ensure_ascii=False, indent=2, default=str),
+                "",
+            ])
+        if news_summary:
+            parts.extend(["## 뉴스 요약", news_summary[:1000], ""])
+        parts.append("위 정보를 빠르게 분류하세요. immediate_actions에는 즉시 매도할 보유종목, candidates에는 매수 검토할 종목 코드만 나열하세요.")
+        return "\n".join(parts)
 
     def interpret_natural_language(self, user_input: str, current_params: dict) -> dict:
         """자연어 전략 변경 → config 조정 목록 반환."""
