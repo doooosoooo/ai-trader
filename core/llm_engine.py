@@ -101,13 +101,15 @@ class LLMEngine:
 
         # 2단계: 후보 종목만 깊이 분석
         deep_actions = []
+        deep = {}
         if candidates:
             deep = self._stage2_deep_analysis(
                 strategy, portfolio, market_data, ml_predictions or {},
                 news_summary, macro_data or {}, candidates,
                 prediction_feedback, backtest_feedback,
             )
-            deep_actions = deep.get("actions", [])
+            # 2단계에서는 BUY/SELL만 필터링 (HOLD는 제외)
+            deep_actions = [a for a in deep.get("actions", []) if a.get("type", "").upper() in ("BUY", "SELL")]
 
         # 결과 통합
         all_actions = immediate_actions + deep_actions
@@ -127,9 +129,7 @@ class LLMEngine:
 
         signal = {
             "actions": all_actions,
-            "reasoning": triage.get("reasoning", "") + " | " + (
-                deep.get("reasoning", "") if candidates else ""
-            ),
+            "reasoning": triage.get("reasoning", "") + (" | " + deep.get("reasoning", "") if deep else ""),
             "risk_assessment": triage.get("risk_assessment", "MEDIUM"),
             "market_outlook": triage.get("market_outlook", ""),
             "config_adjustments": [],
