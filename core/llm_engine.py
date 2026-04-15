@@ -116,6 +116,7 @@ class LLMEngine:
 
         # HOLD 종목 자동 추가 (보유 중인데 액션이 없는 종목)
         action_tickers = {a.get("ticker") for a in all_actions}
+        hold_reasons = triage.get("hold_reasons", {}) if isinstance(triage.get("hold_reasons"), dict) else {}
         for ticker in portfolio.get("positions", {}):
             if ticker not in action_tickers:
                 pos = portfolio["positions"][ticker]
@@ -124,7 +125,7 @@ class LLMEngine:
                     "ticker": ticker,
                     "name": pos.get("name", ticker),
                     "ratio": 0.0,
-                    "reason": "1단계 분류: 변경 없음",
+                    "reason": hold_reasons.get(ticker, "보유 유지"),
                 })
 
         signal = {
@@ -161,11 +162,15 @@ JSON 형식으로 응답:
   "immediate_actions": [
     {"type": "SELL", "ticker": "종목코드", "name": "종목명", "ratio": 1.0, "reason": "매도 사유"}
   ],
-  "candidates": ["종목코드1", "종목코드2"]
+  "candidates": ["종목코드1", "종목코드2"],
+  "hold_reasons": {
+    "종목코드": "보유 유지 근거 한 줄 (수익률, 추세, 수급 등 사실 기반)"
+  }
 }
 
 immediate_actions: 즉시 매도해야 할 보유종목 (사실 기반만)
-candidates: 매수 검토 가치가 있는 워치리스트 종목 (최대 5개)"""
+candidates: 매수 검토 가치가 있는 워치리스트 종목 (최대 5개)
+hold_reasons: immediate_actions에 없는 모든 보유종목에 대해 한 줄 이유 (왜 HOLD인지)"""
 
         user_message = self._build_triage_prompt(
             strategy, portfolio, market_data, ml_predictions, news_summary, screening_context,
