@@ -44,6 +44,7 @@ class RiskManager:
         self.sim_tracker = sim_tracker
         self.sync_account_fn = sync_account_fn
         self._watchlist: list[str] | None = None  # 스크리닝 관심종목 (외부에서 설정)
+        self._gap_sold_today: dict[str, str] = {}  # {ticker: date_str} 갭상승 익절 중복 방지
 
         # 집중도/드로다운 알림 상태 — 파일 영속화 (PM2 재시작 시 스팸 방지)
         self._concentration_alerted: dict[str, str] = {}
@@ -111,6 +112,22 @@ class RiskManager:
                         f"조기익절 (수익 {pos.pnl_pct:.1%}, "
                         f"고점{pos.peak_price:,.0f}→현재{pos.current_price:,.0f} 하락반전) [{pos.label}]"
                     )
+
+            # 3-B. 갭상승 부분 익절 (장시작 30분 + 코스피 +1.5% + 수익 +3% 이상)
+            # value는 장기 보유이므로 제외, 당일 1회만
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            gap_sold_today = self._gap_sold_today.get(ticker) == today_str
+            if reason is None and pos.strategy_type != "value" and pos.pnl_pct >= 0.03 and not gap_sold_today:
+                now_t = datetime.now().time()
+                from datetime import time as dtime
+                if dtime(9, 0) <= now_t < dtime(9, 30):
+                    kospi_change = self._get_kospi_change_pct()
+                    if kospi_change is not None and kospi_change >= 0.015:
+                        # 부분 매도 (50%) — 갭상승 되돌림 대비
+                        reason = (
+                            f"갭상승익절 (수익 {pos.pnl_pct:.1%}, 코스피 +{kospi_change:.1%} 갭상승) [{pos.label}][PARTIAL:50%]"
+                        )
+                        self._gap_sold_today[ticker] = today_str
 
             # 4. 스크리닝 탈락 + 마이너스 → 즉시 매도 (value 제외)
             if reason is None and self._watchlist is not None:
@@ -183,16 +200,35 @@ class RiskManager:
 
         return results
 
+    def _get_kospi_change_pct(self) -> float | None:
+        """현재 코스피 당일 등락률 조회."""
+        try:
+            import requests
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            resp = requests.get(
+                'https://m.stock.naver.com/api/index/KOSPI/basic',
+                headers=headers, timeout=3,
+            )
+            data = resp.json()
+            return float(data.get('fluctuationsRatio', 0)) / 100
+        except Exception:
+            return None
+
     def _execute_risk_exit(self, ticker: str, pos, reason: str) -> dict | None:
         """리스크 청산 즉시 실행 — 쿨다운/확인 우회."""
         try:
+            # [PARTIAL:X%] 태그로 부분 매도 비율 파싱
+            import re
+            partial_match = re.search(r"\[PARTIAL:(\d+)%\]", reason)
+            ratio = float(partial_match.group(1)) / 100 if partial_match else 1.0
+
             # PnL을 매도 전에 계산 (live 매도 결과에는 pnl이 없으므로)
             pre_pnl = pos.pnl
             pre_pnl_pct = pos.pnl_pct
             result = self.executor._execute_sell(
                 ticker=ticker,
                 name=pos.name,
-                ratio=1.0,
+                ratio=ratio,
                 urgency="high",
                 limit_price=None,
                 current_price=pos.current_price,
