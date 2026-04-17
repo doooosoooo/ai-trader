@@ -151,8 +151,19 @@ class LLMEngine:
 
 매도 가능 조건 (사실 기반만):
 - 손절선 도달 (value -10%, swing -5%, daytrading -3%)
-- 익절 목표 도달 (value +20%, swing +10%, daytrading +5%)
+- 익절 목표 도달 (value +20%, swing +10%, daytrading +5%) — 보유일 무관 즉시 매도
 - 트레일링 스탑 (수익 구간에서 고점 대비 -5%)
+
+⚠️ 포지션 교체(Rotation) 규칙:
+- 보유종목이 max_positions에 도달해도, 더 좋은 매수 후보가 있으면 교체 가능
+- 보유종목 중 rotation_score가 가장 낮고 0 미만인 종목 = 교체 대상
+- 교체 대상은 immediate_actions에 SELL로 넣고, 대체할 종목을 candidates에 넣을 것
+- value 종목은 교체 금지
+
+⚠️ candidates를 반드시 뽑아라:
+- 워치리스트 중 현재 미보유이면서 매수 조건에 부합하는 종목을 최대 5개 선별
+- 보유 포화(max_positions) 상태라도 candidates는 반드시 뽑아야 함 (포지션 교체용)
+- candidates가 비어있으면 2단계 분석이 실행되지 않아 매수 기회를 영원히 놓침
 
 JSON 형식으로 응답:
 {
@@ -168,8 +179,8 @@ JSON 형식으로 응답:
   }
 }
 
-immediate_actions: 즉시 매도해야 할 보유종목 (사실 기반만)
-candidates: 매수 검토 가치가 있는 워치리스트 종목 (최대 5개)
+immediate_actions: 즉시 매도해야 할 보유종목 (사실 기반만 + 교체 대상)
+candidates: 매수 검토 가치가 있는 워치리스트 종목 (최대 5개, 반드시 뽑을 것)
 hold_reasons: immediate_actions에 없는 모든 보유종목에 대해 한 줄 이유 (왜 HOLD인지)"""
 
         user_message = self._build_triage_prompt(
