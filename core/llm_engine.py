@@ -21,9 +21,10 @@ class LLMEngine:
         self.client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         llm_config = config.get("llm", {})
         self.model = llm_config.get("model", "claude-sonnet-4-6")
+        self.model_deep = llm_config.get("model_deep", "claude-opus-4-6")  # 2단계 깊이 분석용
         self.max_tokens = llm_config.get("max_tokens", 2048)
         self.temperature = llm_config.get("temperature", 0.3)
-        self.cost_limit_daily = llm_config.get("cost_limit_daily_usd", 5.0)
+        self.cost_limit_daily = llm_config.get("cost_limit_daily_usd", 10.0)
         self._daily_cost = 0.0
         self._cost_date = ""
         DECISIONS_LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -45,12 +46,13 @@ class LLMEngine:
         cost = (input_tokens * 3 / 1_000_000) + (output_tokens * 15 / 1_000_000)
         self._daily_cost += cost
 
-    def _call_llm(self, system_prompt: str, user_message: str) -> str:
+    def _call_llm(self, system_prompt: str, user_message: str, model: str | None = None) -> str:
         if not self._check_cost_limit():
             raise RuntimeError("LLM daily cost limit reached")
 
+        use_model = model or self.model
         response = self.client.messages.create(
-            model=self.model,
+            model=use_model,
             max_tokens=self.max_tokens,
             temperature=self.temperature,
             system=system_prompt,
@@ -211,7 +213,8 @@ hold_reasons: immediate_actions에 없는 모든 보유종목에 대해 한 줄 
             prediction_feedback=prediction_feedback,
             backtest_feedback=backtest_feedback,
         )
-        raw = self._call_llm(system_prompt, user_message)
+        raw = self._call_llm(system_prompt, user_message, model=self.model_deep)
+        logger.info(f"Stage 2 deep analysis used model: {self.model_deep}")
         return self._parse_signal(raw)
 
     def _build_triage_prompt(
