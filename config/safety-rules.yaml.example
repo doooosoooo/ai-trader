@@ -1,0 +1,67 @@
+# ============================================================
+# AI Trader - 안전장치 규칙 (하드코딩, LLM 변경 불가)
+# ============================================================
+# 이 파일의 값은 LLM이 절대 수정할 수 없습니다.
+# 수정은 사용자가 직접 파일을 편집해야만 가능합니다.
+
+# 포지션 관리
+max_position_ratio: 0.15           # 종목당 최대 총자산의 15%
+max_positions: 8                   # 동시 보유 최대 8종목
+max_single_order_amount: 5000000   # 단일 주문 최대 500만원
+
+# 손실 관리
+max_daily_loss_pct: -0.03          # 일일 -3% → 당일 거래 중단
+emergency_stop_loss_pct: -0.10     # 총자산 -10% → 전체 거래 중단
+
+# 실행 규칙
+trading_hours_only: true           # 장 시간에만 거래
+require_confirmation_above: 10000000  # 1000만원 이상 → Telegram 확인 요청
+cool_down_minutes: 5               # 같은 종목 연속매매 최소 간격
+market_order_max_amount: 1000000   # 시장가 주문 최대 100만원
+
+# LLM 안전
+max_llm_retry: 3                   # LLM 파싱 실패 시 최대 재시도
+skip_on_parse_failure: true        # 파싱 실패 → 해당 사이클 스킵
+
+# trading-params.yaml에서 LLM이 조정 가능한 범위 제한
+# 주의: 여기에 없는 파라미터는 LLM이 변경할 수 없음 (화이트리스트)
+adjustable_limits:
+  take_profit_pct:
+    min: 0.02
+    max: 0.50
+  stop_loss_pct:
+    min: -0.20
+    max: -0.01
+  trailing_stop_pct:
+    min: 0.01
+    max: 0.20
+  position_size_pct:
+    min: 0.03
+    max: 0.15
+  holding_period_days_min:
+    min: 1
+    max: 30
+  holding_period_days_max:
+    min: 1
+    max: 90
+  max_cash_ratio:
+    min: 0.10
+    max: 0.90
+  portfolio_targets_monthly_target_pct:
+    min: 1.0
+    max: 15.0
+  indicators_rsi_oversold:
+    min: 15
+    max: 45
+  indicators_rsi_overbought:
+    min: 55
+    max: 85
+  indicators_volume_surge_multiplier:
+    min: 1.0
+    max: 10.0
+  indicators_ma_short:
+    min: 3
+    max: 60
+  indicators_ma_long:
+    min: 20
+    max: 200

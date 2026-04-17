@@ -1,0 +1,52 @@
+system:
+  mode: simulation    # live로 변경 시 실제 매매 실행됨 (주의!)
+  timezone: Asia/Seoul
+  log_level: INFO
+  db_path: data/storage/trader.db
+schedule:
+  data_collection_interval: 5
+  llm_analysis_interval: 15
+  news_check_interval: 30
+  market_open: 09:00
+  market_close: '15:30'
+ml:
+  training_mode: batch
+  retrain_schedule: daily
+  models:
+    price_direction: true
+    market_regime: true
+    anomaly_detection: true
+  lookback_days: 120
+  feature_window: 20
+llm:
+  model: claude-sonnet-4-6
+  max_tokens: 4096
+  temperature: 0.3
+  cost_limit_daily_usd: 5.0
+  max_retries: 3
+  timeout_seconds: 30
+broker:
+  provider: kis
+  account_type: virtual    # real로 변경 시 실전 계좌 사용
+  base_url_virtual: https://openapivts.koreainvestment.com:29443
+  base_url_real: https://openapi.koreainvestment.com:9443
+  ws_url_virtual: ws://ops.koreainvestment.com:31000
+  ws_url_real: ws://ops.koreainvestment.com:21000
+telegram:
+  enabled: true
+  alert_levels:
+  - trade_executed
+  - signal_generated
+  - llm_analysis
+  - circuit_breaker
+  - daily_report
+  - confirmation_required
+  - strategy_suggestion
+  - screening_result
+  - error
+  - risk_exit
+  - concentration_alert
+  - drawdown_alert
+  - backtest_result
+  - unfilled_order
+  confirmation_timeout_seconds: 300

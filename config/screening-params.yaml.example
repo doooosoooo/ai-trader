@@ -1,0 +1,39 @@
+# ============================================================
+# AI Trader - 종목 스크리닝 설정
+# ============================================================
+
+screening:
+  enabled: true
+  markets: ["KOSPI", "KOSDAQ"]
+  kosdaq_top_n: 500                        # KOSDAQ 시총 상위 N개만 대상
+  max_watchlist_size: 15                   # 스크리너 최종 관심종목 수
+  always_include_held: true                # 보유종목 항상 포함
+
+  # Stage 1: 사전 필터 (제거 조건)
+  filters:
+    min_market_cap: 200_000_000_000        # 최소 시가총액 2천억원
+    min_trading_value_20d: 3_000_000_000   # 최소 20일 평균 거래대금 30억원
+    min_price: 1000                        # 최소 주가 1000원
+    max_per: 200                           # PER 200 이상 제외
+    min_per: -50                           # PER -50 이하 제외 (극단적 적자만 제외)
+
+  # Stage 2: 스코어링 가중치 (모멘텀 중심 — 상승장 대응)
+  scoring:
+    momentum:
+      weight: 0.35                         # 최근 상승세 강한 종목 우선
+      lookback_days: 20
+    value:
+      weight: 0.10                         # 밸류 비중 축소 (가치주 편향 방지)
+    volume:
+      weight: 0.20                         # 거래량 급증 종목 포착
+      surge_threshold: 2.0
+    investor_flow:
+      weight: 0.20
+      lookback_days: 5
+    technical:
+      weight: 0.15
+      rsi_sweet_spot: [30, 50]
+
+  # 수동 제외/포함
+  exclude_tickers: []                      # 항상 제외할 종목코드
+  include_tickers: []                      # 항상 포함할 종목코드
