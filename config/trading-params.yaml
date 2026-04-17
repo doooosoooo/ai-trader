@@ -1,29 +1,29 @@
 holding_period_days:
+  max: 14
   min: 3
-  max: 40
-take_profit_pct: 0.25
-stop_loss_pct: -0.05
-trailing_stop_pct: 0.1
-position_size_pct: 0.13
-max_cash_ratio: 0.2
 indicators:
-  rsi_oversold: 35
-  rsi_overbought: 75
-  volume_surge_multiplier: 1.5
-  ma_short: 20
-  ma_long: 120
-  macd_fast: 12
-  macd_slow: 26
-  macd_signal: 9
   bb_period: 20
   bb_std: 2.0
+  ma_long: 120
+  ma_short: 20
+  macd_fast: 12
+  macd_signal: 9
+  macd_slow: 26
+  rsi_overbought: 75
+  rsi_oversold: 40
+  volume_surge_multiplier: 1.5
+market_conditions:
+  kospi_drop_threshold: -0.02
+  vix_high_threshold: 25
+max_cash_ratio: 0.2
 portfolio_targets:
   monthly_target_pct: 7.0
-  yearly_target_pct: 50.0
   on_target_reached: maintain
   on_underperform: maintain
-market_conditions:
-  vix_high_threshold: 25
-  kospi_drop_threshold: -0.02
-unfilled_cancel_threshold_pct: 0.01   # 1% 가격 이탈 시 미체결 취소
-unfilled_resubmit: true                # 취소 후 현재가 재주문
+  yearly_target_pct: 50.0
+position_size_pct: 0.13
+stop_loss_pct: -0.07
+take_profit_pct: 0.2
+trailing_stop_pct: 0.1
+unfilled_cancel_threshold_pct: 0.01
+unfilled_resubmit: true
