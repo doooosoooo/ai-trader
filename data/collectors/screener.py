@@ -486,7 +486,7 @@ class StockScreener:
         result = {"per": None, "foreign_net": 0, "institution_net": 0,
                   "rsi_14": 50.0, "ma5_above_ma20": False, "price_vs_ma20": 0.0,
                   "volume_trend": 1.0, "week52_position": 0.5, "pbr": None,
-                  "consecutive_up_days": 0}
+                  "consecutive_up_days": 0, "prev_change_pct": None}
 
         # 1) 종합 정보 (PER, 수급, 52주 고저)
         try:
@@ -565,6 +565,10 @@ class StockScreener:
                         break
                 result["consecutive_up_days"] = up_days
 
+                # 전일 등락률 (장 시작 전 스크리닝 시 오늘 change_pct=0인 문제 보완)
+                if len(closes) >= 2 and closes[-2] > 0:
+                    result["prev_change_pct"] = (closes[-1] - closes[-2]) / closes[-2] * 100
+
         except Exception as e:
             logger.debug(f"Price data fetch failed for {ticker}: {e}")
 
@@ -601,6 +605,10 @@ class StockScreener:
             s["volume_trend"] = detail.get("volume_trend", 1.0)
             s["week52_position"] = detail.get("week52_position", 0.5)
             s["consecutive_up_days"] = detail.get("consecutive_up_days", 0)
+            # 장 시작 전 스크리닝 시 change_pct=0이면 전일 등락률로 대체 (모멘텀 점수 정상화)
+            prev_pct = detail.get("prev_change_pct")
+            if prev_pct is not None and abs(s.get("change_pct", 0)) < 0.01:
+                s["change_pct"] = prev_pct
             if (i + 1) % 10 == 0:
                 logger.info(f"Screening detail: {i + 1}/{min(max_stocks, len(stocks))}")
             time.sleep(0.2)  # rate limit
