@@ -22,8 +22,6 @@ portfolio_targets:
   on_underperform: maintain
   yearly_target_pct: 50.0
 position_size_pct: 0.13
-stop_loss_pct: -0.07
-take_profit_pct: 0.2
-trailing_stop_pct: 0.1
+trailing_stop_pct: 0.05
 unfilled_cancel_threshold_pct: 0.01
 unfilled_resubmit: true

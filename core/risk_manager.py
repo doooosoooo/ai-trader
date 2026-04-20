@@ -81,9 +81,8 @@ class RiskManager:
         해당 조건 발생 시 텔레그램 확인 없이 즉시 매도.
         """
         params = self.config_manager.trading_params
-        stop_loss_pct = params.get("stop_loss_pct", -0.07)
         trailing_stop_pct = params.get("trailing_stop_pct", 0.06)
-        max_hold_days = params.get("hold_period_days", {}).get("max", 20)
+        max_hold_days = params.get("holding_period_days", {}).get("max", 20)
 
         results = []
         for ticker, pos in list(self.portfolio.positions.items()):
@@ -96,8 +95,8 @@ class RiskManager:
             if pos.pnl_pct <= pos_sl:
                 reason = f"하드손절 ({pos.pnl_pct:.1%} ≤ {pos_sl:.0%}) [{pos.label}]"
 
-            # 2. 트레일링 스탑 (수익 구간에서만 적용)
-            if reason is None and pos.peak_price > pos.avg_price:
+            # 2. 트레일링 스탑 (수익 구간에서만 적용, avg_price=0 포지션은 스킵)
+            if reason is None and pos.avg_price > 0 and pos.peak_price > pos.avg_price:
                 drawdown = (pos.peak_price - pos.current_price) / pos.peak_price
                 if drawdown >= trailing_stop_pct:
                     reason = (

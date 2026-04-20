@@ -1078,7 +1078,7 @@ class TelegramBot:
             msg += (
                 f"\n{'─' * 24}\n"
                 "변경: /param &lt;키&gt; &lt;값&gt;\n"
-                "예: /param take_profit_pct 0.20\n"
+                "예: /param position_size_pct 0.13\n"
                 "범위 초과 시 확인 후 강제 적용 가능"
             )
             await update.message.reply_html(msg)
@@ -1088,7 +1088,7 @@ class TelegramBot:
         if len(args) < 2:
             await update.message.reply_text(
                 "사용법: /param <키> <값>\n"
-                "예: /param take_profit_pct 0.20\n"
+                "예: /param position_size_pct 0.13\n"
                 "목록 보기: /param"
             )
             return
@@ -1245,10 +1245,6 @@ class TelegramBot:
                 tp_path = Path(__file__).parent.parent / "config" / "trading-params.yaml"
                 with open(tp_path) as f:
                     tp = yaml.safe_load(f)
-                if "take_profit_pct" in params:
-                    tp["take_profit_pct"] = params["take_profit_pct"]
-                if "stop_loss_pct" in params:
-                    tp["stop_loss_pct"] = -abs(params["stop_loss_pct"])
                 if "position_size_pct" in params:
                     tp["position_size_pct"] = params["position_size_pct"]
                 if "max_hold_days" in params:

@@ -390,9 +390,8 @@ class TradingSystem:
 
             # 포지션별 리스크 컨텍스트 추가 (보유일수, 손절거리, 트레일링, 비중)
             t_params = self.config_manager.trading_params
-            sl_pct = t_params.get("stop_loss_pct", -0.07)
             ts_pct = t_params.get("trailing_stop_pct", 0.06)
-            max_hold = t_params.get("hold_period_days", {}).get("max", 20)
+            max_hold = t_params.get("holding_period_days", {}).get("max", 20)
             total_asset = self.portfolio.total_asset or 1
 
             for ticker, pos_dict in portfolio_summary.get("positions", {}).items():
@@ -402,7 +401,8 @@ class TradingSystem:
                 bought = datetime.fromisoformat(pos.bought_at)
                 days_held = (datetime.now().date() - bought.date()).days
                 weight = pos.market_value / total_asset
-                dist_to_sl = pos.pnl_pct - sl_pct  # 양수 = 손절까지 여유
+                pos_sl = pos.rules["stop_loss"]  # strategy_type별 손절선
+                dist_to_sl = pos.pnl_pct - pos_sl  # 양수 = 손절까지 여유
                 trailing_dd = (pos.peak_price - pos.current_price) / pos.peak_price if pos.peak_price > 0 else 0
 
                 pos_dict["days_held"] = days_held

@@ -290,6 +290,8 @@ class Portfolio:
         strategy_type: str = "swing",
     ) -> dict:
         """매수 실행 기록."""
+        if price <= 0:
+            raise ValueError(f"Invalid buy price for {ticker}: {price} (avg_price=0 포지션 생성 방지)")
         amount = quantity * price + fee
         if amount > self.cash:
             raise ValueError(f"Insufficient cash: need {amount:,.0f}, have {self.cash:,.0f}")

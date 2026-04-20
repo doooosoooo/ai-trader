@@ -26,8 +26,8 @@ logger.add(sys.stdout, level="INFO", format="<green>{time:YYYY-MM-DD HH:mm:ss}</
 logger.add(
     "logs/optimizer.log",
     level="DEBUG",
-    rotation="10 MB",
-    retention="14 days",
+    rotation="50 MB",
+    retention="3 days",
     format="{time:YYYY-MM-DD HH:mm:ss} | {level: <7} | {message}",
 )
 

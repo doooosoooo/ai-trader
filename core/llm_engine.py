@@ -51,10 +51,10 @@ class LLMEngine:
             raise RuntimeError("LLM daily cost limit reached")
 
         use_model = model or self.model
+        # Opus 4.7부터 temperature 파라미터 deprecated (400 에러). SDK default 사용.
         response = self.client.messages.create(
             model=use_model,
             max_tokens=self.max_tokens,
-            temperature=self.temperature,
             system=system_prompt,
             messages=[{"role": "user", "content": user_message}],
         )
@@ -258,8 +258,6 @@ hold_reasons: immediate_actions에 없는 모든 보유종목에 대해 한 줄 
 
 현재 조정 가능한 파라미터:
 - holding_period_days.min / holding_period_days.max: 보유 기간
-- take_profit_pct: 익절 비율 (0.02~0.50)
-- stop_loss_pct: 손절 비율 (-0.20~-0.01)
 - trailing_stop_pct: 트레일링 스톱 (null이면 미사용)
 - position_size_pct: 포지션 크기 (0.03~0.15)
 - max_cash_ratio: 최소 현금 비중 (0.10~0.90)
