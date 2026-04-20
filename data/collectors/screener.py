@@ -309,7 +309,8 @@ class StockScreener:
 
     def _score_momentum(self, df: pd.DataFrame, scoring: dict) -> pd.Series:
         """모멘텀 점수: 등락률 + 이동평균 추세 + 연속 상승일."""
-        pct = df["change_pct"].fillna(0)
+        # 단일일 급등락에 과점수 주는 것 방지(추격매수 리스크 완화): ±5% 하드캡
+        pct = df["change_pct"].fillna(0).clip(-5.0, 5.0)
         # 등락률 백분위 (40%)
         lower = pct.quantile(0.05)
         upper = pct.quantile(0.95)
