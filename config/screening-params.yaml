@@ -17,23 +17,26 @@ screening:
     max_per: 200                           # PER 200 이상 제외
     min_per: -50                           # PER -50 이하 제외 (극단적 적자만 제외)
 
-  # Stage 2: 스코어링 가중치 (모멘텀 중심 — 상승장 대응)
+  # Stage 2: 스코어링 가중치 (균형 — buy-high sell-low 패턴 완화 위해 momentum 완화 + value 회복)
   scoring:
     momentum:
-      weight: 0.35                         # 최근 상승세 강한 종목 우선
+      weight: 0.35                         # 추세 추종 가중치 완화 (이전 0.50은 고점매수 편향 강화)
       lookback_days: 20
     value:
-      weight: 0.10                         # 밸류 비중 축소 (가치주 편향 방지)
+      weight: 0.20                         # 저평가 가산점 회복 (좋은 가격 매수 유도)
     volume:
       weight: 0.20                         # 거래량 급증 종목 포착
       surge_threshold: 2.0
     investor_flow:
-      weight: 0.20
+      weight: 0.10                         # 외국인/기관 매수 (금융주 만점 편향 방지 위해 낮게 유지)
       lookback_days: 5
     technical:
       weight: 0.15
-      rsi_sweet_spot: [30, 50]
+      rsi_sweet_spot: [40, 65]             # 강세 추세 허용
 
   # 수동 제외/포함
   exclude_tickers: []                      # 항상 제외할 종목코드
-  include_tickers: []                      # 항상 포함할 종목코드
+  include_tickers:                         # 항상 포함할 종목코드 (AI/반도체 강세주 강제 후보화)
+    - "000660"  # SK하이닉스
+    - "005930"  # 삼성전자
+    - "042700"  # 한미반도체

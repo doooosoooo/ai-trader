@@ -7,7 +7,8 @@
 # 포지션 관리
 max_position_ratio: 0.15           # 종목당 최대 총자산의 15%
 max_positions: 8                   # 동시 보유 최대 8종목
-max_single_order_amount: 5000000   # 단일 주문 최대 500만원
+max_sector_positions: 2            # 동일 섹터 최대 2종목 (섹터 쏠림 방지, sector-mapping.yaml 매핑 기반)
+max_single_order_amount: 7000000   # 단일 주문 최대 700만원 (5M→7M, position_size_pct 0.13과 한도 모순 해소)
 
 # 손실 관리
 max_daily_loss_pct: -0.03          # 일일 -3% → 당일 거래 중단
@@ -18,6 +19,7 @@ trading_hours_only: true           # 장 시간에만 거래
 require_confirmation_above: 10000000  # 1000만원 이상 → Telegram 확인 요청
 cool_down_minutes: 5               # 같은 종목 연속매매 최소 간격
 market_order_max_amount: 1000000   # 시장가 주문 최대 100만원
+rebuy_cooldown_trading_days: 2     # 매도 후 동일 종목 재매수까지 최소 거래일 (LLM 무시 방지 코드 차단)
 
 # LLM 안전
 max_llm_retry: 3                   # LLM 파싱 실패 시 최대 재시도

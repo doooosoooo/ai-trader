@@ -81,7 +81,8 @@ class RiskManager:
         해당 조건 발생 시 텔레그램 확인 없이 즉시 매도.
         """
         params = self.config_manager.trading_params
-        trailing_stop_pct = params.get("trailing_stop_pct", 0.06)
+        default_trailing_stop_pct = params.get("trailing_stop_pct", 0.06)
+        sector_trailing_stop = params.get("trailing_stop_by_sector", {}) or {}
         max_hold_days = params.get("holding_period_days", {}).get("max", 20)
 
         results = []
@@ -91,17 +92,23 @@ class RiskManager:
             pos_sl = rules["stop_loss"]
             pos_tp = rules["take_profit"]
 
+            # 종목 섹터 → 섹터별 트레일링 스탑 (변동성 차등). 매핑 없으면 default.
+            sector = self.safety_guard.get_sector(ticker) if hasattr(self.safety_guard, "get_sector") else None
+            trailing_stop_pct = sector_trailing_stop.get(sector, default_trailing_stop_pct) if sector else default_trailing_stop_pct
+
             # 1. 하드 손절 (strategy_type별 다른 손절선)
             if pos.pnl_pct <= pos_sl:
                 reason = f"하드손절 ({pos.pnl_pct:.1%} ≤ {pos_sl:.0%}) [{pos.label}]"
 
             # 2. 트레일링 스탑 (수익 구간에서만 적용, avg_price=0 포지션은 스킵)
+            #    섹터별 변동성 기반 스탑 적용 (반도체/2차전지=10%, 금융=5% 등)
             if reason is None and pos.avg_price > 0 and pos.peak_price > pos.avg_price:
                 drawdown = (pos.peak_price - pos.current_price) / pos.peak_price
                 if drawdown >= trailing_stop_pct:
+                    sector_label = f" [{sector} {trailing_stop_pct:.0%}]" if sector and sector in sector_trailing_stop else ""
                     reason = (
                         f"트레일링스탑 (고점{pos.peak_price:,.0f}"
-                        f"→현재{pos.current_price:,.0f}, -{drawdown:.1%}) [{pos.label}]"
+                        f"→현재{pos.current_price:,.0f}, -{drawdown:.1%}){sector_label} [{pos.label}]"
                     )
 
             # 3. 조기 익절 (수익 +5% 이상이면서 고점 대비 -5% 하락 시)

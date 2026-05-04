@@ -72,7 +72,11 @@ class TradingSystem:
         self.market_client = MarketDataClient(self.kis_auth)
 
         # Core
-        self.safety_guard = SafetyGuard(safety_rules, trading_params)
+        self.safety_guard = SafetyGuard(
+            safety_rules,
+            trading_params,
+            db_path=settings.get("system", {}).get("db_path", "data/storage/trader.db"),
+        )
         self.circuit_breaker = CircuitBreaker(
             safety_rules,
             notify_callback=lambda **kw: self._notify(**kw),

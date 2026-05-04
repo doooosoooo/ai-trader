@@ -331,7 +331,10 @@ class OrderExecutor:
         if self.config.get("broker", {}).get("account_type") == "virtual":
             tr_id = "VTTC0802U"  # 모의 매수
 
-        ord_type = "00"  # 지정가 (KIS: 00=지정가, 01=시장가)
+        # KIS: 00=지정가, 01=시장가. urgency="market"일 때만 시장가 사용.
+        is_market = urgency == "market"
+        ord_type = "01" if is_market else "00"
+        ord_unpr = "0" if is_market else str(int(price))
 
         body = {
             "CANO": self.auth.account_no[:8],
@@ -339,7 +342,7 @@ class OrderExecutor:
             "PDNO": ticker,
             "ORD_DVSN": ord_type,
             "ORD_QTY": str(quantity),
-            "ORD_UNPR": str(int(price)),
+            "ORD_UNPR": ord_unpr,
         }
 
         try:
@@ -395,7 +398,10 @@ class OrderExecutor:
         if self.config.get("broker", {}).get("account_type") == "virtual":
             tr_id = "VTTC0801U"  # 모의 매도
 
-        ord_type = "00"  # 지정가 (KIS: 00=지정가, 01=시장가)
+        # KIS: 00=지정가, 01=시장가. urgency="market"일 때만 시장가 사용.
+        is_market = urgency == "market"
+        ord_type = "01" if is_market else "00"
+        ord_unpr = "0" if is_market else str(int(price))
 
         # 포지션 이름 가져오기
         pos = self.portfolio.positions.get(ticker)
@@ -407,7 +413,7 @@ class OrderExecutor:
             "PDNO": ticker,
             "ORD_DVSN": ord_type,
             "ORD_QTY": str(quantity),
-            "ORD_UNPR": str(int(price)),
+            "ORD_UNPR": ord_unpr,
         }
 
         try:

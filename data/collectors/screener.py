@@ -358,45 +358,62 @@ class StockScreener:
         return score.fillna(50)
 
     def _score_technical(self, df: pd.DataFrame, scoring: dict) -> pd.Series:
-        """기술적 점수: RSI + 20일선 대비 위치 + 52주 위치."""
-        sweet = scoring.get("technical", {}).get("rsi_sweet_spot", [30, 50])
+        """기술적 점수: RSI + 20일선 대비 위치 + 52주 위치.
 
-        # RSI 점수 (40%): 과매도 탈출 구간(30~50)이 최고, 과매수(70+)는 감점
+        강세 추세 종목(RSI 65~80, 52주 신고가 근처, 20일선 위 멀리)을 페널티 주지 않도록
+        설계. 과매수 극단(RSI 85+)에서만 약하게 감점.
+        """
+        sweet = scoring.get("technical", {}).get("rsi_sweet_spot", [40, 65])
+
+        # RSI 점수 (40%): sweet spot 최고, 강세(65~80) 양호, 극과매수(85+)만 감점
         rsi = df.get("rsi_14", pd.Series([50.0] * len(df))).fillna(50.0)
         rsi_score = pd.Series(np.where(
-            (rsi >= sweet[0]) & (rsi <= sweet[1]), 90,  # 과매도 탈출 = 최고
+            (rsi >= sweet[0]) & (rsi <= sweet[1]), 90,   # sweet spot
             np.where(
-                (rsi > sweet[1]) & (rsi <= 60), 75,     # 중립~약강세
+                (rsi > sweet[1]) & (rsi <= 75), 80,       # 강세 추세 = 양호
                 np.where(
-                    (rsi > 60) & (rsi <= 70), 60,        # 강세 (과매수 접근)
+                    (rsi > 75) & (rsi <= 85), 65,         # 강한 과매수 = 약감점
                     np.where(
-                        rsi > 70, 35,                     # 과매수 = 감점
-                        np.where(rsi < sweet[0], 50, 50)  # 과매도 = 중립 (반등 기대)
+                        rsi > 85, 45,                      # 극단 과매수 = 감점 (이전 35→45)
+                        np.where(
+                            (rsi >= 30) & (rsi < sweet[0]), 60,  # 약세 회복 구간
+                            40                             # RSI 30 미만 = 약세
+                        )
                     )
                 )
             )
         ), index=df.index, dtype=float)
 
-        # 20일선 대비 위치 점수 (30%): 살짝 위(0~5%)가 최적
+        # 20일선 대비 위치 점수 (30%): 추세 상승 종목 보호
         price_ma = df.get("price_vs_ma20", pd.Series([0.0] * len(df))).fillna(0.0) * 100
         ma_pos_score = pd.Series(np.where(
-            (price_ma >= 0) & (price_ma <= 5), 90,      # 20일선 바로 위 = 최고
+            (price_ma >= 0) & (price_ma <= 5), 90,        # 20일선 바로 위 = 최고
             np.where(
-                (price_ma > 5) & (price_ma <= 15), 70,   # 상당히 위
+                (price_ma > 5) & (price_ma <= 15), 80,     # 강한 추세 = 양호 (이전 70→80)
                 np.where(
-                    (price_ma >= -5) & (price_ma < 0), 65,  # 살짝 아래 (눌림목)
-                    np.where(price_ma < -5, 40, 50)       # 크게 아래 = 약세
+                    (price_ma > 15) & (price_ma <= 25), 65,  # 매우 강한 추세 (신규)
+                    np.where(
+                        price_ma > 25, 50,                  # 과열 (신규)
+                        np.where(
+                            (price_ma >= -5) & (price_ma < 0), 65,  # 눌림목
+                            np.where(price_ma < -5, 40, 50)
+                        )
+                    )
                 )
             )
         ), index=df.index, dtype=float)
 
-        # 52주 위치 점수 (30%): 중간~상위(40~70%)가 최적 (추세 + 여력)
+        # 52주 위치 점수 (30%): 신고가 페널티 대폭 완화 — 추세 종목 허용
         w52 = df.get("week52_position", pd.Series([0.5] * len(df))).fillna(0.5)
         w52_score = pd.Series(np.where(
-            (w52 >= 0.3) & (w52 <= 0.7), 80,            # 중간 = 추세 + 상승여력
+            (w52 >= 0.3) & (w52 <= 0.7), 75,              # 중간 = 양호
             np.where(
-                (w52 > 0.7) & (w52 <= 0.85), 60,         # 고점 근처
-                np.where(w52 > 0.85, 35, 55)              # 52주 신고가 근처 = 리스크
+                (w52 > 0.7) & (w52 <= 0.85), 80,           # 고점 근처 = 추세 우수 (이전 60→80)
+                np.where(
+                    (w52 > 0.85) & (w52 <= 0.95), 75,      # 신고가 근처 (이전 35→75)
+                    np.where(w52 > 0.95, 60,               # 52주 정점 직전 (이전 35→60)
+                             55)                            # 저점권
+                )
             )
         ), index=df.index, dtype=float)
 
@@ -533,6 +550,14 @@ class StockScreener:
             resp = self._session.get(url, timeout=5)
             resp.raise_for_status()
             bars = resp.json()
+
+            # 장 시작 전(또는 동시호가)이면 Naver가 오늘 날짜의 "빈/임시 봉"을 보냄.
+            # closePrice = 어제 종가 그대로(fluctuationsRatio="0.00")이면 시간외/동시호가 임시 데이터 →
+            # 이를 제거하지 않으면 closes[-1]=어제 종가, closes[-2]=어제 종가가 되어 모멘텀/등락률이 모두 0.
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            if (bars and bars[0].get("localTradedAt") == today_str
+                    and bars[0].get("fluctuationsRatio", "0") == "0.00"):
+                bars = bars[1:]
 
             if bars and len(bars) >= 14:
                 closes = [self._parse_number(b.get("closePrice", "0")) for b in bars]

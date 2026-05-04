@@ -39,11 +39,31 @@ class LLMEngine:
             return False
         return True
 
-    def _track_cost(self, usage: dict) -> None:
+    # 모델별 가격 (USD per 1M tokens). 새 모델 추가 시 여기에 등록.
+    _MODEL_PRICING = {
+        "claude-opus-4-7": (15.0, 75.0),
+        "claude-opus-4-6": (15.0, 75.0),
+        "claude-sonnet-4-6": (3.0, 15.0),
+        "claude-haiku-4-5": (1.0, 5.0),
+    }
+
+    @classmethod
+    def _resolve_pricing(cls, model: str) -> tuple[float, float]:
+        """모델 이름 → (input_price, output_price) per 1M tokens. 매핑 없으면 Sonnet 기준 fallback."""
+        # 정확 매칭 우선, 그 다음 prefix 매칭 (예: claude-opus-4-7-2026... 같은 변종 대응)
+        if model in cls._MODEL_PRICING:
+            return cls._MODEL_PRICING[model]
+        for known, prices in cls._MODEL_PRICING.items():
+            if model.startswith(known):
+                return prices
+        logger.warning(f"Unknown model pricing for {model}; falling back to Sonnet rates")
+        return (3.0, 15.0)
+
+    def _track_cost(self, usage: dict, model: str) -> None:
         input_tokens = usage.get("input_tokens", 0)
         output_tokens = usage.get("output_tokens", 0)
-        # Sonnet 가격 기준 (대략적)
-        cost = (input_tokens * 3 / 1_000_000) + (output_tokens * 15 / 1_000_000)
+        in_price, out_price = self._resolve_pricing(model)
+        cost = (input_tokens * in_price / 1_000_000) + (output_tokens * out_price / 1_000_000)
         self._daily_cost += cost
 
     def _call_llm(self, system_prompt: str, user_message: str, model: str | None = None) -> str:
@@ -62,7 +82,7 @@ class LLMEngine:
         self._track_cost({
             "input_tokens": response.usage.input_tokens,
             "output_tokens": response.usage.output_tokens,
-        })
+        }, model=use_model)
 
         return response.content[0].text
 

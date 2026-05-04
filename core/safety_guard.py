@@ -1,9 +1,29 @@
 """Safety Guard — LLM 출력과 무관하게 반드시 지켜야 할 하드코딩 규칙."""
 
+import sqlite3
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
+import holidays
+import yaml
 from loguru import logger
+
+_KR_HOLIDAYS = holidays.KR(years=range(2025, 2030))
+
+
+def _trading_days_between(start: datetime, end: datetime) -> int:
+    """start ~ end 사이의 거래일 수 (start 익일부터 end 까지, end 포함)."""
+    if end < start:
+        return 0
+    days = 0
+    cur = start.date() + timedelta(days=1)
+    end_d = end.date()
+    while cur <= end_d:
+        if cur.weekday() < 5 and cur not in _KR_HOLIDAYS:
+            days += 1
+        cur += timedelta(days=1)
+    return days
 
 
 class SafetyViolation:
@@ -22,12 +42,60 @@ class SafetyViolation:
 class SafetyGuard:
     """모든 매매 시그널을 주문 실행 전에 반드시 검증."""
 
-    def __init__(self, safety_rules: dict, trading_params: dict):
+    def __init__(self, safety_rules: dict, trading_params: dict, db_path: str | None = None):
         self.rules = safety_rules
         self.trading_params = trading_params
         self._last_trade_time: dict[str, datetime] = {}  # ticker -> last trade time
         self._daily_pnl: float = 0.0
         self._daily_pnl_date: str = ""
+        # 재매수 쿨다운 검사용 DB 경로 (trade_history 조회)
+        self.db_path = db_path or str(
+            Path(__file__).parent.parent / "data" / "storage" / "trader.db"
+        )
+        # 섹터 매핑 (ticker -> sector). 매핑 없는 종목은 섹터 캡 미적용
+        self._sector_map: dict[str, str] = self._load_sector_map()
+
+    def _load_sector_map(self) -> dict[str, str]:
+        """config/sector-mapping.yaml 로드하여 ticker → sector dict 생성."""
+        mapping_path = Path(__file__).parent.parent / "config" / "sector-mapping.yaml"
+        if not mapping_path.exists():
+            logger.warning(f"sector-mapping.yaml not found at {mapping_path}; sector cap disabled")
+            return {}
+        try:
+            with open(mapping_path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            sectors = data.get("sectors", {})
+            ticker_to_sector: dict[str, str] = {}
+            for sector_name, tickers in sectors.items():
+                for t in tickers or []:
+                    ticker_to_sector[str(t)] = sector_name
+            logger.info(f"Loaded sector mapping: {len(ticker_to_sector)} tickers across {len(sectors)} sectors")
+            return ticker_to_sector
+        except Exception as e:
+            logger.error(f"Failed to load sector-mapping.yaml: {e}")
+            return {}
+
+    def get_sector(self, ticker: str) -> str | None:
+        """종목코드의 섹터 반환. 매핑 없으면 None."""
+        return self._sector_map.get(ticker)
+
+    def _last_sell_for(self, ticker: str) -> tuple[datetime, float] | None:
+        """해당 종목의 가장 최근 SELL 거래 (timestamp, price) 반환. 없으면 None."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    "SELECT timestamp, price FROM trade_history "
+                    "WHERE ticker = ? AND action = 'SELL' "
+                    "ORDER BY timestamp DESC LIMIT 1",
+                    (ticker,),
+                ).fetchone()
+            if not row:
+                return None
+            ts = datetime.fromisoformat(row[0])
+            return ts, float(row[1])
+        except Exception as e:
+            logger.warning(f"_last_sell_for failed for {ticker}: {e}")
+            return None
 
     def validate_signal(
         self,
@@ -112,6 +180,23 @@ class SafetyGuard:
                     index,
                 ))
 
+            # 3.5. 동일 섹터 최대 보유 종목 수 (섹터 쏠림 방지)
+            #     매핑에 등록된 종목만 적용. 신규 매수일 때만 카운트 증가하여 검사.
+            max_sector = self.rules.get("max_sector_positions")
+            if max_sector and not is_existing:
+                target_sector = self._sector_map.get(ticker)
+                if target_sector:
+                    held_in_sector = sum(
+                        1 for held_ticker in portfolio.get("positions", {})
+                        if self._sector_map.get(held_ticker) == target_sector
+                    )
+                    if held_in_sector >= max_sector:
+                        violations.append(SafetyViolation(
+                            "max_sector_positions",
+                            f"{target_sector} 섹터 보유 {held_in_sector}종목 >= 최대 {max_sector}종목",
+                            index,
+                        ))
+
             # 4. 단일 주문 최대 금액
             max_order = self.rules.get("max_single_order_amount", 5_000_000)
             order_amount = total_asset * ratio
@@ -121,6 +206,33 @@ class SafetyGuard:
                     f"주문 금액 {order_amount:,.0f}원 > 최대 {max_order:,.0f}원",
                     index,
                 ))
+
+            # 4.5. 재매수 쿨다운 — 매도 후 N거래일 내 동일 종목 재매수 차단
+            #     LLM 프롬프트(active.md) 규칙을 코드 레벨에서 강제
+            cooldown_days = self.rules.get("rebuy_cooldown_trading_days", 2)
+            last_sell = self._last_sell_for(ticker)
+            if last_sell is not None:
+                sell_ts, sell_price = last_sell
+                elapsed_days = _trading_days_between(sell_ts, datetime.now())
+                if elapsed_days < cooldown_days:
+                    violations.append(SafetyViolation(
+                        "rebuy_cooldown",
+                        f"{ticker} 매도({sell_ts.strftime('%m-%d %H:%M')}) "
+                        f"후 {elapsed_days}거래일 < 쿨다운 {cooldown_days}거래일",
+                        index,
+                    ))
+                # 매도가보다 높은 가격에 같은 날 재매수 금지 (active.md 규칙 D)
+                same_day = sell_ts.date() == datetime.now().date()
+                action_price = action.get("limit_price")
+                # limit_price가 없으면 reference로 매도가 자체 비교는 못 하지만,
+                # 같은 날 재매수 자체가 위험하므로 차단
+                if same_day:
+                    violations.append(SafetyViolation(
+                        "same_day_rebuy",
+                        f"{ticker} 당일 매도({sell_ts.strftime('%H:%M')} "
+                        f"@{sell_price:,.0f}) 후 재매수 차단",
+                        index,
+                    ))
 
         # 5. 쿨다운 (같은 종목 연속 매매 간격)
         cool_down = self.rules.get("cool_down_minutes", 5)
