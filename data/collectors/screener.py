@@ -297,6 +297,13 @@ class StockScreener:
                 "ma5_above_ma20": bool(row.get("ma5_above_ma20", False)),
                 "volume_trend": round(float(row.get("volume_trend", 1.0)), 2),
                 "week52_position": round(float(row.get("week52_position", 0.5)), 2),
+                "price_position_5d": round(float(row.get("price_position_5d", 0.5)), 2),
+                "price_position_20d": round(float(row.get("price_position_20d", 0.5)), 2),
+                "high_5d": int(row.get("high_5d", 0) or 0),
+                "low_5d": int(row.get("low_5d", 0) or 0),
+                "avg_5d": int(row.get("avg_5d", 0) or 0),
+                "high_20d": int(row.get("high_20d", 0) or 0),
+                "low_20d": int(row.get("low_20d", 0) or 0),
                 "composite_score": round(float(row["composite_score"]), 1),
                 "momentum_score": round(float(row["momentum_score"]), 1),
                 "value_score": round(float(row["value_score"]), 1),
@@ -308,7 +315,10 @@ class StockScreener:
         return result
 
     def _score_momentum(self, df: pd.DataFrame, scoring: dict) -> pd.Series:
-        """모멘텀 점수: 등락률 + 이동평균 추세 + 연속 상승일."""
+        """모멘텀 점수: 등락률 + 이동평균 추세 + 연속 상승일.
+
+        buy-high 회피: 5일 고가 -2% 이내 종목은 점수 강하게 감점 (추격매수 차단).
+        """
         # 단일일 급등락에 과점수 주는 것 방지(추격매수 리스크 완화): ±5% 하드캡
         pct = df["change_pct"].fillna(0).clip(-5.0, 5.0)
         # 등락률 백분위 (40%)
@@ -325,7 +335,21 @@ class StockScreener:
         up_days = df.get("consecutive_up_days", pd.Series([0] * len(df))).fillna(0).clip(0, 5)
         up_score = up_days / 5 * 100
 
-        return change_rank * 0.4 + ma_score * 0.3 + up_score * 0.3
+        base = change_rank * 0.4 + ma_score * 0.3 + up_score * 0.3
+
+        # 가격 위치 페널티: 5일 고가 근접도 / 20일 신고가 근접도
+        pp5 = df.get("price_position_5d", pd.Series([0.5] * len(df))).fillna(0.5)
+        pp20 = df.get("price_position_20d", pd.Series([0.5] * len(df))).fillna(0.5)
+
+        # 5일 고가 -2% 이내 (price_position_5d >= 0.95) → -20점
+        # 5일 고가 -5% 이내 (>= 0.85) → -10점
+        penalty_5d = pd.Series(np.where(pp5 >= 0.95, -20.0,
+                                np.where(pp5 >= 0.85, -10.0, 0.0)),
+                                index=df.index, dtype=float)
+        # 20일 신고가 근처 (>= 0.95) → 추가 -10점 (조정 대기 유도)
+        penalty_20d = pd.Series(np.where(pp20 >= 0.95, -10.0, 0.0), index=df.index, dtype=float)
+
+        return (base + penalty_5d + penalty_20d).clip(0, 100)
 
     def _score_value(self, df: pd.DataFrame, scoring: dict) -> pd.Series:
         """밸류 점수: PER 역순 백분위 (낮을수록 좋음)."""
@@ -576,6 +600,29 @@ class StockScreener:
                     current = closes[-1]
                     result["price_vs_ma20"] = (current - ma20) / ma20 if ma20 > 0 else 0
 
+                # 5일 고저 대비 현재 위치 (buy-high 회피 핵심 지표)
+                # 0=5일 저점, 1=5일 고점. 0.85+면 추격매수 위험 구간.
+                if len(closes) >= 5:
+                    high_5d = max(closes[-5:])
+                    low_5d = min(closes[-5:])
+                    result["high_5d"] = high_5d
+                    result["low_5d"] = low_5d
+                    result["price_position_5d"] = (
+                        (closes[-1] - low_5d) / (high_5d - low_5d) if high_5d > low_5d else 0.5
+                    )
+                    # 5일 평균 (limit_price 가이드용)
+                    result["avg_5d"] = sum(closes[-5:]) / 5
+
+                # 20일 고저 대비 현재 위치 (역추세 진입 판단용)
+                if len(closes) >= 20:
+                    high_20d = max(closes[-20:])
+                    low_20d = min(closes[-20:])
+                    result["high_20d"] = high_20d
+                    result["low_20d"] = low_20d
+                    result["price_position_20d"] = (
+                        (closes[-1] - low_20d) / (high_20d - low_20d) if high_20d > low_20d else 0.5
+                    )
+
                 # 거래량 추세: 최근 5일 평균 / 20일 평균
                 if len(volumes) >= 20:
                     vol_5 = sum(volumes[-5:]) / 5
@@ -631,6 +678,14 @@ class StockScreener:
             s["volume_trend"] = detail.get("volume_trend", 1.0)
             s["week52_position"] = detail.get("week52_position", 0.5)
             s["consecutive_up_days"] = detail.get("consecutive_up_days", 0)
+            # 5일/20일 가격 위치 (buy-high 페널티 + LLM limit_price 가이드)
+            s["price_position_5d"] = detail.get("price_position_5d", 0.5)
+            s["price_position_20d"] = detail.get("price_position_20d", 0.5)
+            s["high_5d"] = detail.get("high_5d", 0)
+            s["low_5d"] = detail.get("low_5d", 0)
+            s["avg_5d"] = detail.get("avg_5d", 0)
+            s["high_20d"] = detail.get("high_20d", 0)
+            s["low_20d"] = detail.get("low_20d", 0)
             # 장 시작 전 스크리닝 시 change_pct=0이면 전일 등락률로 대체 (모멘텀 점수 정상화)
             prev_pct = detail.get("prev_change_pct")
             if prev_pct is not None and abs(s.get("change_pct", 0)) < 0.01:

@@ -160,6 +160,17 @@ class SafetyGuard:
                 ))
 
         if action_type == "BUY":
+            # 1.5. 매수가 명시 필수 (buy-high 차단). swing/value는 limit_price 필수, daytrading은 예외
+            strategy_type = action.get("strategy_type", "swing")
+            if strategy_type in ("swing", "value"):
+                limit_price = action.get("limit_price")
+                if limit_price is None or (isinstance(limit_price, (int, float)) and limit_price <= 0):
+                    violations.append(SafetyViolation(
+                        "limit_price_required",
+                        f"{strategy_type} 매수는 limit_price 필수 (시장가 추격매수 차단)",
+                        index,
+                    ))
+
             # 2. 단일 종목 최대 비중
             max_ratio = self.rules.get("max_position_ratio", 0.15)
             if ratio > max_ratio:
