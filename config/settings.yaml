@@ -5,7 +5,7 @@ system:
   db_path: data/storage/trader.db
 schedule:
   data_collection_interval: 3
-  llm_analysis_interval: 5
+  llm_analysis_interval: 10
   news_check_interval: 30
   market_open: 09:00
   market_close: '15:30'
