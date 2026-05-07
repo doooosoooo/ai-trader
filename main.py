@@ -198,7 +198,13 @@ class TradingSystem:
             if t not in watchlist:
                 watchlist.append(t)
 
-        # 2. 스크리너 결과
+        # 2. config include_tickers — 강제 포함 (스크리너 점수 무관)
+        screening_cfg = self.screener.config if self.screener else {}
+        for t in screening_cfg.get("include_tickers", []):
+            if t not in watchlist:
+                watchlist.append(t)
+
+        # 3. 스크리너 결과
         if self.screener:
             result = self.screener.get_last_result()
             if result and result.candidates:
@@ -209,12 +215,6 @@ class TradingSystem:
                     # TICKER_NAMES 동적 확장
                     if ticker not in TICKER_NAMES and c.get("name"):
                         TICKER_NAMES[ticker] = c["name"]
-
-        # 3. config include_tickers
-        screening_cfg = self.screener.config if self.screener else {}
-        for t in screening_cfg.get("include_tickers", []):
-            if t not in watchlist:
-                watchlist.append(t)
 
         # 4. 전략 파일에서 추출 (위에서 부족할 때)
         if len(watchlist) < max_size:

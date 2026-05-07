@@ -23,7 +23,7 @@ llm:
   model_deep: claude-sonnet-4-6   # Stage 2 Deep analysis (Opus 4.7→Sonnet 4.6 다운그레이드, 비용 5배 절감)
   max_tokens: 4096
   temperature: 0.3
-  cost_limit_daily_usd: 5.0       # Stage 2도 Sonnet이라 한도 축소 (실비용 추적 정확화 후 재조정)
+  cost_limit_daily_usd: 10.0      # Stage 2도 Sonnet이라 한도 축소 (실비용 추적 정확화 후 재조정)
   max_retries: 3
   timeout_seconds: 30
 broker:

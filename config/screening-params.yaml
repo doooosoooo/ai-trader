@@ -6,7 +6,7 @@ screening:
   enabled: true
   markets: ["KOSPI", "KOSDAQ"]
   kosdaq_top_n: 500                        # KOSDAQ 시총 상위 N개만 대상
-  max_watchlist_size: 15                   # 스크리너 최종 관심종목 수
+  max_watchlist_size: 18                   # 스크리너 최종 관심종목 수 (보유 5 + include 3 + 스크리너 ~10 수용)
   always_include_held: true                # 보유종목 항상 포함
 
   # Stage 1: 사전 필터 (제거 조건)
