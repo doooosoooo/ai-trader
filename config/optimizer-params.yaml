@@ -6,7 +6,7 @@ schedule:
   db_refresh_before_run: true    # 실행 전 DB 스냅샷 갱신
 
 optimization:
-  default_capital: 60_000_000    # 백테스트 초기 자본 (현재 자산 수준)
+  default_capital: 100_000    # 백테스트 초기 자본 (현재 자산 수준)
   default_start: "20210101"      # 기본 시작일 (5년치)
   sort_by: "sharpe_ratio"        # 정렬 기준 (sharpe_ratio, total_return)
   max_workers: 1                 # 동시 실행 수 (CPU 보호)
