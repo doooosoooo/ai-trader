@@ -97,6 +97,27 @@ class SafetyGuard:
             logger.warning(f"_last_sell_for failed for {ticker}: {e}")
             return None
 
+    def _last_sell_in_sector(self, sector: str) -> tuple[str, datetime] | None:
+        """해당 섹터에서 가장 최근 SELL 거래 (ticker, timestamp) 반환. 없으면 None."""
+        sector_tickers = [t for t, s in self._sector_map.items() if s == sector]
+        if not sector_tickers:
+            return None
+        try:
+            placeholders = ",".join("?" * len(sector_tickers))
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    f"SELECT ticker, timestamp FROM trade_history "
+                    f"WHERE action = 'SELL' AND ticker IN ({placeholders}) "
+                    f"ORDER BY timestamp DESC LIMIT 1",
+                    sector_tickers,
+                ).fetchone()
+            if not row:
+                return None
+            return row[0], datetime.fromisoformat(row[1])
+        except Exception as e:
+            logger.warning(f"_last_sell_in_sector failed for {sector}: {e}")
+            return None
+
     def validate_signal(
         self,
         signal: dict,
@@ -207,6 +228,23 @@ class SafetyGuard:
                             f"{target_sector} 섹터 보유 {held_in_sector}종목 >= 최대 {max_sector}종목",
                             index,
                         ))
+
+            # 3.6. 동일 섹터 매도 후 재매수 쿨다운 (섹터 즉시 회전 차단)
+            #     같은 섹터에서 최근 SELL이 있으면 N거래일간 신규 매수 금지.
+            sector_cooldown = self.rules.get("same_sector_rebuy_cooldown_days")
+            if sector_cooldown and not is_existing:
+                target_sector = self._sector_map.get(ticker)
+                if target_sector:
+                    last_sell = self._last_sell_in_sector(target_sector)
+                    if last_sell:
+                        sold_ticker, sold_ts = last_sell
+                        days_since = _trading_days_between(sold_ts, datetime.now())
+                        if days_since < sector_cooldown:
+                            violations.append(SafetyViolation(
+                                "same_sector_rebuy_cooldown",
+                                f"{target_sector} 섹터 {sold_ticker} 매도 후 {days_since}거래일 < {sector_cooldown}일 쿨다운",
+                                index,
+                            ))
 
             # 4. 단일 주문 최대 금액
             max_order = self.rules.get("max_single_order_amount", 5_000_000)
