@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import requests
+import yaml
 from loguru import logger
 
 DB_DIR = Path(__file__).parent.parent / "storage"
@@ -46,7 +47,26 @@ class StockScreener:
         self._last_result: ScreeningResult | None = None
         self._session = requests.Session()
         self._session.headers.update(NAVER_HEADERS)
+        self._sector_map: dict[str, str] = self._load_sector_map()
         self._init_db()
+
+    def _load_sector_map(self) -> dict[str, str]:
+        """config/sector-mapping.yaml 로드 — 섹터 다양성 가산점 계산용."""
+        mapping_path = Path(__file__).parent.parent.parent / "config" / "sector-mapping.yaml"
+        if not mapping_path.exists():
+            return {}
+        try:
+            with open(mapping_path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            sectors = data.get("sectors", {})
+            ticker_to_sector: dict[str, str] = {}
+            for sector_name, tickers in sectors.items():
+                for t in tickers or []:
+                    ticker_to_sector[str(t)] = sector_name
+            return ticker_to_sector
+        except Exception as e:
+            logger.warning(f"Failed to load sector-mapping.yaml in screener: {e}")
+            return {}
 
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
@@ -102,8 +122,9 @@ class StockScreener:
             logger.info("Screening: fetching detail info for top candidates...")
             self._enrich_with_details(filtered, max_stocks=50)
 
-            # 3. Stage 2: 멀티팩터 스코어링
-            scored = self._stage2_score(filtered)
+            # 3. Stage 2: 멀티팩터 스코어링 (보유 섹터는 -5점, 미보유 섹터 +5점 — 다양화 유도)
+            held_sectors = {s for t in held_tickers if (s := self._sector_map.get(t))}
+            scored = self._stage2_score(filtered, held_sectors=held_sectors)
             stats["after_scoring"] = len(scored)
             logger.info(f"Screening Stage 2: {len(scored)} stocks scored")
 
@@ -247,7 +268,7 @@ class StockScreener:
     # Stage 2: 멀티팩터 스코어링
     # ------------------------------------------------------------------
 
-    def _stage2_score(self, stocks: list[dict]) -> list[dict]:
+    def _stage2_score(self, stocks: list[dict], held_sectors: set[str] | None = None) -> list[dict]:
         """멀티팩터 스코어링 — 0~100점 가중합."""
         if not stocks:
             return []
@@ -276,6 +297,16 @@ class StockScreener:
             + df["flow_score"] * w_flow
             + df["technical_score"] * w_tech
         )
+
+        # 섹터 다양성 보정: 보유 섹터 종목 -5점, 미보유 섹터 종목 +5점
+        # (점수 자체는 의미를 유지하고 정렬에만 영향 — 보정폭 작게)
+        if held_sectors and self._sector_map:
+            def _sector_adj(ticker: str) -> float:
+                sector = self._sector_map.get(str(ticker))
+                if not sector:
+                    return 0.0
+                return -5.0 if sector in held_sectors else 5.0
+            df["composite_score"] = df["composite_score"] + df["ticker"].apply(_sector_adj)
 
         # 점수 순 정렬
         df = df.sort_values("composite_score", ascending=False).reset_index(drop=True)

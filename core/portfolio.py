@@ -17,8 +17,8 @@ class Position:
     # 전략 유형별 규칙
     STRATEGY_RULES = {
         "value":      {"stop_loss": -0.10, "min_hold_days": 10, "screening_dropout_sell": False, "take_profit": 0.20, "label": "💎가치"},
-        "swing":      {"stop_loss": -0.05, "min_hold_days": 3,  "screening_dropout_sell": True,  "take_profit": 0.10, "label": "🔄스윙"},
-        "daytrading": {"stop_loss": -0.03, "min_hold_days": 0,  "screening_dropout_sell": True,  "take_profit": 0.05, "label": "⚡단타"},
+        "swing":      {"stop_loss": -0.05, "min_hold_days": 3,  "screening_dropout_sell": False, "take_profit": 0.10, "label": "🔄스윙"},
+        "daytrading": {"stop_loss": -0.03, "min_hold_days": 0,  "screening_dropout_sell": False, "take_profit": 0.05, "label": "⚡단타"},
     }
 
     def __init__(
