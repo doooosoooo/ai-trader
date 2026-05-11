@@ -283,6 +283,30 @@ class SafetyGuard:
                         index,
                     ))
 
+        # 4.6. LLM 선제 매도 차단: 손실 중인데 손절선 미도달인 SELL은 거부.
+        #      Why: LLM이 dist_to_stop_loss를 "임박"으로 해석해 -3.5~-4%에서 선제 매도하던 패턴 차단.
+        #      익절(수익 중)/실제 손절 도달은 통과.
+        if action_type == "SELL":
+            pos_data = portfolio.get("positions", {}).get(ticker, {})
+            if pos_data:
+                pnl_str = str(pos_data.get("pnl_pct", "0%")).strip().rstrip("%")
+                try:
+                    pnl_pct_val = float(pnl_str) / 100
+                except (ValueError, TypeError):
+                    pnl_pct_val = 0.0
+                from core.portfolio import Position
+                strategy_type = pos_data.get("strategy_type", "swing")
+                stop_loss = Position.STRATEGY_RULES.get(
+                    strategy_type, Position.STRATEGY_RULES["swing"]
+                )["stop_loss"]
+                if pnl_pct_val < 0 and pnl_pct_val > stop_loss:
+                    violations.append(SafetyViolation(
+                        "premature_sell_block",
+                        f"{ticker} 손익 {pnl_pct_val:.2%} > 손절선 {stop_loss:.0%} "
+                        f"— 손절선 미도달 선제 매도 차단",
+                        index,
+                    ))
+
         # 5. 쿨다운 (같은 종목 연속 매매 간격)
         cool_down = self.rules.get("cool_down_minutes", 5)
         last_trade = self._last_trade_time.get(ticker)

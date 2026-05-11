@@ -405,15 +405,14 @@ class TradingSystem:
                 bought = datetime.fromisoformat(pos.bought_at)
                 days_held = (datetime.now().date() - bought.date()).days
                 weight = pos.market_value / total_asset
-                pos_sl = pos.rules["stop_loss"]  # strategy_type별 손절선
-                dist_to_sl = pos.pnl_pct - pos_sl  # 양수 = 손절까지 여유
                 trailing_dd = (pos.peak_price - pos.current_price) / pos.peak_price if pos.peak_price > 0 else 0
 
                 pos_dict["days_held"] = days_held
                 pos_dict["max_hold_days"] = max_hold
                 pos_dict["portfolio_weight"] = f"{weight:.1%}"
                 pos_dict["peak_price"] = pos.peak_price
-                pos_dict["dist_to_stop_loss"] = f"{dist_to_sl:+.1%}"
+                # dist_to_stop_loss는 LLM에 노출하지 않음: "임박" 선제 매도 방지.
+                # 손절은 risk_manager가 실제 도달 시에만 실행.
                 pos_dict["trailing_drawdown"] = f"{trailing_dd:.1%}"
                 pos_dict["trailing_stop_pct"] = f"{ts_pct:.0%}"
                 # 스크리닝 탈락 여부 (관심종목에서 빠졌으면 모멘텀 이탈)
