@@ -193,6 +193,96 @@ def history(ticker: str = typer.Option(None, help="종목코드 필터"), limit:
     console.print(table)
 
 
+# --- 입출금 관리 ---
+
+@app.command()
+def deposit(
+    amount: float = typer.Argument(..., help="입금액(원)"),
+    memo: str = typer.Option("", help="메모"),
+):
+    """입금 이력 기록. 수익률 분모 자동 보정."""
+    if amount <= 0:
+        console.print("[red]금액은 양수여야 합니다.[/]")
+        raise typer.Exit(1)
+    system = _get_system()
+    portfolio = system.portfolio
+    portfolio.record_cash_transaction("deposit", amount, memo=memo)
+    console.print(Panel(
+        f"💰 입금 기록 완료: {amount:,.0f}원\n"
+        f"메모: {memo or '-'}\n"
+        f"누적 순합: {portfolio.net_deposits:+,.0f}원\n"
+        f"수익률 분모: {portfolio.invested_base:,.0f}원\n"
+        f"실수익률: {portfolio.total_pnl_pct * 100:+.2f}%",
+        title="Deposit",
+    ))
+
+
+@app.command()
+def withdraw(
+    amount: float = typer.Argument(..., help="출금액(원)"),
+    memo: str = typer.Option("", help="메모"),
+):
+    """출금 이력 기록."""
+    if amount <= 0:
+        console.print("[red]금액은 양수여야 합니다.[/]")
+        raise typer.Exit(1)
+    system = _get_system()
+    portfolio = system.portfolio
+    portfolio.record_cash_transaction("withdraw", amount, memo=memo)
+    console.print(Panel(
+        f"💸 출금 기록 완료: {amount:,.0f}원\n"
+        f"메모: {memo or '-'}\n"
+        f"누적 순합: {portfolio.net_deposits:+,.0f}원\n"
+        f"수익률 분모: {portfolio.invested_base:,.0f}원\n"
+        f"실수익률: {portfolio.total_pnl_pct * 100:+.2f}%",
+        title="Withdraw",
+    ))
+
+
+@app.command()
+def cashflow(limit: int = typer.Option(20, help="조회 건수")):
+    """입출금 이력 조회."""
+    import sqlite3
+    system = _get_system()
+    portfolio = system.portfolio
+    with sqlite3.connect(portfolio.db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT timestamp, type, amount, memo FROM cash_transactions
+            WHERE mode = ? ORDER BY timestamp DESC LIMIT ?
+            """,
+            (portfolio.mode, limit),
+        ).fetchall()
+
+    console.print(Panel(
+        f"누적 순합: {portfolio.net_deposits:+,.0f}원 | "
+        f"분모: {portfolio.invested_base:,.0f}원 | "
+        f"실수익률: {portfolio.total_pnl_pct * 100:+.2f}%",
+        title="입출금 요약",
+    ))
+
+    if not rows:
+        console.print("[dim]입출금 이력 없음[/]")
+        return
+
+    table = Table(title=f"입출금 이력 (최근 {len(rows)}건)")
+    table.add_column("시간", style="dim")
+    table.add_column("구분")
+    table.add_column("금액", justify="right")
+    table.add_column("메모")
+    for ts, tx_type, amt, memo in rows:
+        style = "green" if tx_type == "deposit" else "red"
+        label = "💰입금" if tx_type == "deposit" else "💸출금"
+        sign = "+" if tx_type == "deposit" else "-"
+        table.add_row(
+            ts[:16],
+            f"[{style}]{label}[/]",
+            f"[{style}]{sign}{amt:,.0f}[/]",
+            memo or "-",
+        )
+    console.print(table)
+
+
 # --- 자연어 전략 변경 ---
 
 @app.command()

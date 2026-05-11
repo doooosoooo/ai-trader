@@ -66,6 +66,9 @@ class TelegramBot:
         self._app.add_handler(CommandHandler("mode_confirm_live", self._cmd_mode_confirm_live))
         self._app.add_handler(CommandHandler("reset", self._cmd_reset))
         self._app.add_handler(CommandHandler("setcapital", self._cmd_setcapital))
+        self._app.add_handler(CommandHandler("deposit", self._cmd_deposit))
+        self._app.add_handler(CommandHandler("withdraw", self._cmd_withdraw))
+        self._app.add_handler(CommandHandler("cashflow", self._cmd_cashflow))
         self._app.add_handler(CommandHandler("orders", self._cmd_orders))
         self._app.add_handler(CommandHandler("trades", self._cmd_trades))
         self._app.add_handler(CommandHandler("analysis", self._cmd_analysis))
@@ -431,6 +434,9 @@ class TelegramBot:
             "/resume - 거래 재개\n"
             "/mode <simulation|live> - 모드 전환\n"
             "/setcapital - 초기자본 설정 (auto/±금액/reset)\n"
+            "/deposit <금액> [메모] - 입금 기록 (수익률 자동 보정)\n"
+            "/withdraw <금액> [메모] - 출금 기록\n"
+            "/cashflow - 입출금 이력 조회\n"
             "/reset - 서킷브레이커 리셋\n\n"
             "자연어로 전략 변경도 가능합니다.\n"
             "예: '단타로 전환해', '현금비중 50%로 올려'"
@@ -710,34 +716,57 @@ class TelegramBot:
 
         arg = args[0].strip().lower()
 
+        # +/- 입출금은 initial_capital을 건드리지 않고 cash_transactions에 기록.
+        # 수익률 분모는 (initial_capital + net_deposits)로 자동 보정됨.
+        if arg.startswith("+") or arg.startswith("-"):
+            try:
+                delta = float(arg.replace(",", ""))
+            except ValueError:
+                await update.message.reply_text("잘못된 금액입니다. 예: /setcapital +20000000")
+                return
+            if delta == 0:
+                await update.message.reply_text("0원은 기록할 수 없습니다.")
+                return
+            tx_type = "deposit" if delta > 0 else "withdraw"
+            portfolio.record_cash_transaction(tx_type, abs(delta), memo="via /setcapital")
+            try:
+                import sqlite3
+                db_path = str(Path(__file__).parent.parent / "data" / "storage" / "trader.db")
+                with sqlite3.connect(db_path) as conn:
+                    conn.execute(
+                        "UPDATE daily_snapshot SET total_asset = total_asset + ? "
+                        "WHERE date = (SELECT MAX(date) FROM daily_snapshot)",
+                        (delta,),
+                    )
+            except Exception as e:
+                logger.warning(f"Snapshot adjustment failed: {e}")
+            base = portfolio.invested_base
+            pnl = portfolio.total_pnl
+            pnl_pct = portfolio.total_pnl_pct * 100
+            label = "💰 입금" if delta > 0 else "💸 출금"
+            await update.message.reply_text(
+                f"✅ {label} 기록 완료\n\n"
+                f"금액: {abs(delta):,.0f}원\n"
+                f"누적 입출금 순합: {portfolio.net_deposits:+,.0f}원\n"
+                f"수익률 분모(초기자본+순입금): {base:,.0f}원\n"
+                f"총자산: {portfolio.total_asset:,.0f}원\n"
+                f"실수익: {pnl:+,.0f}원 ({pnl_pct:+.2f}%)"
+            )
+            return
+
         if arg == "auto":
-            # 투자원금(현금 + 매입금액) 기준
             new_capital = portfolio.cash + sum(
                 p.quantity * p.avg_price for p in portfolio.positions.values()
             )
         elif arg == "reset":
-            # 현재 총자산 기준 (수익률 0%부터 시작)
             new_capital = portfolio.total_asset
-        elif arg.startswith("+") or arg.startswith("-"):
-            # +/- 증감: 입금, 이체, 출금 시 초기자본 조정
-            try:
-                delta = float(arg.replace(",", ""))
-                new_capital = old_capital + delta
-                if new_capital <= 0:
-                    await update.message.reply_text(
-                        f"변경 후 초기자본이 {new_capital:,.0f}원이 됩니다. 0 이하는 불가합니다."
-                    )
-                    return
-            except ValueError:
-                await update.message.reply_text("잘못된 금액입니다. 예: /setcapital +20000000")
-                return
         else:
             try:
                 new_capital = float(arg.replace(",", ""))
                 if new_capital <= 0:
                     raise ValueError
             except ValueError:
-                await update.message.reply_text("잘못된 금액입니다. 숫자 또는 auto/reset을 입력하세요.")
+                await update.message.reply_text("잘못된 금액입니다. 숫자, +/-금액, auto, reset 중 하나를 입력하세요.")
                 return
 
         portfolio.initial_capital = new_capital
@@ -746,26 +775,8 @@ class TelegramBot:
         portfolio._save_state()
         pnl = portfolio.total_asset - new_capital
         pnl_pct = pnl / new_capital * 100 if new_capital > 0 else 0
-
-        # +/- 변경인 경우 delta 표시 포함
         diff = new_capital - old_capital
         delta_str = f" ({diff:+,.0f})" if diff != 0 else ""
-
-        # 입출금 시 전일 스냅샷 보정 (서킷브레이커 오발동 방지)
-        if diff != 0:
-            try:
-                import sqlite3
-                db_path = str(Path(__file__).parent.parent / "data" / "storage" / "trader.db")
-                with sqlite3.connect(db_path) as conn:
-                    # 최근 스냅샷의 total_asset을 입출금 금액만큼 조정
-                    conn.execute(
-                        "UPDATE daily_snapshot SET total_asset = total_asset + ? "
-                        "WHERE date = (SELECT MAX(date) FROM daily_snapshot)",
-                        (diff,),
-                    )
-                logger.info(f"Daily snapshot adjusted by {diff:+,.0f} for capital change")
-            except Exception as e:
-                logger.warning(f"Snapshot adjustment failed: {e}")
 
         await update.message.reply_text(
             f"✅ 초기자본 변경 완료\n\n"
@@ -774,6 +785,118 @@ class TelegramBot:
             f"총자산: {portfolio.total_asset:,.0f}원\n"
             f"수익률: {pnl:+,.0f}원 ({pnl_pct:+.2f}%)"
         )
+
+    async def _record_cash_flow(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        tx_type: str,
+    ) -> None:
+        if not await self._check_auth(update):
+            return
+        if not self.system:
+            await update.message.reply_text("시스템 미연결")
+            return
+
+        args = context.args
+        if not args:
+            label = "입금" if tx_type == "deposit" else "출금"
+            await update.message.reply_text(
+                f"사용법: /{tx_type} <금액> [메모]\n"
+                f"예: /{tx_type} 700000 5월 {label}"
+            )
+            return
+
+        try:
+            amount = float(args[0].replace(",", "").replace("+", "").replace("-", ""))
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("잘못된 금액입니다. 양수 숫자를 입력하세요.")
+            return
+
+        memo = " ".join(args[1:]) if len(args) > 1 else ""
+        portfolio = self.system.portfolio
+        portfolio.record_cash_transaction(tx_type, amount, memo=memo)
+
+        # 입출금은 일일 스냅샷의 total_asset에도 반영되어야 서킷브레이커 오발동 방지.
+        signed = amount if tx_type == "deposit" else -amount
+        try:
+            import sqlite3
+            db_path = str(Path(__file__).parent.parent / "data" / "storage" / "trader.db")
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    "UPDATE daily_snapshot SET total_asset = total_asset + ? "
+                    "WHERE date = (SELECT MAX(date) FROM daily_snapshot)",
+                    (signed,),
+                )
+        except Exception as e:
+            logger.warning(f"Snapshot adjustment failed: {e}")
+
+        label = "💰 입금" if tx_type == "deposit" else "💸 출금"
+        memo_line = f"\n메모: {memo}" if memo else ""
+        await update.message.reply_text(
+            f"✅ {label} 기록 완료\n\n"
+            f"금액: {amount:,.0f}원{memo_line}\n"
+            f"누적 입출금 순합: {portfolio.net_deposits:+,.0f}원\n"
+            f"수익률 분모: {portfolio.invested_base:,.0f}원\n"
+            f"총자산: {portfolio.total_asset:,.0f}원\n"
+            f"실수익률: {portfolio.total_pnl_pct * 100:+.2f}%"
+        )
+
+    async def _cmd_deposit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """입금 기록. /deposit <금액> [메모]"""
+        await self._record_cash_flow(update, context, "deposit")
+
+    async def _cmd_withdraw(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """출금 기록. /withdraw <금액> [메모]"""
+        await self._record_cash_flow(update, context, "withdraw")
+
+    async def _cmd_cashflow(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """입출금 이력 조회. /cashflow [개수]"""
+        if not await self._check_auth(update):
+            return
+        if not self.system:
+            await update.message.reply_text("시스템 미연결")
+            return
+
+        try:
+            limit = int(context.args[0]) if context.args else 20
+        except ValueError:
+            limit = 20
+
+        import sqlite3
+        portfolio = self.system.portfolio
+        with sqlite3.connect(portfolio.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT timestamp, type, amount, memo FROM cash_transactions
+                WHERE mode = ? ORDER BY timestamp DESC LIMIT ?
+                """,
+                (portfolio.mode, limit),
+            ).fetchall()
+
+        if not rows:
+            await update.message.reply_text(
+                "📭 입출금 이력이 없습니다.\n\n"
+                "입금: /deposit <금액> [메모]\n"
+                "출금: /withdraw <금액> [메모]"
+            )
+            return
+
+        lines = [
+            f"📋 <b>입출금 이력</b> (최근 {len(rows)}건)\n",
+            f"누적 순합: <b>{portfolio.net_deposits:+,.0f}원</b>",
+            f"수익률 분모: {portfolio.invested_base:,.0f}원\n",
+        ]
+        for ts, tx_type, amount, memo in rows:
+            date = ts[:10]
+            icon = "💰" if tx_type == "deposit" else "💸"
+            sign = "+" if tx_type == "deposit" else "-"
+            memo_str = f" — {memo}" if memo else ""
+            lines.append(f"{date} {icon} {sign}{amount:,.0f}원{memo_str}")
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     async def _cmd_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """당일 주문 체결 현황 (KIS API 실시간 조회)."""

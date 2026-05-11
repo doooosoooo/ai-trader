@@ -144,6 +144,18 @@ class Portfolio:
                     cumulative_pnl_pct REAL,
                     positions_json TEXT
                 );
+
+                CREATE TABLE IF NOT EXISTS cash_transactions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    type TEXT NOT NULL CHECK(type IN ('deposit', 'withdraw')),
+                    amount REAL NOT NULL CHECK(amount > 0),
+                    memo TEXT,
+                    mode TEXT NOT NULL DEFAULT 'live'
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_cash_tx_timestamp
+                    ON cash_transactions(timestamp);
             """)
 
     def _migrate_db(self) -> None:
@@ -231,14 +243,34 @@ class Portfolio:
         return self.cash + self.total_invested
 
     @property
+    def net_deposits(self) -> float:
+        """입출금 순합(입금 - 출금). cash_transactions 테이블 누적."""
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT COALESCE(SUM(
+                    CASE WHEN type='deposit' THEN amount ELSE -amount END
+                ), 0)
+                FROM cash_transactions WHERE mode = ?
+                """,
+                (self.mode,),
+            ).fetchone()
+        return float(row[0]) if row else 0.0
+
+    @property
+    def invested_base(self) -> float:
+        """수익률 계산용 분모 = 초기자본 + 순입금."""
+        return self.initial_capital + self.net_deposits
+
+    @property
     def total_pnl(self) -> float:
-        return self.total_asset - self.initial_capital
+        return self.total_asset - self.invested_base
 
     @property
     def total_pnl_pct(self) -> float:
-        if self.initial_capital == 0:
+        if self.invested_base == 0:
             return 0.0
-        return self.total_pnl / self.initial_capital
+        return self.total_pnl / self.invested_base
 
     @property
     def cash_ratio(self) -> float:
@@ -387,8 +419,53 @@ class Portfolio:
                 signal_json, self.mode,
             ))
 
+    def record_cash_transaction(
+        self,
+        tx_type: str,
+        amount: float,
+        memo: str = "",
+    ) -> dict:
+        """입출금 이력 기록. 수익률 계산 분모를 즉시 갱신함.
+
+        tx_type: 'deposit' | 'withdraw'
+        amount: 양수 (절대값)
+        memo: 메모 (선택)
+        """
+        if tx_type not in ("deposit", "withdraw"):
+            raise ValueError(f"Invalid tx_type: {tx_type}")
+        if amount <= 0:
+            raise ValueError(f"amount must be positive, got {amount}")
+
+        ts = datetime.now().isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO cash_transactions (timestamp, type, amount, memo, mode)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (ts, tx_type, amount, memo, self.mode),
+            )
+        logger.info(f"Cash {tx_type}: {amount:,.0f} KRW (memo={memo})")
+        return {"timestamp": ts, "type": tx_type, "amount": amount, "memo": memo}
+
+    def _today_net_cash_flow(self) -> float:
+        """오늘 발생한 입출금 순합(입금 - 출금). daily_pnl 보정용."""
+        today_prefix = datetime.now().strftime("%Y-%m-%d")
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT COALESCE(SUM(
+                    CASE WHEN type='deposit' THEN amount ELSE -amount END
+                ), 0)
+                FROM cash_transactions
+                WHERE mode = ? AND timestamp LIKE ?
+                """,
+                (self.mode, f"{today_prefix}%"),
+            ).fetchone()
+        return float(row[0]) if row else 0.0
+
     def save_daily_snapshot(self) -> None:
-        """일일 스냅샷 저장."""
+        """일일 스냅샷 저장. 오늘 입출금분은 일일 PnL에서 제외."""
         today = datetime.now().strftime("%Y-%m-%d")
         positions_json = json.dumps(
             {t: p.to_dict() for t, p in self.positions.items()},
@@ -398,11 +475,14 @@ class Portfolio:
         with sqlite3.connect(self.db_path) as conn:
             # 전일 스냅샷으로 일일 PnL 계산
             prev = conn.execute(
-                "SELECT total_asset FROM daily_snapshot ORDER BY date DESC LIMIT 1"
+                "SELECT total_asset FROM daily_snapshot WHERE date < ? ORDER BY date DESC LIMIT 1",
+                (today,),
             ).fetchone()
             prev_asset = prev[0] if prev else self.initial_capital
-            daily_pnl = self.total_asset - prev_asset
-            daily_pnl_pct = daily_pnl / prev_asset if prev_asset > 0 else 0
+            today_flow = self._today_net_cash_flow()
+            daily_pnl = (self.total_asset - prev_asset) - today_flow
+            base = prev_asset + max(today_flow, 0)
+            daily_pnl_pct = daily_pnl / base if base > 0 else 0
 
             conn.execute("""
                 INSERT INTO daily_snapshot
