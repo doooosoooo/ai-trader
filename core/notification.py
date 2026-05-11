@@ -117,7 +117,7 @@ class NotificationService:
             f"선정: {len(result.candidates)}종목\n\n"
         )
 
-        for i, c in enumerate(result.candidates[:8], 1):
+        for i, c in enumerate(result.candidates, 1):
             name = c.get("name", c["ticker"])
             score = c.get("composite_score", 0)
             change = c.get("change_pct", 0)

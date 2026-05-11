@@ -563,7 +563,7 @@ class TelegramBot:
             if result and result.candidates:
                 ts = result.timestamp[:16].replace("T", " ")
                 msg += f"\n\n{'─' * 24}\n🔍 스크리닝 관심종목 ({ts})\n"
-                for i, c in enumerate(result.candidates[:8], 1):
+                for i, c in enumerate(result.candidates, 1):
                     name = c.get("name", c["ticker"])
                     score = c.get("composite_score", 0)
                     change = c.get("change_pct", 0)
