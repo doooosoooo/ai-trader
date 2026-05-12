@@ -140,6 +140,10 @@ class TradingSystem:
         screening_config = self.config_manager.load_yaml("screening-params.yaml")
         self.screener = StockScreener(screening_config) if screening_config.get("screening", {}).get("enabled", True) else None
 
+        # include_tickers는 LLM 1단계에서 강제 후보화 (LLM이 빠뜨려도 stage 2 분석 보장)
+        include_tickers = screening_config.get("screening", {}).get("include_tickers", []) or []
+        self.llm_engine.set_force_include_tickers(include_tickers)
+
         # Scheduler
         self.trading_scheduler = TradingScheduler(self, settings)
 
