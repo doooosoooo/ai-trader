@@ -19,11 +19,11 @@ ml:
   lookback_days: 120
   feature_window: 20
 llm:
-  model: claude-opus-4-7          # Stage 1 Triage — 강세장 판단 정교화 위해 Opus 복귀 (2026-05-12)
-  model_deep: claude-opus-4-7     # Stage 2 Deep analysis — 매수 후보 심층 분석에 Opus
+  model: claude-sonnet-4-6        # Stage 1 Triage — Sonnet (분류는 가벼운 작업, 비용 절감)
+  model_deep: claude-opus-4-7     # Stage 2 Deep analysis — Opus (매수 후보 심층 분석에는 강력 모델)
   max_tokens: 4096
   temperature: 0.3
-  cost_limit_daily_usd: 30.0      # Opus 5배 단가 + 12분 주기 반영해 한도 상향 ($10→$30)
+  cost_limit_daily_usd: 30.0      # Stage 2만 Opus라 한도는 유지 (Sonnet+Opus 혼합)
   max_retries: 3
   timeout_seconds: 30
 broker:
