@@ -151,7 +151,16 @@ class TradingSystem:
         self._paused = False
         self._running = False
         self._last_report_notify: datetime | None = None  # 마지막 정기 리포트 알림 시각
-        self._cancelled_order_nos: set[str] = set()  # 취소 완료/실패한 주문번호 (반복 방지)
+        self._cancelled_order_nos_file = Path("data/cancelled_orders.txt")
+        self._cancelled_order_nos: set[str] = set()
+        if self._cancelled_order_nos_file.exists():
+            try:
+                self._cancelled_order_nos = {
+                    line.strip() for line in self._cancelled_order_nos_file.read_text().splitlines()
+                    if line.strip()
+                }
+            except Exception as e:
+                logger.warning(f"Failed to load cancelled orders: {e}")
         self._last_analysis: dict | None = self.analysis_store.load_last_analysis()  # 마지막 LLM 분석 결과
         # 스크리닝 캐시가 없거나 오래됐으면(오늘 날짜 아님) 시작 시 즉시 실행
         if self.screener:
@@ -771,7 +780,7 @@ class TradingSystem:
         is_near_close = now.time() >= dtime(15, 20)
 
         try:
-            orders = self.market_client.get_today_orders()
+            orders = self.market_client.get_pending_orders()
         except Exception as e:
             logger.warning(f"Unfilled order check — query failed: {e}")
             return
@@ -841,6 +850,12 @@ class TradingSystem:
                     self._cancelled_order_nos.add(order_no)
                 elif result["action"] == "failed":
                     self._cancelled_order_nos.add(order_no)
+
+        try:
+            self._cancelled_order_nos_file.parent.mkdir(parents=True, exist_ok=True)
+            self._cancelled_order_nos_file.write_text("\n".join(sorted(self._cancelled_order_nos)))
+        except Exception as e:
+            logger.warning(f"Failed to persist cancelled orders: {e}")
 
         if cancelled > 0:
             parts = [f"🔄 미체결 관리: {cancelled}건 취소"]
@@ -993,6 +1008,11 @@ class TradingSystem:
         logger.info("Market opening — initializing")
         self.circuit_breaker.daily_reset()
         self._cancelled_order_nos.clear()
+        try:
+            if self._cancelled_order_nos_file.exists():
+                self._cancelled_order_nos_file.unlink()
+        except Exception as e:
+            logger.warning(f"Failed to clear cancelled orders file: {e}")
         self.config_manager.reload()
         self._watchlist = self._get_watchlist()
 

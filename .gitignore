@@ -10,6 +10,7 @@ data/storage/
 data/*.db
 data/*.json
 data/*.jsonl
+data/cancelled_orders.txt
 ml/models/*.pkl
 ml/models/*.json
 

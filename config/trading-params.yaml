@@ -40,5 +40,5 @@ trailing_stop_by_sector:
   필수소비재: 0.05
   금융: 0.05
   통신: 0.04
-unfilled_cancel_threshold_pct: 0.03
-unfilled_resubmit: false
+unfilled_cancel_threshold_pct: 0.015
+unfilled_resubmit: true

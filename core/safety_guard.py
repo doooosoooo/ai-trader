@@ -323,6 +323,31 @@ class SafetyGuard:
                         index,
                     ))
 
+        # 4.5. 최소 보유 30분 룰: 매수 직후 LLM 자가매도 차단.
+        #      Why: swing_pullback으로 산 종목을 다음 사이클이 swing 표준 잣대로 평가해 청산하는 모순 사례 발생(2026-05-13 NAVER 12분 매도).
+        #      자동 매도(손절/트레일링/보유기간초과)는 reason 키워드로 식별해 통과.
+        if action_type == "SELL":
+            pos_data = portfolio.get("positions", {}).get(ticker, {})
+            if pos_data:
+                reason_text = action.get("reason", "")
+                AUTO_SELL_KEYWORDS = ("하드손절", "트레일링스탑", "조기익절", "갭상승익절", "보유기간초과", "스크리닝탈락")
+                is_auto_sell = any(kw in reason_text for kw in AUTO_SELL_KEYWORDS)
+                if not is_auto_sell:
+                    bought_at_str = pos_data.get("bought_at", "")
+                    if bought_at_str:
+                        try:
+                            bought_at = datetime.fromisoformat(bought_at_str)
+                            held_minutes = (datetime.now() - bought_at).total_seconds() / 60
+                            min_hold_min = self.rules.get("min_hold_minutes_after_buy", 30)
+                            if held_minutes < min_hold_min:
+                                violations.append(SafetyViolation(
+                                    "min_hold_minutes",
+                                    f"{ticker} 매수 후 {held_minutes:.1f}분 < 최소 {min_hold_min}분 — LLM 자가매도 차단",
+                                    index,
+                                ))
+                        except (ValueError, TypeError):
+                            pass
+
         # 4.6. LLM 선제 매도 차단: 손실 중인데 손절선 미도달인 SELL은 거부.
         #      Why: LLM이 dist_to_stop_loss를 "임박"으로 해석해 -3.5~-4%에서 선제 매도하던 패턴 차단.
         #      익절(수익 중)/실제 손절 도달은 통과.
