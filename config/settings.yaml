@@ -5,7 +5,7 @@ system:
   db_path: data/storage/trader.db
 schedule:
   data_collection_interval: 3
-  llm_analysis_interval: 10
+  llm_analysis_interval: 12
   news_check_interval: 30
   market_open: 09:00
   market_close: '15:30'
@@ -19,11 +19,11 @@ ml:
   lookback_days: 120
   feature_window: 20
 llm:
-  model: claude-sonnet-4-6        # Stage 1 Triage (워치리스트 후보 선별, 매 사이클 호출)
-  model_deep: claude-sonnet-4-6   # Stage 2 Deep analysis (Opus 4.7→Sonnet 4.6 다운그레이드, 비용 5배 절감)
+  model: claude-sonnet-4-6        # Stage 1 Triage — Sonnet (분류는 가벼운 작업, 비용 절감)
+  model_deep: claude-opus-4-7     # Stage 2 Deep analysis — Opus (매수 후보 심층 분석에는 강력 모델)
   max_tokens: 4096
   temperature: 0.3
-  cost_limit_daily_usd: 0.5       # Stage 2도 Sonnet이라 한도 축소 (실비용 추적 정확화 후 재조정)
+  cost_limit_daily_usd: 0.5      # Stage 2만 Opus라 한도는 유지 (Sonnet+Opus 혼합)
   max_retries: 3
   timeout_seconds: 30
 broker:

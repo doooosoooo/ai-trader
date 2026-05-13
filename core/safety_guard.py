@@ -80,21 +80,58 @@ class SafetyGuard:
         return self._sector_map.get(ticker)
 
     def _last_sell_for(self, ticker: str) -> tuple[datetime, float] | None:
-        """해당 종목의 가장 최근 SELL 거래 (timestamp, price) 반환. 없으면 None."""
+        """해당 종목의 가장 최근 '자발적' SELL 거래 (timestamp, price) 반환. 없으면 None.
+
+        손절/트레일링/보유기간초과 같은 자동 매도는 제외 — 의도와 무관한 매도까지
+        rebuy_cooldown으로 차단하면 좋은 재매수 기회를 놓침.
+        """
+        AUTO_SELL_KEYWORDS = ("하드손절", "트레일링스탑", "조기익절", "갭상승익절", "보유기간초과", "스크리닝탈락")
         try:
             with sqlite3.connect(self.db_path) as conn:
-                row = conn.execute(
-                    "SELECT timestamp, price FROM trade_history "
+                rows = conn.execute(
+                    "SELECT timestamp, price, reason FROM trade_history "
                     "WHERE ticker = ? AND action = 'SELL' "
-                    "ORDER BY timestamp DESC LIMIT 1",
+                    "ORDER BY timestamp DESC LIMIT 20",
                     (ticker,),
-                ).fetchone()
-            if not row:
-                return None
-            ts = datetime.fromisoformat(row[0])
-            return ts, float(row[1])
+                ).fetchall()
+            for ts_str, price, reason in rows:
+                reason_text = reason or ""
+                if any(kw in reason_text for kw in AUTO_SELL_KEYWORDS):
+                    continue
+                return datetime.fromisoformat(ts_str), float(price)
+            return None
         except Exception as e:
             logger.warning(f"_last_sell_for failed for {ticker}: {e}")
+            return None
+
+    def _last_sell_in_sector(self, sector: str) -> tuple[str, datetime] | None:
+        """해당 섹터에서 가장 최근 '자발적' SELL 거래 (ticker, timestamp) 반환. 없으면 None.
+
+        '자발적' 매도만 카운트 — 손절/트레일링/보유기간초과 같은 자동 매도는 제외.
+        의도가 아닌 매도까지 cooldown 적용하면 적극 매매 차단 부작용 발생.
+        """
+        sector_tickers = [t for t, s in self._sector_map.items() if s == sector]
+        if not sector_tickers:
+            return None
+        # 자동 매도 사유 키워드 — 이 키워드가 reason에 포함되면 cooldown 제외
+        AUTO_SELL_KEYWORDS = ("하드손절", "트레일링스탑", "조기익절", "갭상승익절", "보유기간초과", "스크리닝탈락")
+        try:
+            placeholders = ",".join("?" * len(sector_tickers))
+            with sqlite3.connect(self.db_path) as conn:
+                rows = conn.execute(
+                    f"SELECT ticker, timestamp, reason FROM trade_history "
+                    f"WHERE action = 'SELL' AND ticker IN ({placeholders}) "
+                    f"ORDER BY timestamp DESC LIMIT 20",
+                    sector_tickers,
+                ).fetchall()
+            for ticker, ts_str, reason in rows:
+                reason_text = reason or ""
+                if any(kw in reason_text for kw in AUTO_SELL_KEYWORDS):
+                    continue  # 자동 매도는 제외
+                return ticker, datetime.fromisoformat(ts_str)
+            return None
+        except Exception as e:
+            logger.warning(f"_last_sell_in_sector failed for {sector}: {e}")
             return None
 
     def validate_signal(
@@ -119,6 +156,30 @@ class SafetyGuard:
         for i, action in enumerate(actions):
             action_violations = self._validate_action(action, portfolio, total_asset, i)
             violations.extend(action_violations)
+
+        # 사이클 레벨 검증: 동일 섹터 BUY 다중 진입 차단 (섹터 집중 방지)
+        max_same_sector_buys = self.rules.get("max_same_sector_buys_per_cycle")
+        if max_same_sector_buys and max_same_sector_buys > 0:
+            sector_buys: dict[str, list[int]] = {}
+            for i, action in enumerate(actions):
+                if action.get("type", "").upper() != "BUY":
+                    continue
+                sector = self._sector_map.get(action.get("ticker", ""))
+                if not sector:
+                    continue
+                sector_buys.setdefault(sector, []).append(i)
+            for sector, indices in sector_buys.items():
+                if len(indices) <= max_same_sector_buys:
+                    continue
+                # ratio 큰 순서대로 우선순위 부여, 상위 max_same_sector_buys개만 통과
+                sorted_idx = sorted(indices, key=lambda j: -actions[j].get("ratio", 0))
+                for j in sorted_idx[max_same_sector_buys:]:
+                    a = actions[j]
+                    violations.append(SafetyViolation(
+                        "max_same_sector_buys_per_cycle",
+                        f"{sector} 섹터 동일 사이클 BUY {len(indices)}건 > 최대 {max_same_sector_buys}건 — {a.get('name', a.get('ticker', ''))} 차단 (낮은 비중 우선 차단)",
+                        j,
+                    ))
 
         passed = len(violations) == 0
         if not passed:
@@ -208,6 +269,23 @@ class SafetyGuard:
                             index,
                         ))
 
+            # 3.6. 동일 섹터 매도 후 재매수 쿨다운 (섹터 즉시 회전 차단)
+            #     같은 섹터에서 최근 SELL이 있으면 N거래일간 신규 매수 금지.
+            sector_cooldown = self.rules.get("same_sector_rebuy_cooldown_days")
+            if sector_cooldown and not is_existing:
+                target_sector = self._sector_map.get(ticker)
+                if target_sector:
+                    last_sell = self._last_sell_in_sector(target_sector)
+                    if last_sell:
+                        sold_ticker, sold_ts = last_sell
+                        days_since = _trading_days_between(sold_ts, datetime.now())
+                        if days_since < sector_cooldown:
+                            violations.append(SafetyViolation(
+                                "same_sector_rebuy_cooldown",
+                                f"{target_sector} 섹터 {sold_ticker} 매도 후 {days_since}거래일 < {sector_cooldown}일 쿨다운",
+                                index,
+                            ))
+
             # 4. 단일 주문 최대 금액
             max_order = self.rules.get("max_single_order_amount", 5_000_000)
             order_amount = total_asset * ratio
@@ -242,6 +320,30 @@ class SafetyGuard:
                         "same_day_rebuy",
                         f"{ticker} 당일 매도({sell_ts.strftime('%H:%M')} "
                         f"@{sell_price:,.0f}) 후 재매수 차단",
+                        index,
+                    ))
+
+        # 4.6. LLM 선제 매도 차단: 손실 중인데 손절선 미도달인 SELL은 거부.
+        #      Why: LLM이 dist_to_stop_loss를 "임박"으로 해석해 -3.5~-4%에서 선제 매도하던 패턴 차단.
+        #      익절(수익 중)/실제 손절 도달은 통과.
+        if action_type == "SELL":
+            pos_data = portfolio.get("positions", {}).get(ticker, {})
+            if pos_data:
+                pnl_str = str(pos_data.get("pnl_pct", "0%")).strip().rstrip("%")
+                try:
+                    pnl_pct_val = float(pnl_str) / 100
+                except (ValueError, TypeError):
+                    pnl_pct_val = 0.0
+                from core.portfolio import Position
+                strategy_type = pos_data.get("strategy_type", "swing")
+                stop_loss = Position.STRATEGY_RULES.get(
+                    strategy_type, Position.STRATEGY_RULES["swing"]
+                )["stop_loss"]
+                if pnl_pct_val < 0 and pnl_pct_val > stop_loss:
+                    violations.append(SafetyViolation(
+                        "premature_sell_block",
+                        f"{ticker} 손익 {pnl_pct_val:.2%} > 손절선 {stop_loss:.0%} "
+                        f"— 손절선 미도달 선제 매도 차단",
                         index,
                     ))
 

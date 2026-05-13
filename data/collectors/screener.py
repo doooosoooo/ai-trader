@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import requests
+import yaml
 from loguru import logger
 
 DB_DIR = Path(__file__).parent.parent / "storage"
@@ -46,7 +47,26 @@ class StockScreener:
         self._last_result: ScreeningResult | None = None
         self._session = requests.Session()
         self._session.headers.update(NAVER_HEADERS)
+        self._sector_map: dict[str, str] = self._load_sector_map()
         self._init_db()
+
+    def _load_sector_map(self) -> dict[str, str]:
+        """config/sector-mapping.yaml 로드 — 섹터 다양성 가산점 계산용."""
+        mapping_path = Path(__file__).parent.parent.parent / "config" / "sector-mapping.yaml"
+        if not mapping_path.exists():
+            return {}
+        try:
+            with open(mapping_path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            sectors = data.get("sectors", {})
+            ticker_to_sector: dict[str, str] = {}
+            for sector_name, tickers in sectors.items():
+                for t in tickers or []:
+                    ticker_to_sector[str(t)] = sector_name
+            return ticker_to_sector
+        except Exception as e:
+            logger.warning(f"Failed to load sector-mapping.yaml in screener: {e}")
+            return {}
 
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
@@ -102,8 +122,9 @@ class StockScreener:
             logger.info("Screening: fetching detail info for top candidates...")
             self._enrich_with_details(filtered, max_stocks=50)
 
-            # 3. Stage 2: 멀티팩터 스코어링
-            scored = self._stage2_score(filtered)
+            # 3. Stage 2: 멀티팩터 스코어링 (보유 섹터는 -5점, 미보유 섹터 +5점 — 다양화 유도)
+            held_sectors = {s for t in held_tickers if (s := self._sector_map.get(t))}
+            scored = self._stage2_score(filtered, held_sectors=held_sectors)
             stats["after_scoring"] = len(scored)
             logger.info(f"Screening Stage 2: {len(scored)} stocks scored")
 
@@ -247,7 +268,7 @@ class StockScreener:
     # Stage 2: 멀티팩터 스코어링
     # ------------------------------------------------------------------
 
-    def _stage2_score(self, stocks: list[dict]) -> list[dict]:
+    def _stage2_score(self, stocks: list[dict], held_sectors: set[str] | None = None) -> list[dict]:
         """멀티팩터 스코어링 — 0~100점 가중합."""
         if not stocks:
             return []
@@ -277,39 +298,77 @@ class StockScreener:
             + df["technical_score"] * w_tech
         )
 
+        # 섹터 다양성 보정: 보유 섹터 종목 -15점, 미보유 섹터 종목 +15점
+        # (기존 ±5점은 score 차이 12점을 못 따라잡아 금융주 편향 → ±15로 강화)
+        if held_sectors and self._sector_map:
+            def _sector_adj(ticker: str) -> float:
+                sector = self._sector_map.get(str(ticker))
+                if not sector:
+                    return 0.0
+                return -15.0 if sector in held_sectors else 15.0
+            df["composite_score"] = df["composite_score"] + df["ticker"].apply(_sector_adj)
+
+        # 동일 섹터 상위 후보 과집중 페널티: 점수 상위 30개 중 한 섹터가 4개 이상이면 그 섹터에 -10점
+        # (보유 안 한 섹터도 후보가 같은 섹터로 쏠리면 다양화 안 됨 → 추가 페널티로 다른 섹터에 자리 양보)
+        if self._sector_map:
+            top_now = df.nlargest(30, "composite_score")
+            sector_count = top_now["ticker"].astype(str).map(self._sector_map.get).value_counts()
+            crowded_sectors = sector_count[sector_count >= 4].index.tolist()
+            if crowded_sectors:
+                def _crowd_penalty(ticker: str) -> float:
+                    sector = self._sector_map.get(str(ticker))
+                    return -10.0 if sector in crowded_sectors else 0.0
+                df["composite_score"] = df["composite_score"] + df["ticker"].apply(_crowd_penalty)
+
         # 점수 순 정렬
         df = df.sort_values("composite_score", ascending=False).reset_index(drop=True)
 
         # dict 리스트 변환 (상위 50개만 상세 정보 유지)
+        def _safe_int(v, default=0):
+            try:
+                if v is None or pd.isna(v):
+                    return default
+                return int(v)
+            except (ValueError, TypeError):
+                return default
+
+        def _safe_float(v, default=0.0):
+            try:
+                if v is None or pd.isna(v):
+                    return default
+                return float(v)
+            except (ValueError, TypeError):
+                return default
+
         result = []
         for _, row in df.head(50).iterrows():
             result.append({
                 "ticker": row["ticker"],
                 "name": row["name"],
                 "market": row["market"],
-                "close_price": int(row["close_price"]),
-                "change_pct": float(row["change_pct"]),
-                "market_cap": int(row["market_cap"]),
-                "trading_value": int(row["trading_value"]),
-                "volume": int(row["volume"]),
-                "per": row.get("per"),
-                "rsi_14": round(float(row.get("rsi_14", 50)), 1),
+                "close_price": _safe_int(row.get("close_price")),
+                "change_pct": _safe_float(row.get("change_pct")),
+                "market_cap": _safe_int(row.get("market_cap")),
+                "trading_value": _safe_int(row.get("trading_value")),
+                "volume": _safe_int(row.get("volume")),
+                "per": row.get("per") if pd.notna(row.get("per")) else None,
+                "rsi_14": round(_safe_float(row.get("rsi_14"), 50.0), 1),
                 "ma5_above_ma20": bool(row.get("ma5_above_ma20", False)),
-                "volume_trend": round(float(row.get("volume_trend", 1.0)), 2),
-                "week52_position": round(float(row.get("week52_position", 0.5)), 2),
-                "price_position_5d": round(float(row.get("price_position_5d", 0.5)), 2),
-                "price_position_20d": round(float(row.get("price_position_20d", 0.5)), 2),
-                "high_5d": int(row.get("high_5d", 0) or 0),
-                "low_5d": int(row.get("low_5d", 0) or 0),
-                "avg_5d": int(row.get("avg_5d", 0) or 0),
-                "high_20d": int(row.get("high_20d", 0) or 0),
-                "low_20d": int(row.get("low_20d", 0) or 0),
-                "composite_score": round(float(row["composite_score"]), 1),
-                "momentum_score": round(float(row["momentum_score"]), 1),
-                "value_score": round(float(row["value_score"]), 1),
-                "volume_score": round(float(row["volume_score"]), 1),
-                "flow_score": round(float(row["flow_score"]), 1),
-                "technical_score": round(float(row["technical_score"]), 1),
+                "volume_trend": round(_safe_float(row.get("volume_trend"), 1.0), 2),
+                "week52_position": round(_safe_float(row.get("week52_position"), 0.5), 2),
+                "price_position_5d": round(_safe_float(row.get("price_position_5d"), 0.5), 2),
+                "price_position_20d": round(_safe_float(row.get("price_position_20d"), 0.5), 2),
+                "high_5d": _safe_int(row.get("high_5d")),
+                "low_5d": _safe_int(row.get("low_5d")),
+                "avg_5d": _safe_int(row.get("avg_5d")),
+                "high_20d": _safe_int(row.get("high_20d")),
+                "low_20d": _safe_int(row.get("low_20d")),
+                "composite_score": round(_safe_float(row.get("composite_score")), 1),
+                "momentum_score": round(_safe_float(row.get("momentum_score")), 1),
+                "value_score": round(_safe_float(row.get("value_score")), 1),
+                "volume_score": round(_safe_float(row.get("volume_score")), 1),
+                "flow_score": round(_safe_float(row.get("flow_score")), 1),
+                "technical_score": round(_safe_float(row.get("technical_score")), 1),
             })
 
         return result

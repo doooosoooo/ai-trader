@@ -6,7 +6,7 @@ screening:
   enabled: true
   markets: ["KOSPI", "KOSDAQ"]
   kosdaq_top_n: 500                        # KOSDAQ 시총 상위 N개만 대상
-  max_watchlist_size: 18                   # 스크리너 최종 관심종목 수 (보유 5 + include 3 + 스크리너 ~10 수용)
+  max_watchlist_size: 25                   # 18→25 확대 — 후보 다양성 확보 (보유 + include 7 + 스크리너 ~13)
   always_include_held: true                # 보유종목 항상 포함
 
   # Stage 1: 사전 필터 (제거 조건)
@@ -36,7 +36,11 @@ screening:
 
   # 수동 제외/포함
   exclude_tickers: []                      # 항상 제외할 종목코드
-  include_tickers:                         # 항상 포함할 종목코드 (AI/반도체 강세주 강제 후보화)
-    - "000660"  # SK하이닉스
-    - "005930"  # 삼성전자
-    - "042700"  # 한미반도체
+  include_tickers:                         # 항상 포함 — 섹터별 우량주 분산 (반도체 편향 해소)
+    - "000660"  # SK하이닉스 (반도체)
+    - "005930"  # 삼성전자 (반도체)
+    - "042700"  # 한미반도체 (반도체)
+    - "005380"  # 현대차 (자동차)
+    - "035420"  # NAVER (IT_플랫폼)
+    - "247540"  # 에코프로비엠 (2차전지)
+    - "012450"  # 한화에어로스페이스 (방산_중공업)

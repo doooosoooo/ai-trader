@@ -140,6 +140,10 @@ class TradingSystem:
         screening_config = self.config_manager.load_yaml("screening-params.yaml")
         self.screener = StockScreener(screening_config) if screening_config.get("screening", {}).get("enabled", True) else None
 
+        # include_tickers는 LLM 1단계에서 강제 후보화 (LLM이 빠뜨려도 stage 2 분석 보장)
+        include_tickers = screening_config.get("screening", {}).get("include_tickers", []) or []
+        self.llm_engine.set_force_include_tickers(include_tickers)
+
         # Scheduler
         self.trading_scheduler = TradingScheduler(self, settings)
 
@@ -149,11 +153,16 @@ class TradingSystem:
         self._last_report_notify: datetime | None = None  # 마지막 정기 리포트 알림 시각
         self._cancelled_order_nos: set[str] = set()  # 취소 완료/실패한 주문번호 (반복 방지)
         self._last_analysis: dict | None = self.analysis_store.load_last_analysis()  # 마지막 LLM 분석 결과
-        # 스크리닝 캐시가 없거나 오래됐으면 시작 시 즉시 실행
+        # 스크리닝 캐시가 없거나 오래됐으면(오늘 날짜 아님) 시작 시 즉시 실행
         if self.screener:
             cached = self.screener.get_last_result()
-            if not cached or not cached.candidates:
-                logger.info("No valid screening cache — running initial screening...")
+            today_str = datetime.now().strftime("%Y-%m-%dT")  # ISO 접두로 timestamp 비교
+            is_stale = False
+            if cached and cached.timestamp and not cached.timestamp.startswith(today_str):
+                is_stale = True
+                logger.warning(f"Screening cache is stale (timestamp={cached.timestamp}) — will re-run")
+            if not cached or not cached.candidates or is_stale:
+                logger.info("Running fresh screening on startup...")
                 try:
                     self.cycle_screening()
                 except Exception as e:
@@ -405,15 +414,14 @@ class TradingSystem:
                 bought = datetime.fromisoformat(pos.bought_at)
                 days_held = (datetime.now().date() - bought.date()).days
                 weight = pos.market_value / total_asset
-                pos_sl = pos.rules["stop_loss"]  # strategy_type별 손절선
-                dist_to_sl = pos.pnl_pct - pos_sl  # 양수 = 손절까지 여유
                 trailing_dd = (pos.peak_price - pos.current_price) / pos.peak_price if pos.peak_price > 0 else 0
 
                 pos_dict["days_held"] = days_held
                 pos_dict["max_hold_days"] = max_hold
                 pos_dict["portfolio_weight"] = f"{weight:.1%}"
                 pos_dict["peak_price"] = pos.peak_price
-                pos_dict["dist_to_stop_loss"] = f"{dist_to_sl:+.1%}"
+                # dist_to_stop_loss는 LLM에 노출하지 않음: "임박" 선제 매도 방지.
+                # 손절은 risk_manager가 실제 도달 시에만 실행.
                 pos_dict["trailing_drawdown"] = f"{trailing_dd:.1%}"
                 pos_dict["trailing_stop_pct"] = f"{ts_pct:.0%}"
                 # 스크리닝 탈락 여부 (관심종목에서 빠졌으면 모멘텀 이탈)
