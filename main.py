@@ -153,11 +153,16 @@ class TradingSystem:
         self._last_report_notify: datetime | None = None  # 마지막 정기 리포트 알림 시각
         self._cancelled_order_nos: set[str] = set()  # 취소 완료/실패한 주문번호 (반복 방지)
         self._last_analysis: dict | None = self.analysis_store.load_last_analysis()  # 마지막 LLM 분석 결과
-        # 스크리닝 캐시가 없거나 오래됐으면 시작 시 즉시 실행
+        # 스크리닝 캐시가 없거나 오래됐으면(오늘 날짜 아님) 시작 시 즉시 실행
         if self.screener:
             cached = self.screener.get_last_result()
-            if not cached or not cached.candidates:
-                logger.info("No valid screening cache — running initial screening...")
+            today_str = datetime.now().strftime("%Y-%m-%dT")  # ISO 접두로 timestamp 비교
+            is_stale = False
+            if cached and cached.timestamp and not cached.timestamp.startswith(today_str):
+                is_stale = True
+                logger.warning(f"Screening cache is stale (timestamp={cached.timestamp}) — will re-run")
+            if not cached or not cached.candidates or is_stale:
+                logger.info("Running fresh screening on startup...")
                 try:
                     self.cycle_screening()
                 except Exception as e:
