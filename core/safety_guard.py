@@ -80,40 +80,56 @@ class SafetyGuard:
         return self._sector_map.get(ticker)
 
     def _last_sell_for(self, ticker: str) -> tuple[datetime, float] | None:
-        """해당 종목의 가장 최근 SELL 거래 (timestamp, price) 반환. 없으면 None."""
+        """해당 종목의 가장 최근 '자발적' SELL 거래 (timestamp, price) 반환. 없으면 None.
+
+        손절/트레일링/보유기간초과 같은 자동 매도는 제외 — 의도와 무관한 매도까지
+        rebuy_cooldown으로 차단하면 좋은 재매수 기회를 놓침.
+        """
+        AUTO_SELL_KEYWORDS = ("하드손절", "트레일링스탑", "조기익절", "갭상승익절", "보유기간초과", "스크리닝탈락")
         try:
             with sqlite3.connect(self.db_path) as conn:
-                row = conn.execute(
-                    "SELECT timestamp, price FROM trade_history "
+                rows = conn.execute(
+                    "SELECT timestamp, price, reason FROM trade_history "
                     "WHERE ticker = ? AND action = 'SELL' "
-                    "ORDER BY timestamp DESC LIMIT 1",
+                    "ORDER BY timestamp DESC LIMIT 20",
                     (ticker,),
-                ).fetchone()
-            if not row:
-                return None
-            ts = datetime.fromisoformat(row[0])
-            return ts, float(row[1])
+                ).fetchall()
+            for ts_str, price, reason in rows:
+                reason_text = reason or ""
+                if any(kw in reason_text for kw in AUTO_SELL_KEYWORDS):
+                    continue
+                return datetime.fromisoformat(ts_str), float(price)
+            return None
         except Exception as e:
             logger.warning(f"_last_sell_for failed for {ticker}: {e}")
             return None
 
     def _last_sell_in_sector(self, sector: str) -> tuple[str, datetime] | None:
-        """해당 섹터에서 가장 최근 SELL 거래 (ticker, timestamp) 반환. 없으면 None."""
+        """해당 섹터에서 가장 최근 '자발적' SELL 거래 (ticker, timestamp) 반환. 없으면 None.
+
+        '자발적' 매도만 카운트 — 손절/트레일링/보유기간초과 같은 자동 매도는 제외.
+        의도가 아닌 매도까지 cooldown 적용하면 적극 매매 차단 부작용 발생.
+        """
         sector_tickers = [t for t, s in self._sector_map.items() if s == sector]
         if not sector_tickers:
             return None
+        # 자동 매도 사유 키워드 — 이 키워드가 reason에 포함되면 cooldown 제외
+        AUTO_SELL_KEYWORDS = ("하드손절", "트레일링스탑", "조기익절", "갭상승익절", "보유기간초과", "스크리닝탈락")
         try:
             placeholders = ",".join("?" * len(sector_tickers))
             with sqlite3.connect(self.db_path) as conn:
-                row = conn.execute(
-                    f"SELECT ticker, timestamp FROM trade_history "
+                rows = conn.execute(
+                    f"SELECT ticker, timestamp, reason FROM trade_history "
                     f"WHERE action = 'SELL' AND ticker IN ({placeholders}) "
-                    f"ORDER BY timestamp DESC LIMIT 1",
+                    f"ORDER BY timestamp DESC LIMIT 20",
                     sector_tickers,
-                ).fetchone()
-            if not row:
-                return None
-            return row[0], datetime.fromisoformat(row[1])
+                ).fetchall()
+            for ticker, ts_str, reason in rows:
+                reason_text = reason or ""
+                if any(kw in reason_text for kw in AUTO_SELL_KEYWORDS):
+                    continue  # 자동 매도는 제외
+                return ticker, datetime.fromisoformat(ts_str)
+            return None
         except Exception as e:
             logger.warning(f"_last_sell_in_sector failed for {sector}: {e}")
             return None
@@ -140,6 +156,30 @@ class SafetyGuard:
         for i, action in enumerate(actions):
             action_violations = self._validate_action(action, portfolio, total_asset, i)
             violations.extend(action_violations)
+
+        # 사이클 레벨 검증: 동일 섹터 BUY 다중 진입 차단 (섹터 집중 방지)
+        max_same_sector_buys = self.rules.get("max_same_sector_buys_per_cycle")
+        if max_same_sector_buys and max_same_sector_buys > 0:
+            sector_buys: dict[str, list[int]] = {}
+            for i, action in enumerate(actions):
+                if action.get("type", "").upper() != "BUY":
+                    continue
+                sector = self._sector_map.get(action.get("ticker", ""))
+                if not sector:
+                    continue
+                sector_buys.setdefault(sector, []).append(i)
+            for sector, indices in sector_buys.items():
+                if len(indices) <= max_same_sector_buys:
+                    continue
+                # ratio 큰 순서대로 우선순위 부여, 상위 max_same_sector_buys개만 통과
+                sorted_idx = sorted(indices, key=lambda j: -actions[j].get("ratio", 0))
+                for j in sorted_idx[max_same_sector_buys:]:
+                    a = actions[j]
+                    violations.append(SafetyViolation(
+                        "max_same_sector_buys_per_cycle",
+                        f"{sector} 섹터 동일 사이클 BUY {len(indices)}건 > 최대 {max_same_sector_buys}건 — {a.get('name', a.get('ticker', ''))} 차단 (낮은 비중 우선 차단)",
+                        j,
+                    ))
 
         passed = len(violations) == 0
         if not passed:
