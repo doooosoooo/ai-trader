@@ -19,8 +19,8 @@ ml:
   lookback_days: 120
   feature_window: 20
 llm:
-  model: claude-sonnet-4-6        # Stage 1 Triage (워치리스트 후보 선별, 매 사이클 호출)
-  model_deep: claude-sonnet-4-6   # Stage 2 Deep analysis (Opus 4.7→Sonnet 4.6 다운그레이드, 비용 5배 절감)
+  model: claude-haiku-4-5         # Stage 1 Triage (워치리스트 후보 선별, 매 사이클 호출)
+  model_deep: claude-haiku-4-5    # Stage 2 Deep analysis (Opus 4.7→Sonnet 4.6 다운그레이드, 비용 5배 절감)
   max_tokens: 4096
   temperature: 0.3
   cost_limit_daily_usd: 5.0       # Stage 2도 Sonnet이라 한도 축소 (실비용 추적 정확화 후 재조정)
