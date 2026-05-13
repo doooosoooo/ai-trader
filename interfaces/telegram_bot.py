@@ -912,6 +912,10 @@ class TelegramBot:
             orders = await loop.run_in_executor(
                 None, self.system.market_client.get_today_orders
             )
+            pending = await loop.run_in_executor(
+                None, self.system.market_client.get_pending_orders
+            )
+            pending_nos = {p["order_no"] for p in pending}
         except Exception as e:
             await update.message.reply_text(f"조회 실패: {e}")
             return
@@ -922,7 +926,12 @@ class TelegramBot:
 
         msg = "📋 <b>당일 주문 현황</b>\n\n"
         for o in orders:
-            status = "✅체결" if o["filled"] else f"⏳미체결({o['ccld_qty']}/{o['ord_qty']})"
+            if o["filled"]:
+                status = "✅체결"
+            elif o["order_no"] in pending_nos:
+                status = f"⏳미체결({o['ccld_qty']}/{o['ord_qty']})"
+            else:
+                status = "⚪취소됨"
             side_emoji = "🟢" if o["side"] == "매수" else "🔴"
             time_str = f"{o['order_time'][:2]}:{o['order_time'][2:4]}" if len(o['order_time']) >= 4 else ""
             msg += (
@@ -933,6 +942,7 @@ class TelegramBot:
                 msg += f"  체결: {o['ccld_qty']}주 × {o['ccld_price']:,}원 = {o['ccld_amount']:,}원\n"
             msg += f"  {status} | {time_str} | #{o['order_no']}\n\n"
 
+        msg += f"\n📊 실제 잔여 미체결: <b>{len(pending)}건</b>"
         await update.message.reply_html(msg)
 
     async def _cmd_trades(self, update: Update, context: ContextTypes.DEFAULT_TYPE):

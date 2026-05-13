@@ -185,14 +185,22 @@ class OrderExecutor:
             logger.error(f"Invalid current price for {ticker}: {current_price}")
             return None
 
-        # 5분봉 양봉 확인 (단타 제외) — 떨어지는 칼날 차단
-        if strategy_type != "daytrading" and self.mode != "simulation":
+        # 5분봉 음봉 차단 — 떨어지는 칼날 회피용
+        # 면제: daytrading / swing_breakout / include_tickers(SK하이닉스·삼성전자·한미반도체) / 음봉 폭 -0.3% 미만
+        INCLUDE_TICKERS = {"000660", "005930", "042700"}
+        skip_check = (
+            strategy_type in ("daytrading", "swing_breakout")
+            or ticker in INCLUDE_TICKERS
+            or self.mode == "simulation"
+        )
+        if not skip_check:
             try:
                 bars = self.market_client.get_minute_ohlcv(ticker, interval="5")
                 if bars and len(bars) >= 1:
                     last = bars[0]
-                    if last["close"] < last["open"]:
-                        logger.info(f"BUY blocked: {name}({ticker}) — 5분봉 음봉 (O:{last['open']:,} > C:{last['close']:,})")
+                    drop_pct = (last["close"] - last["open"]) / last["open"] if last["open"] > 0 else 0
+                    if drop_pct < -0.003:  # -0.3% 이상 음봉만 차단
+                        logger.info(f"BUY blocked: {name}({ticker}) — 5분봉 음봉 {drop_pct:.2%} (O:{last['open']:,} > C:{last['close']:,})")
                         return None
             except Exception as e:
                 logger.debug(f"Minute bar check failed for {ticker}: {e}")
@@ -260,7 +268,7 @@ class OrderExecutor:
         # 라이브 모드: 미체결 매도 주문이 있으면 중복 매도 방지
         if self.mode != "simulation" and self.market_client:
             try:
-                orders = self.market_client.get_today_orders()
+                orders = self.market_client.get_pending_orders()
                 pending_sell_qty = sum(
                     o["ord_qty"] - o["ccld_qty"]
                     for o in orders
@@ -504,7 +512,7 @@ class OrderExecutor:
             _time.sleep(0.5)
 
             if order["side"] == "매수":
-                price = adjust_price_to_tick(current_price, "down")
+                price = adjust_price_to_tick(current_price, "up")  # 즉시 체결 — 매도1호가 잡기
                 new_result = self._live_buy(
                     ticker=order["ticker"], name=order["name"],
                     quantity=remaining, price=price, urgency="limit",

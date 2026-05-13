@@ -57,14 +57,43 @@ class KISAuth:
         self._access_token: str = ""
         self._token_expires: datetime = datetime.min
         self._token_lock = threading.Lock()
+        self._token_cache_path = Path("data") / f"kis_token_{self.account_type}.json"
 
     @property
     def is_authenticated(self) -> bool:
         return bool(self._access_token) and datetime.now() < self._token_expires
 
+    def _load_cached_token(self) -> bool:
+        try:
+            if not self._token_cache_path.exists():
+                return False
+            import json as _json
+            data = _json.loads(self._token_cache_path.read_text())
+            expires = datetime.fromisoformat(data["expires"])
+            if datetime.now() >= expires:
+                return False
+            self._access_token = data["token"]
+            self._token_expires = expires
+            return True
+        except Exception:
+            return False
+
+    def _save_cached_token(self):
+        try:
+            import json as _json
+            self._token_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self._token_cache_path.write_text(_json.dumps({
+                "token": self._access_token,
+                "expires": self._token_expires.isoformat(),
+            }))
+        except Exception as e:
+            logger.warning(f"Failed to cache KIS token: {e}")
+
     def get_token(self) -> str:
         with self._token_lock:
             if self.is_authenticated:
+                return self._access_token
+            if self._load_cached_token():
                 return self._access_token
             return self._issue_token()
 
@@ -84,6 +113,7 @@ class KISAuth:
                 self._access_token = data["access_token"]
                 # 토큰 유효시간 — 보통 24시간, 여유 있게 23시간으로 설정
                 self._token_expires = datetime.now() + timedelta(hours=23)
+                self._save_cached_token()
                 logger.info("KIS API token issued successfully")
                 return self._access_token
             except Exception as e:
@@ -442,6 +472,52 @@ class MarketDataClient:
             "positions": positions,
         }
 
+    def get_pending_orders(self) -> list[dict]:
+        """KIS에 살아있는 정정취소 가능 주문만 조회 (취소·체결된 것 제외).
+
+        inquire-psbl-rvsecncl API 사용 — 진짜 미체결 잔량만 반환.
+        get_today_orders는 취소된 이력까지 포함하므로 미체결 관리 용도에 부적합.
+        """
+        path = "/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl"
+        tr_id = "VTTC8036R" if self.auth.account_type == "virtual" else "TTTC8036R"
+        params = {
+            "CANO": self.auth.account_no[:8],
+            "ACNT_PRDT_CD": self.auth.account_product_code,
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+            "INQR_DVSN_1": "0",
+            "INQR_DVSN_2": "0",
+        }
+        try:
+            data = self._get(path, tr_id, params)
+        except RuntimeError as e:
+            logger.warning(f"Pending order inquiry failed: {e}")
+            return []
+
+        orders = []
+        for o in data.get("output", []):
+            psbl_qty = _safe_int(o.get("psbl_qty", 0))
+            if psbl_qty <= 0:
+                continue
+            ord_qty = _safe_int(o.get("ord_qty", 0))
+            ccld_qty = _safe_int(o.get("tot_ccld_qty", 0))
+            ord_price = _safe_int(o.get("ord_unpr", 0))
+            orders.append({
+                "ticker": o.get("pdno", ""),
+                "name": o.get("prdt_name", ""),
+                "side": "매수" if o.get("sll_buy_dvsn_cd") == "02" else "매도",
+                "ord_qty": ord_qty if ord_qty > 0 else psbl_qty,
+                "ccld_qty": ccld_qty,
+                "ord_price": ord_price,
+                "ccld_price": 0,
+                "ccld_amount": 0,
+                "order_no": o.get("odno", ""),
+                "order_time": o.get("ord_tmd", ""),
+                "filled": False,
+                "psbl_qty": psbl_qty,
+            })
+        return orders
+
     def get_today_orders(self) -> list[dict]:
         """당일 주문 체결 조회."""
         from datetime import datetime
@@ -549,6 +625,10 @@ class MarketDataClient:
             return {"success": True, "message": "cancelled", "order_no": cancel_no}
         else:
             error_msg = data.get("msg1", "Unknown error")
+            # 좀비 주문 처리: 이미 취소·체결되어 KIS에 잔량 없음 → 영구 무시 신호
+            if "정정취소 가능수량이 없습니다" in error_msg:
+                logger.info(f"Order already settled/cancelled: {ticker} #{order_no} (KIS no remaining qty) — treating as done")
+                return {"success": False, "message": error_msg, "order_no": order_no, "zombie": True}
             logger.error(f"Cancel order failed: {ticker} #{order_no} — {error_msg}")
             return {"success": False, "message": error_msg, "order_no": order_no}
 
