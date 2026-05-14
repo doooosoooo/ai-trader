@@ -323,6 +323,18 @@ class SafetyGuard:
                         index,
                     ))
 
+        # 4.4. 보유하지 않은 종목 SELL 차단 — LLM 환각 방지.
+        #      Why: LLM이 워치리스트의 약세 종목을 "rotation 대상"으로 잘못 분류해 SELL 액션 생성.
+        #      executor가 "No position to sell"로 차단하지만 그 전에 텔레그램 알림이 발송돼 사용자 혼란.
+        if action_type == "SELL":
+            held = portfolio.get("positions", {})
+            if ticker not in held:
+                violations.append(SafetyViolation(
+                    "sell_without_position",
+                    f"{ticker} 미보유 종목 SELL 시도 — LLM 환각 또는 sync 지연 (보유 종목만 매도 가능)",
+                    index,
+                ))
+
         # 4.5. 최소 보유 30분 룰: 매수 직후 LLM 자가매도 차단.
         #      Why: swing_pullback으로 산 종목을 다음 사이클이 swing 표준 잣대로 평가해 청산하는 모순 사례 발생(2026-05-13 NAVER 12분 매도).
         #      자동 매도(손절/트레일링/보유기간초과)는 reason 키워드로 식별해 통과.
