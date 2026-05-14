@@ -20,7 +20,7 @@ ml:
   feature_window: 20
 llm:
   model: claude-sonnet-4-6        # Stage 1 Triage — Sonnet (분류는 가벼운 작업, 비용 절감)
-  model_deep: claude-opus-4-7     # Stage 2 Deep analysis — Opus (매수 후보 심층 분석에는 강력 모델)
+  model_deep: claude-sonnet-4-6     # Stage 2 Deep analysis — Sonnet (친구 계좌 비용 절감)
   max_tokens: 4096
   temperature: 0.3
   cost_limit_daily_usd: 0.5      # Stage 2만 Opus라 한도는 유지 (Sonnet+Opus 혼합)
