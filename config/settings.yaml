@@ -23,7 +23,7 @@ llm:
   model_deep: claude-sonnet-4-6     # Stage 2 Deep analysis — Sonnet (친구 계좌 비용 절감)
   max_tokens: 4096
   temperature: 0.3
-  cost_limit_daily_usd: 0.5      # Stage 2만 Opus라 한도는 유지 (Sonnet+Opus 혼합)
+  cost_limit_daily_usd: 5.0      # Stage 2만 Opus라 한도는 유지 (Sonnet+Opus 혼합)
   max_retries: 3
   timeout_seconds: 30
 broker:
