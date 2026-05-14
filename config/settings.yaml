@@ -19,11 +19,18 @@ ml:
   lookback_days: 120
   feature_window: 20
 llm:
-  model: claude-sonnet-4-6        # Stage 1 Triage — Sonnet (분류는 가벼운 작업, 비용 절감)
-  model_deep: claude-opus-4-7     # Stage 2 Deep analysis — Opus (매수 후보 심층 분석에는 강력 모델)
+  model: claude-sonnet-4-6        # Stage 1 Triage — Sonnet
+  model_deep: claude-sonnet-4-6   # Stage 2 Deep analysis — Sonnet (Opus는 daily_review/RCA/weekly_refine 전용)
   max_tokens: 4096
   temperature: 0.3
-  cost_limit_daily_usd: 30.0      # Stage 2만 Opus라 한도는 유지 (Sonnet+Opus 혼합)
+  # 카테고리별 일일 한도 (USD) — 한 기능 폭주가 다른 기능 차단 못 하도록 분리
+  cost_limits_daily_usd:
+    trading: 10.0                 # 평상시 트레이딩 (Stage1+Stage2 둘 다 Sonnet, 일 평균 $1~2)
+    daily_review: 1.0             # 장 마감 후 Opus 1회 심층 복기
+    weekly_review: 15.0           # 주 1회 Opus 전략 검토 (1M context)
+    rca: 5.0                      # 사고 발생 시 Opus RCA (이벤트 트리거)
+    news: 5.0                     # 뉴스/공시 심층 (선택, 비활성)
+  cost_limit_daily_usd: 10.0      # backward compat — trading 카테고리와 동일
   max_retries: 3
   timeout_seconds: 30
 broker:

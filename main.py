@@ -99,7 +99,11 @@ class TradingSystem:
         self.telegram = TelegramBot(settings, system_ref=self)
 
         # Review
-        self.reviewer = DailyReviewer(self.llm_engine, self.portfolio)
+        self.reviewer = DailyReviewer(
+            self.llm_engine,
+            self.portfolio,
+            db_path=settings.get("system", {}).get("db_path", "data/storage/trader.db"),
+        )
         self.strategy_evaluator = StrategyEvaluator(self.portfolio)
 
         # Simulation
@@ -1040,8 +1044,29 @@ class TradingSystem:
     # --- 공개 API ---
 
     def run_daily_review(self) -> dict:
-        """일일 복기 실행."""
-        return self.reviewer.run_daily_review()
+        """일일 심층 복기 실행 — Opus 4.7 (daily_review 카테고리) + 텔레그램 발송.
+
+        실패 시 Sonnet fallback은 reviewer 내부에서 자동 처리.
+        """
+        try:
+            strategy_excerpt = self.llm_engine.load_strategy()
+        except Exception:
+            strategy_excerpt = ""
+
+        review = self.reviewer.run_deep_daily_review(strategy_excerpt=strategy_excerpt)
+
+        # 매매도 분석도 없는 경우 알림 skip
+        if review.get("overall_score") in (0, "0", None) and not review.get("key_findings"):
+            return review
+
+        # 텔레그램 발송
+        try:
+            if self.telegram and self.telegram.enabled:
+                msg = self.reviewer.format_deep_review_telegram(review)
+                self.telegram.send_alert_sync("daily_report", msg)
+        except Exception as e:
+            logger.error(f"Daily review telegram failed: {e}")
+        return review
 
     def run_weekly_review(self) -> dict:
         return self.reviewer.run_weekly_review()
