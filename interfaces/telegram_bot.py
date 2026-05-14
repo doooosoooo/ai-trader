@@ -75,6 +75,10 @@ class TelegramBot:
         self._app.add_handler(CommandHandler("screen", self._cmd_screen))
         self._app.add_handler(CommandHandler("backtest", self._cmd_backtest))
         self._app.add_handler(CommandHandler("param", self._cmd_param))
+        self._app.add_handler(CommandHandler("refine_list", self._cmd_refine_list))
+        self._app.add_handler(CommandHandler("refine_show", self._cmd_refine_show))
+        self._app.add_handler(CommandHandler("refine_approve", self._cmd_refine_approve))
+        self._app.add_handler(CommandHandler("refine_reject", self._cmd_refine_reject))
         self._app.add_handler(CallbackQueryHandler(self._handle_callback))
         self._app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text))
 
@@ -437,7 +441,11 @@ class TelegramBot:
             "/deposit <금액> [메모] - 입금 기록 (수익률 자동 보정)\n"
             "/withdraw <금액> [메모] - 출금 기록\n"
             "/cashflow - 입출금 이력 조회\n"
-            "/reset - 서킷브레이커 리셋\n\n"
+            "/reset - 서킷브레이커 리셋\n"
+            "/refine_list - 주간 전략 다듬기 승인 대기 목록\n"
+            "/refine_show <id> - 다듬기 제안 확인\n"
+            "/refine_approve <id> - 다듬기 적용\n"
+            "/refine_reject <id> - 다듬기 거부\n\n"
             "자연어로 전략 변경도 가능합니다.\n"
             "예: '단타로 전환해', '현금비중 50%로 올려'"
         )
@@ -1289,6 +1297,96 @@ class TelegramBot:
             f"강제 적용하시겠습니까?",
             reply_markup=keyboard,
         )
+
+    # --- 주간 전략 다듬기 명령 ---
+
+    async def _cmd_refine_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """승인 대기 중인 refinement 목록."""
+        if not await self._check_auth(update):
+            return
+        if not self.system or not getattr(self.system, "strategy_refiner", None):
+            await update.message.reply_text("Strategy refiner 미연결")
+            return
+        pending = self.system.strategy_refiner.list_pending()
+        if not pending:
+            await update.message.reply_text("승인 대기 중인 전략 다듬기가 없습니다.")
+            return
+        lines = [f"📋 <b>승인 대기 refinement ({len(pending)}건)</b>", ""]
+        for item in pending[:10]:
+            rid = item.get("id", "?")
+            created = item.get("created_at", "")[:16].replace("T", " ")
+            headline = item.get("refinement", {}).get("headline", "")[:80]
+            lines.append(f"<code>{rid}</code> ({created})")
+            lines.append(f"  {headline}")
+            lines.append("")
+        lines.append("/refine_show {id} — 전문 확인")
+        lines.append("/refine_approve {id} — 적용")
+        lines.append("/refine_reject {id} — 거부")
+        await update.message.reply_html("\n".join(lines))
+
+    async def _cmd_refine_show(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/refine_show {id} — 제안 본문 + 새 active.md 발췌."""
+        if not await self._check_auth(update):
+            return
+        if not self.system or not getattr(self.system, "strategy_refiner", None):
+            await update.message.reply_text("Strategy refiner 미연결")
+            return
+        args = context.args or []
+        if not args:
+            await update.message.reply_text("사용법: /refine_show <id>\n예: /refine_show refine_20260516_1000")
+            return
+        rid = args[0]
+        item = self.system.strategy_refiner.get_pending(rid)
+        if not item:
+            await update.message.reply_text(f"❌ {rid} 없음 또는 만료")
+            return
+        refinement = item.get("refinement", {})
+        msg = self.system.strategy_refiner.format_refinement_telegram(refinement)
+        await update.message.reply_html(msg)
+
+        # 새 active.md 발췌 — 처음 1500자만
+        new_md = refinement.get("new_active_md", "")
+        if new_md:
+            excerpt = new_md[:1500]
+            tail_note = "" if len(new_md) == len(excerpt) else f"\n...(전체 {len(new_md)}자, 발췌 1500자)"
+            await update.message.reply_text(
+                f"📄 새 active.md (발췌):\n\n{excerpt}{tail_note}\n\n"
+                f"전문은 logs/reviews/{rid}.md 참고",
+            )
+
+    async def _cmd_refine_approve(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/refine_approve {id} — archive 백업 → active.md 교체 → git commit."""
+        if not await self._check_auth(update):
+            return
+        if not self.system or not getattr(self.system, "strategy_refiner", None):
+            await update.message.reply_text("Strategy refiner 미연결")
+            return
+        args = context.args or []
+        if not args:
+            await update.message.reply_text("사용법: /refine_approve <id>")
+            return
+        rid = args[0]
+        ok, msg = self.system.strategy_refiner.approve(rid)
+        await update.message.reply_text(msg)
+        if ok:
+            logger.info(f"Strategy refinement approved via Telegram: {rid}")
+
+    async def _cmd_refine_reject(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/refine_reject {id} — 제안 거부."""
+        if not await self._check_auth(update):
+            return
+        if not self.system or not getattr(self.system, "strategy_refiner", None):
+            await update.message.reply_text("Strategy refiner 미연결")
+            return
+        args = context.args or []
+        if not args:
+            await update.message.reply_text("사용법: /refine_reject <id>")
+            return
+        rid = args[0]
+        ok, msg = self.system.strategy_refiner.reject(rid)
+        await update.message.reply_text(msg)
+        if ok:
+            logger.info(f"Strategy refinement rejected via Telegram: {rid}")
 
     async def _handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """인라인 버튼 콜백 처리 (주문 승인/거부 + 파라미터 강제 적용)."""

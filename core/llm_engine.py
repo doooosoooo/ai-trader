@@ -97,7 +97,14 @@ class LLMEngine:
         self._reset_daily_costs_if_new_day()
         self._daily_costs[category] = self._daily_costs.get(category, 0.0) + cost
 
-    def _call_llm(self, system_prompt: str, user_message: str, model: str | None = None, category: str = "trading") -> str:
+    def _call_llm(
+        self,
+        system_prompt: str,
+        user_message: str,
+        model: str | None = None,
+        category: str = "trading",
+        max_tokens: int | None = None,
+    ) -> str:
         if not self._check_cost_limit(category):
             raise RuntimeError(f"LLM daily cost limit reached [{category}]")
 
@@ -105,7 +112,7 @@ class LLMEngine:
         # Opus 4.7부터 temperature 파라미터 deprecated (400 에러). SDK default 사용.
         response = self.client.messages.create(
             model=use_model,
-            max_tokens=self.max_tokens,
+            max_tokens=max_tokens or self.max_tokens,
             system=system_prompt,
             messages=[{"role": "user", "content": user_message}],
         )
@@ -556,6 +563,112 @@ hold_reasons: immediate_actions에 없는 모든 보유종목에 대해 한 줄 
             system_prompt, user_message,
             model="claude-opus-4-7",
             category="rca",
+        )
+        return self._parse_json_response(raw)
+
+    def generate_weekly_refinement(
+        self,
+        trades_week: list[dict],
+        decisions_week: list[dict],
+        backtest_summary: dict,
+        safety_stats: dict,
+        portfolio_summary: dict,
+        weekly_pnl_summary: dict,
+        current_active_md: str,
+    ) -> dict:
+        """주간 전략 다듬기 — Opus 4.7로 active.md 전문 + 변경 요약 출력.
+
+        category='weekly_review'로 비용 추적 ($15/일 한도).
+        자동 적용 절대 없음 — 호출자가 텔레그램 승인 후 적용.
+        """
+        system_prompt = """당신은 한국 주식 자동매매 시스템의 주간 전략 다듬기(Strategy Refinement) 엔진입니다.
+지난 7거래일의 매매·결정·룰 차단·백테스트 결과를 종합 분석하여 현재 활성 전략(active.md)을
+개선합니다. 핵심 철학과 안전장치 우선순위는 유지하되, 데이터로 검증된 미세 조정만 반영합니다.
+
+분석 원칙:
+1. **데이터 기반** — 가설이 아니라 실제 매매·결정 패턴에서 검증된 부분만 수정
+2. **점진 개선** — 한 번에 전략을 뒤집지 말 것. 좁고 명확한 룰 수정 위주
+3. **충돌 해소** — safety_filtered 통계에서 자주 차단된 룰은 LLM 판단과 충돌. 어느 쪽이 옳은지 판단
+4. **놓친 기회 vs 손실** — 어느 쪽이 더 큰지 가중 분석. 한 쪽 사례만 보고 룰을 풀거나 조이지 말 것
+5. **핵심 안전장치 유지** — 손절선/트레일링/시장가 금지/F~J 가격대 룰 같은 안전장치는 절대 약화 금지
+6. **strategy_type별 분리** — value/swing/daytrading 룰을 섞지 말 것
+7. **새 active.md 전문 출력** — 부분 패치가 아니라 새 버전 전체 (md 형식 그대로)
+
+⚠️ 금지:
+- 손절 폭 -5%/-10% 완화 금지
+- 시장가 매수 허용 금지 (`urgency: limit` 강제 유지)
+- 익절 단독 매도 허용 금지 (트레일링 자동 관리 원칙 유지)
+- 신규 strategy_type 도입 금지
+- 미보유 종목 SELL 룰(E3) 약화 금지
+
+반드시 아래 JSON 형식으로만 응답하세요:
+{
+  "headline": "한 줄 요약 (80자 이내, 텔레그램용)",
+  "key_observations": ["이번 주 관찰1", "관찰2", "관찰3"],
+  "what_worked": ["성공 패턴1", "패턴2"],
+  "what_failed": ["실패 패턴1", "패턴2"],
+  "proposed_changes": [
+    {
+      "section": "active.md의 어느 섹션 (예: 스윙 매수 조건, F~J 가격대 룰)",
+      "current": "현재 룰 발췌 (한 줄)",
+      "new": "수정안 (한 줄)",
+      "rationale": "데이터 근거 (어느 매매/결정/통계에서 도출했는지)",
+      "expected_impact": "기대 효과 (한 줄)"
+    }
+  ],
+  "new_active_md": "새 active.md 전문 (markdown 형식 그대로, 최소 2000자, '# 트레이딩 전략' 헤더 포함)",
+  "risk_notes": "변경 시 주의사항 / 모니터링 포인트"
+}"""
+
+        # 결정 로그는 토큰 절감용 compact
+        compact_decisions = []
+        for d in decisions_week[-150:]:  # 7일 분량 cap
+            sig = d.get("signal", {})
+            compact_decisions.append({
+                "ts": d.get("timestamp", "")[:16],
+                "risk": sig.get("risk_assessment", ""),
+                "reasoning": (sig.get("reasoning", "") or "")[:300],
+                "actions": [
+                    {
+                        "type": a.get("type"), "ticker": a.get("ticker"),
+                        "strategy_type": a.get("strategy_type"),
+                        "ratio": a.get("ratio"),
+                        "reason": (a.get("reason", "") or "")[:150],
+                    }
+                    for a in sig.get("actions", [])
+                ],
+                "safety_filtered": sig.get("safety_filtered", []) or [],
+            })
+
+        user_message = f"""## 지난 7거래일 매매 ({len(trades_week)}건)
+{json.dumps(trades_week, ensure_ascii=False, indent=2)[:20000]}
+
+## 결정 로그 요약 ({len(compact_decisions)}건)
+{json.dumps(compact_decisions, ensure_ascii=False, indent=2)[:40000]}
+
+## 룰 차단 통계 (safety_guard + circuit_breaker)
+{json.dumps(safety_stats, ensure_ascii=False, indent=2)}
+
+## 주간 PnL 요약
+{json.dumps(weekly_pnl_summary, ensure_ascii=False, indent=2)}
+
+## 현재 포트폴리오 상태
+{json.dumps(portfolio_summary, ensure_ascii=False, indent=2)}
+
+## 백테스트 결과 요약
+{json.dumps(backtest_summary, ensure_ascii=False, indent=2)[:8000]}
+
+## 현재 active.md 전문
+{current_active_md}
+
+위 데이터를 기반으로 주간 전략 다듬기를 JSON으로만 응답해주세요.
+new_active_md는 반드시 완전한 markdown 전문을 포함해야 합니다 (최소 2000자)."""
+
+        raw = self._call_llm(
+            system_prompt, user_message,
+            model="claude-opus-4-7",
+            category="weekly_review",
+            max_tokens=16384,
         )
         return self._parse_json_response(raw)
 

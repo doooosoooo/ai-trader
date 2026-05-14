@@ -49,6 +49,7 @@ from data.pipeline import DataPipeline
 from interfaces.telegram_bot import TelegramBot
 from review.daily_review import DailyReviewer
 from review.incident_analyzer import IncidentAnalyzer
+from review.strategy_refiner import StrategyRefiner
 from review.strategy_evaluator import StrategyEvaluator
 from simulation.simulator import SimulationTracker
 from data.collectors.screener import StockScreener
@@ -109,6 +110,12 @@ class TradingSystem:
             llm_engine=self.llm_engine,
             portfolio=self.portfolio,
             circuit_breaker=self.circuit_breaker,
+            telegram=self.telegram,
+            db_path=settings.get("system", {}).get("db_path", "data/storage/trader.db"),
+        )
+        self.strategy_refiner = StrategyRefiner(
+            llm_engine=self.llm_engine,
+            portfolio=self.portfolio,
             telegram=self.telegram,
             db_path=settings.get("system", {}).get("db_path", "data/storage/trader.db"),
         )
@@ -1097,7 +1104,24 @@ class TradingSystem:
         return review
 
     def run_weekly_review(self) -> dict:
-        return self.reviewer.run_weekly_review()
+        """주간 리포트 — 토 10:00 cron.
+
+        1) 기존 주간 요약 (Sonnet, 가벼움) — 백업/연속성용
+        2) 주간 전략 다듬기 (Opus 4.7, weekly_review 카테고리) — pending 저장 + 텔레그램 승인 게이트
+        """
+        weekly_summary = {}
+        try:
+            weekly_summary = self.reviewer.run_weekly_review()
+        except Exception as e:
+            logger.error(f"Weekly summary failed (non-fatal): {e}")
+
+        try:
+            refinement = self.strategy_refiner.run_weekly_refinement()
+        except Exception as e:
+            logger.error(f"Weekly refinement failed: {e}")
+            refinement = {}
+
+        return {"summary": weekly_summary, "refinement": refinement}
 
     def train_ml_models(self) -> dict:
         """ML 모델 수동 학습."""
