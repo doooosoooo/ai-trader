@@ -45,6 +45,10 @@ class RiskManager:
         self.sync_account_fn = sync_account_fn
         self._watchlist: list[str] | None = None  # 스크리닝 관심종목 (외부에서 설정)
         self._gap_sold_today: dict[str, str] = {}  # {ticker: date_str} 갭상승 익절 중복 방지
+        # 자동 매도 연속 실패 추적 — 동일 종목 N회 실패 시 일시 차단 + 알림 (KIS 장애 등 무한 재시도 방지)
+        self._sell_failures: dict[str, dict] = {}  # {ticker: {"count": n, "first": ts, "alerted": bool}}
+        self._SELL_FAIL_THRESHOLD = 3      # 3회 연속 실패 시 차단
+        self._SELL_FAIL_BACKOFF_MIN = 15   # 15분간 자동 매도 시도 중지
 
         # 집중도/드로다운 알림 상태 — 파일 영속화 (PM2 재시작 시 스팸 방지)
         self._concentration_alerted: dict[str, str] = {}
@@ -221,7 +225,37 @@ class RiskManager:
             return None
 
     def _execute_risk_exit(self, ticker: str, pos, reason: str) -> dict | None:
-        """리스크 청산 즉시 실행 — 쿨다운/확인 우회."""
+        """리스크 청산 즉시 실행 — 쿨다운/확인 우회. 연속 실패 시 backoff."""
+        # 연속 실패 backoff 체크 — KIS 장애 등으로 같은 종목 무한 재시도 방지
+        fail_info = self._sell_failures.get(ticker)
+        if fail_info and fail_info["count"] >= self._SELL_FAIL_THRESHOLD:
+            from datetime import timedelta
+            backoff_end = fail_info["first"] + timedelta(minutes=self._SELL_FAIL_BACKOFF_MIN)
+            if datetime.now() < backoff_end:
+                # 차단 중 — 첫 차단 시점에만 알림 (스팸 방지)
+                if not fail_info.get("alerted"):
+                    fail_info["alerted"] = True
+                    logger.error(
+                        f"Auto SELL blocked for {pos.name}({ticker}): "
+                        f"{fail_info['count']}회 연속 실패 — {self._SELL_FAIL_BACKOFF_MIN}분 차단. "
+                        f"수동 매도 필요."
+                    )
+                    if self.telegram and self.telegram.enabled:
+                        try:
+                            self.telegram.send_alert_sync(
+                                "error",
+                                f"⚠️ <b>자동 매도 차단</b>\n"
+                                f"{pos.name}({ticker}) — {fail_info['count']}회 연속 KIS API 실패\n"
+                                f"사유: {reason}\n"
+                                f"→ {self._SELL_FAIL_BACKOFF_MIN}분 자동 시도 중지. KIS 앱에서 수동 매도 필요.",
+                            )
+                        except Exception:
+                            pass
+                return None
+            else:
+                # backoff 만료 — 카운터 리셋하고 재시도
+                self._sell_failures.pop(ticker, None)
+
         try:
             # [PARTIAL:X%] 태그로 부분 매도 비율 파싱
             import re
@@ -241,6 +275,13 @@ class RiskManager:
                 reason=f"[AUTO] {reason}",
                 signal_json="",
             )
+            # 실패 카운터 갱신
+            if result and result.get("status") == "FAILED":
+                info = self._sell_failures.setdefault(ticker, {"count": 0, "first": datetime.now(), "alerted": False})
+                info["count"] += 1
+            elif result and result.get("status") in ("SUBMITTED", "SIMULATED"):
+                self._sell_failures.pop(ticker, None)  # 성공 시 카운터 리셋
+
             if result:
                 result["reason"] = reason
                 if "pnl" not in result:
@@ -249,6 +290,8 @@ class RiskManager:
             return result
         except Exception as e:
             logger.error(f"Risk exit execution failed for {ticker}: {e}")
+            info = self._sell_failures.setdefault(ticker, {"count": 0, "first": datetime.now(), "alerted": False})
+            info["count"] += 1
             return None
 
     def process_trade_result(self, result: dict, suppress_notification: bool = False) -> None:

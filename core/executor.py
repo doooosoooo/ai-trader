@@ -359,8 +359,9 @@ class OrderExecutor:
                 hashkey = self.auth.get_hashkey(body)
                 headers = self.auth.build_headers(tr_id, hashkey)
                 resp = requests.post(url, json=body, headers=headers, timeout=10)
-                if resp.status_code in (401, 403) and attempt == 0:
-                    logger.warning(f"Live BUY {resp.status_code}, refreshing token...")
+                # 401/403뿐 아니라 500도 토큰 문제일 수 있어 1회 재발급 시도 (빈 토큰/corrupted 캐시 대응)
+                if resp.status_code in (401, 403, 500) and attempt == 0:
+                    logger.warning(f"Order {resp.status_code}, refreshing token & retrying...")
                     self.auth.invalidate_token()
                     import time; time.sleep(1)
                     continue

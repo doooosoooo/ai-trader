@@ -68,24 +68,42 @@ class KISAuth:
             if not self._token_cache_path.exists():
                 return False
             import json as _json
-            data = _json.loads(self._token_cache_path.read_text())
-            expires = datetime.fromisoformat(data["expires"])
+            raw = self._token_cache_path.read_text()
+            # 빈 파일 또는 corrupted 캐시 방어 (atomic write 실패 시 0바이트 가능)
+            if not raw.strip():
+                logger.warning("KIS token cache is empty — will re-issue")
+                return False
+            data = _json.loads(raw)
+            token = data.get("token", "")
+            expires_str = data.get("expires", "")
+            if not token or not expires_str:
+                logger.warning("KIS token cache missing token/expires — will re-issue")
+                return False
+            expires = datetime.fromisoformat(expires_str)
             if datetime.now() >= expires:
                 return False
-            self._access_token = data["token"]
+            self._access_token = token
             self._token_expires = expires
             return True
-        except Exception:
+        except Exception as e:
+            logger.warning(f"KIS token cache load failed: {e}")
             return False
 
     def _save_cached_token(self):
+        # 빈 토큰 저장 방지 — corrupted state로 다음 load가 실패하지 않도록
+        if not self._access_token:
+            logger.warning("KIS token is empty — skipping cache save")
+            return
         try:
             import json as _json
             self._token_cache_path.parent.mkdir(parents=True, exist_ok=True)
-            self._token_cache_path.write_text(_json.dumps({
+            # Atomic write: temp file에 쓴 후 rename (PM2 재시작 중 중단되어도 corrupted 0byte 파일 방지)
+            tmp_path = self._token_cache_path.with_suffix(".json.tmp")
+            tmp_path.write_text(_json.dumps({
                 "token": self._access_token,
                 "expires": self._token_expires.isoformat(),
             }))
+            tmp_path.replace(self._token_cache_path)
         except Exception as e:
             logger.warning(f"Failed to cache KIS token: {e}")
 
