@@ -48,6 +48,7 @@ from core.account_manager import AccountManager
 from data.pipeline import DataPipeline
 from interfaces.telegram_bot import TelegramBot
 from review.daily_review import DailyReviewer
+from review.incident_analyzer import IncidentAnalyzer
 from review.strategy_evaluator import StrategyEvaluator
 from simulation.simulator import SimulationTracker
 from data.collectors.screener import StockScreener
@@ -104,6 +105,15 @@ class TradingSystem:
             self.portfolio,
             db_path=settings.get("system", {}).get("db_path", "data/storage/trader.db"),
         )
+        self.incident_analyzer = IncidentAnalyzer(
+            llm_engine=self.llm_engine,
+            portfolio=self.portfolio,
+            circuit_breaker=self.circuit_breaker,
+            telegram=self.telegram,
+            db_path=settings.get("system", {}).get("db_path", "data/storage/trader.db"),
+        )
+        # circuit_breaker 늦은 wiring (생성 시점엔 incident_analyzer가 없었음)
+        self.circuit_breaker.set_rca_callback(self.incident_analyzer.trigger)
         self.strategy_evaluator = StrategyEvaluator(self.portfolio)
 
         # Simulation
@@ -126,6 +136,7 @@ class TradingSystem:
             telegram=self.telegram,
             sim_tracker=self.sim_tracker,
             sync_account_fn=lambda: self.account_manager.sync_account_from_broker(),
+            rca_callback=self.incident_analyzer.trigger,
         )
 
         # live 모드면 실계좌 동기화, 시뮬레이션이면 초기 자본금 설정
@@ -155,6 +166,7 @@ class TradingSystem:
         self._paused = False
         self._running = False
         self._last_report_notify: datetime | None = None  # 마지막 정기 리포트 알림 시각
+        self._daily_loss_rca_fired_date: str = ""  # daily_loss_2pct RCA 일별 dedupe
         self._cancelled_order_nos_file = Path("data/cancelled_orders.txt")
         self._cancelled_order_nos: set[str] = set()
         if self._cancelled_order_nos_file.exists():
@@ -760,6 +772,22 @@ class TradingSystem:
         if prev_asset > 0:
             daily_pnl_pct = (self.portfolio.total_asset - prev_asset) / prev_asset
             self.circuit_breaker.check_daily_loss(daily_pnl_pct)
+
+            # 일일 손실 -2% 이상 → Incident RCA (일별 1회)
+            # 서킷 HALTED 임계값(-3%)보다 먼저 발동 → 악화 전 조기 분석
+            if daily_pnl_pct <= -0.02 and self._daily_loss_rca_fired_date != today_str:
+                self._daily_loss_rca_fired_date = today_str
+                try:
+                    self.incident_analyzer.trigger(
+                        event_type="daily_loss_2pct",
+                        ticker=None,
+                        event_detail=(
+                            f"일일 손실 {daily_pnl_pct:.2%} "
+                            f"(전일 자산 {prev_asset:,.0f} → 현재 {self.portfolio.total_asset:,.0f})"
+                        ),
+                    )
+                except Exception as e:
+                    logger.warning(f"daily_loss RCA trigger failed: {e}")
 
         # 총자산 비상 체크
         self.circuit_breaker.check_emergency_loss(self.portfolio.total_pnl_pct)

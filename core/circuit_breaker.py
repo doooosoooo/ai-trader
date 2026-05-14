@@ -33,11 +33,17 @@ class CircuitTrigger(str, Enum):
 class CircuitBreaker:
     """시스템 레벨 비상 정지 관리."""
 
-    def __init__(self, safety_rules: dict, notify_callback: Callable | None = None):
+    def __init__(
+        self,
+        safety_rules: dict,
+        notify_callback: Callable | None = None,
+        rca_callback: Callable | None = None,
+    ):
         self.safety_rules = safety_rules
         self.state = CircuitState.NORMAL
         self.triggers: list[dict] = []
         self._notify = notify_callback  # Telegram 알림 콜백
+        self._rca_callback = rca_callback  # Incident RCA 트리거 콜백
         self._api_failure_count = 0
         self._llm_failure_count = 0
         self._halted_at: datetime | None = None
@@ -45,6 +51,10 @@ class CircuitBreaker:
         self._daily_pnl_pct: float | None = None
         self._kospi_change_pct: float | None = None
         self._load_state()
+
+    def set_rca_callback(self, cb: Callable | None) -> None:
+        """RCA 콜백 늦은 wiring (생성 시 IncidentAnalyzer가 아직 없을 때)."""
+        self._rca_callback = cb
 
     def _load_state(self) -> None:
         """영속화된 상태 복원 (PM2 재시작 시 알림 스팸 방지)."""
@@ -261,6 +271,17 @@ class CircuitBreaker:
                 )
             except Exception as e:
                 logger.error(f"Circuit breaker notification failed: {e}")
+
+        # Incident RCA — HALTED/EMERGENCY 진입 시에만 (WARNING은 단순 주의)
+        if state_changed and self._rca_callback and new_state in (CircuitState.HALTED, CircuitState.EMERGENCY):
+            try:
+                self._rca_callback(
+                    event_type=f"circuit_breaker_{new_state.value}",
+                    ticker=None,
+                    event_detail=f"trigger={trigger.value} | {message}",
+                )
+            except Exception as e:
+                logger.error(f"Circuit breaker RCA callback failed: {e}")
 
     def manual_reset(self) -> str:
         """사용자 수동 리셋."""

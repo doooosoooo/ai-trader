@@ -25,6 +25,7 @@ class RiskManager:
         telegram,
         sim_tracker,
         sync_account_fn=None,
+        rca_callback=None,
     ):
         """
         Args:
@@ -35,6 +36,7 @@ class RiskManager:
             telegram: TelegramBot 인스턴스
             sim_tracker: SimulationTracker 인스턴스
             sync_account_fn: 계좌 동기화 콜백 (account_manager.sync_account_from_broker)
+            rca_callback: IncidentAnalyzer.trigger 콜백 (선택)
         """
         self.portfolio = portfolio
         self.executor = executor
@@ -43,6 +45,7 @@ class RiskManager:
         self.telegram = telegram
         self.sim_tracker = sim_tracker
         self.sync_account_fn = sync_account_fn
+        self._rca_callback = rca_callback
         self._watchlist: list[str] | None = None  # 스크리닝 관심종목 (외부에서 설정)
         self._gap_sold_today: dict[str, str] = {}  # {ticker: date_str} 갭상승 익절 중복 방지
         # 자동 매도 연속 실패 추적 — 동일 종목 N회 실패 시 일시 차단 + 알림 (KIS 장애 등 무한 재시도 방지)
@@ -54,6 +57,19 @@ class RiskManager:
         self._concentration_alerted: dict[str, str] = {}
         self._dd_alerted = False
         self._load_alert_state()
+
+    def set_rca_callback(self, cb) -> None:
+        """RCA 콜백 늦은 wiring."""
+        self._rca_callback = cb
+
+    def _safe_rca(self, event_type: str, ticker: str | None = None, event_detail: str = "") -> None:
+        """RCA 콜백 안전 호출 — 실패해도 트레이딩 중단되지 않음."""
+        if not self._rca_callback:
+            return
+        try:
+            self._rca_callback(event_type=event_type, ticker=ticker, event_detail=event_detail)
+        except Exception as e:
+            logger.warning(f"RCA callback failed [{event_type}/{ticker}]: {e}")
 
     def _load_alert_state(self) -> None:
         """영속화된 알림 상태 복원."""
@@ -251,6 +267,15 @@ class RiskManager:
                             )
                         except Exception:
                             pass
+                    # 첫 차단 시점에 RCA 1회 트리거 (60분 dedupe로 반복 호출 자동 차단)
+                    self._safe_rca(
+                        event_type="sell_backoff_blocked",
+                        ticker=ticker,
+                        event_detail=(
+                            f"{pos.name}({ticker}) — {fail_info['count']}회 연속 매도 실패, "
+                            f"{self._SELL_FAIL_BACKOFF_MIN}분 차단. 사유: {reason}"
+                        ),
+                    )
                 return None
             else:
                 # backoff 만료 — 카운터 리셋하고 재시도
@@ -287,6 +312,23 @@ class RiskManager:
                 if "pnl" not in result:
                     result["pnl"] = pre_pnl
                     result["pnl_pct"] = f"{pre_pnl_pct:.2%}"
+
+            # 하드손절 매도 성공 시 RCA 트리거 (pnl ≤ -5%)
+            if (
+                result
+                and result.get("status") in ("SUBMITTED", "SIMULATED")
+                and "하드손절" in reason
+                and pre_pnl_pct <= -0.05
+            ):
+                self._safe_rca(
+                    event_type="hard_stop_loss",
+                    ticker=ticker,
+                    event_detail=(
+                        f"{pos.name}({ticker}) 하드손절 매도 — "
+                        f"pnl {pre_pnl_pct:.2%} (avg {pos.avg_price:,.0f} → "
+                        f"{pos.current_price:,.0f}). {reason}"
+                    ),
+                )
             return result
         except Exception as e:
             logger.error(f"Risk exit execution failed for {ticker}: {e}")
