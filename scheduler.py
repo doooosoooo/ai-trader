@@ -114,6 +114,17 @@ class TradingScheduler:
             name="일일 복기",
         )
 
+        # 뉴스 심층 분석 (평일 08:00/11:00/13:00/15:00) — 거래일에만, 장외 시간 포함
+        # check_hours=False (08:00, 15:00은 장외), check_trading_day=True (공휴일/주말 제외)
+        # 누적 4h 뉴스를 Opus 4.7로 심층 분석 → 다음 trading 사이클 news_summary 자리에 주입
+        self.scheduler.add_job(
+            self._safe_run(self.system.cycle_news_deep_analysis, check_hours=False),
+            CronTrigger(hour="8,11,13,15", minute=0, day_of_week="mon-fri"),
+            id="news_deep_analysis",
+            name="뉴스 심층 분석",
+            misfire_grace_time=300,
+        )
+
         # ML 모델 재학습 (17:00, 배치 모드인 경우)
         ml_config = self.config.get("ml", {})
         if ml_config.get("training_mode") == "batch":

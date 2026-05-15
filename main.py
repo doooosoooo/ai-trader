@@ -50,6 +50,7 @@ from interfaces.telegram_bot import TelegramBot
 from review.daily_review import DailyReviewer
 from review.incident_analyzer import IncidentAnalyzer
 from review.strategy_refiner import StrategyRefiner
+from review.news_analyzer import NewsAnalyzer
 from review.strategy_evaluator import StrategyEvaluator
 from simulation.simulator import SimulationTracker
 from data.collectors.screener import StockScreener
@@ -118,6 +119,14 @@ class TradingSystem:
             portfolio=self.portfolio,
             telegram=self.telegram,
             db_path=settings.get("system", {}).get("db_path", "data/storage/trader.db"),
+        )
+        # watchlist_provider는 인스턴스 생성 후 self._watchlist 참조 — lambda로 lazy 조회
+        self.news_analyzer = NewsAnalyzer(
+            llm_engine=self.llm_engine,
+            portfolio=self.portfolio,
+            market_client=self.market_client,
+            watchlist_provider=lambda: getattr(self, "_watchlist", []),
+            telegram=self.telegram,
         )
         # circuit_breaker 늦은 wiring (생성 시점엔 incident_analyzer가 없었음)
         self.circuit_breaker.set_rca_callback(self.incident_analyzer.trigger)
@@ -533,11 +542,20 @@ class TradingSystem:
             backtest_feedback = self.analysis_store.build_backtest_feedback(
                 self._watchlist, list(self.portfolio.positions.keys()),
             )
+            # 뉴스 요약 결합: Opus 심층 분석(있을 때, 6h 캐시) + 헤드라인 요약
+            base_news = data.get("news_summary", "") or ""
+            deep_news = ""
+            try:
+                deep_news = self.news_analyzer.get_latest_deep_summary()
+            except Exception as e:
+                logger.debug(f"News deep summary fetch failed: {e}")
+            combined_news = (deep_news + "\n\n" + base_news).strip() if deep_news else base_news
+
             signal = self.llm_engine.analyze_market(
                 portfolio=portfolio_summary,
                 market_data=data.get("market_data", {}),
                 ml_predictions=ml_predictions,
-                news_summary=data.get("news_summary", ""),
+                news_summary=combined_news,
                 macro_data=data.get("macro_data", {}),
                 screening_context=screening_context,
                 prediction_feedback=prediction_feedback,
@@ -754,6 +772,15 @@ class TradingSystem:
 
         except Exception as e:
             logger.warning(f"News check failed: {e}")
+
+    def cycle_news_deep_analysis(self):
+        """뉴스 심층 분석 사이클 — 평일 08/11/13/15 KST. 누적 뉴스를 Opus 4.7로 분석."""
+        if self._paused:
+            return
+        try:
+            self.news_analyzer.trigger()
+        except Exception as e:
+            logger.warning(f"News deep analysis trigger failed: {e}")
 
     def cycle_circuit_check(self):
         """서킷브레이커 정기 체크."""

@@ -672,6 +672,103 @@ new_active_md는 반드시 완전한 markdown 전문을 포함해야 합니다 (
         )
         return self._parse_json_response(raw)
 
+    def generate_news_deep_analysis(
+        self,
+        news_items: list[dict],
+        watchlist_meta: list[dict],
+        holdings_meta: list[dict],
+        market_context: dict,
+        previous_implications: str = "",
+    ) -> dict:
+        """뉴스 심층 분석 — Opus 4.7로 누적 뉴스에서 거시/섹터/종목 시그널 추출.
+
+        category='news'로 비용 추적. 결과의 trading_implications는 다음 trading 사이클의
+        news_summary 자리에 주입되어 LLM의 컨텍스트가 됨.
+        """
+        system_prompt = """당신은 한국 주식 자동매매 시스템의 뉴스 심층 분석 엔진입니다.
+지난 4시간 누적된 뉴스 헤드라인을 종합하여 거시 환경, 섹터 흐름, 종목별 영향도,
+리스크 이벤트를 정리합니다. 결과는 자동매매 시스템의 다음 매매 사이클이 직접 참조합니다.
+
+분석 원칙:
+1. **헤드라인만으로 단정 금지** — 본문이 없으므로 추정에 의존. 확실하지 않은 시그널은 "추정" 명시
+2. **워치리스트/보유 종목 우선** — 무관한 종목 분석에 토큰 낭비 금지
+3. **거시 → 섹터 → 종목 순서로 좁히기** — 환율/금리/원자재 같은 거시 흐름이 어느 섹터에 영향
+4. **리스크 이벤트 강조** — 회계 의혹, 정책 변화, 해외 충격은 별도 risk_events로 분리
+5. **trading_implications는 매매 시스템용 실행 가능 시그널** — "어느 섹터 추가 관심", "어느 종목 단기 회피" 등
+6. 직전 분석(있을 때)과의 변화에 주목 — 새로운 시그널 vs 지속/약화
+
+⚠️ 절대 금지:
+- 헤드라인에 명시되지 않은 종목명/숫자 창작
+- "확실히 상승할 것" 같은 단정 — 항상 확률/조건부 표현
+- 손절선/익절선 같은 매매 룰 제안 (trading LLM이 별도 판단)
+
+반드시 아래 JSON 형식으로만 응답하세요:
+{
+  "headline": "텔레그램 헤더 (80자 이내, 가장 중요한 한 줄)",
+  "macro_summary": "거시 환경 요약 (환율/금리/지수/대외 충격, 2-3문장)",
+  "sector_trends": [
+    {
+      "sector": "반도체 | 2차전지 | 자동차 | 금융 | ...",
+      "trend": "강세 | 약세 | 중립 | 변동성 확대",
+      "drivers": "주요 동인 (1-2문장)",
+      "tickers": ["관련 워치리스트/보유 종목 코드"]
+    }
+  ],
+  "ticker_impacts": [
+    {
+      "ticker": "종목코드",
+      "name": "종목명",
+      "sentiment": "positive | negative | neutral",
+      "impact_score": 1-10,
+      "reason": "근거 헤드라인 인용 + 한 줄 해석"
+    }
+  ],
+  "risk_events": [
+    {
+      "event": "이벤트 요약 (1문장)",
+      "severity": "low | medium | high",
+      "affected_sectors": ["영향받는 섹터"],
+      "action_hint": "회피/관망/모니터링 등 한 줄"
+    }
+  ],
+  "trading_implications": "다음 매매 사이클 LLM이 참고할 핵심 시그널 (3-5문장, 한국어). 거시 톤, 강조 섹터, 회피 종목, 리스크 신호를 압축."
+}"""
+
+        # 뉴스 압축 (토큰 절감)
+        compact_news = []
+        for n in news_items[-200:]:  # 최대 200건
+            compact_news.append({
+                "title": (n.get("title", "") or "")[:200],
+                "ticker": n.get("ticker", ""),
+                "source": n.get("source", ""),
+                "ts": (n.get("datetime", "") or n.get("collected_at", ""))[:16],
+            })
+
+        user_message = f"""## 분석 대상 뉴스 ({len(compact_news)}건, 최근 4시간 누적)
+{json.dumps(compact_news, ensure_ascii=False, indent=2)[:60000]}
+
+## 워치리스트 ({len(watchlist_meta)}종목)
+{json.dumps(watchlist_meta, ensure_ascii=False, indent=2)[:6000]}
+
+## 보유 종목 ({len(holdings_meta)}종목)
+{json.dumps(holdings_meta, ensure_ascii=False, indent=2)[:6000]}
+
+## 시장 컨텍스트
+{json.dumps(market_context, ensure_ascii=False, indent=2)[:4000]}
+
+## 직전 분석의 trading_implications (있을 때, 변화 비교용)
+{previous_implications[:2000] if previous_implications else '(첫 분석)'}
+
+위 데이터를 기반으로 뉴스 심층 분석을 JSON으로만 응답해주세요."""
+
+        raw = self._call_llm(
+            system_prompt, user_message,
+            model="claude-opus-4-7",
+            category="news",
+            max_tokens=8192,
+        )
+        return self._parse_json_response(raw)
+
     def _build_system_prompt(self) -> str:
         return """당신은 한국 주식 자동매매 시스템의 전략 엔진입니다.
 시장 데이터, ML 예측, 뉴스, 매크로 환경을 종합적으로 분석하여 매매 판단을 내립니다.
