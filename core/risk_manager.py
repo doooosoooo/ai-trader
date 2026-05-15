@@ -56,6 +56,8 @@ class RiskManager:
         # 집중도/드로다운 알림 상태 — 파일 영속화 (PM2 재시작 시 스팸 방지)
         self._concentration_alerted: dict[str, str] = {}
         self._dd_alerted = False
+        # 분할 추가매수 (물타기) 일별 dedupe — {ticker: {tier: date_str}}
+        self._avg_down_fired: dict[str, dict[int, str]] = {}
         self._load_alert_state()
 
     def set_rca_callback(self, cb) -> None:
@@ -94,16 +96,40 @@ class RiskManager:
         except Exception as e:
             logger.warning(f"Alert state save failed: {e}")
 
+    # 폭락장 손절 일시정지 임계값 (코스피 일중 등락률)
+    _CRASH_PAUSE_THRESHOLD = -0.02
+    # 폭락장 일시정지가 작동하더라도 평가손실이 이 절대선을 넘으면 무조건 매도
+    _ABSOLUTE_FLOOR_PNL = -0.15
+    # 분할 추가매수 (물타기) 트리거 — 폭락장 + 현금 ≥ 40% 시 활성화
+    _AVG_DOWN_CASH_RATIO_MIN = 0.40
+    _AVG_DOWN_TIER_1_PNL = -0.05  # 1차 추가매수 트리거 평단 대비 손실률
+    _AVG_DOWN_TIER_2_PNL = -0.10  # 2차 추가매수 트리거
+    _AVG_DOWN_RATIO_PER_TIER = 1 / 3  # 매 차수마다 보유 수량의 1/3 추가매수
+
     def check_risk_exits(self) -> list[dict]:
         """리스크 기반 자동 청산 — 손절/트레일링스탑/보유기간 초과.
 
         cycle_data_collection()에서 가격 업데이트 직후 호출.
         해당 조건 발생 시 텔레그램 확인 없이 즉시 매도.
+
+        폭락장 가드: 코스피 일중 -2% 이상 하락 중에는 하드손절/트레일링/조기익절을 일시정지.
+        단, 평가손실 -15% 도달 종목은 절대선으로 무조건 매도.
+        같은 조건 충족 시 분할 추가매수(물타기) 자동 트리거.
         """
         params = self.config_manager.trading_params
         default_trailing_stop_pct = params.get("trailing_stop_pct", 0.06)
         sector_trailing_stop = params.get("trailing_stop_by_sector", {}) or {}
         max_hold_days = params.get("holding_period_days", {}).get("max", 20)
+
+        # 폭락장 여부 — 코스피 일중 등락률 -2% 이하면 자동 손절 일시정지
+        kospi_change = self._get_kospi_change_pct()
+        crash_pause = kospi_change is not None and kospi_change <= self._CRASH_PAUSE_THRESHOLD
+        if crash_pause:
+            logger.warning(
+                f"Crash market pause active (KOSPI {kospi_change:.2%} ≤ "
+                f"{self._CRASH_PAUSE_THRESHOLD:.0%}) — 하드손절/트레일링/조기익절 일시정지, "
+                f"절대선 {self._ABSOLUTE_FLOOR_PNL:.0%}만 유지"
+            )
 
         results = []
         for ticker, pos in list(self.portfolio.positions.items()):
@@ -116,28 +142,50 @@ class RiskManager:
             sector = self.safety_guard.get_sector(ticker) if hasattr(self.safety_guard, "get_sector") else None
             trailing_stop_pct = sector_trailing_stop.get(sector, default_trailing_stop_pct) if sector else default_trailing_stop_pct
 
-            # 1. 하드 손절 (strategy_type별 다른 손절선)
-            if pos.pnl_pct <= pos_sl:
-                reason = f"하드손절 ({pos.pnl_pct:.1%} ≤ {pos_sl:.0%}) [{pos.label}]"
+            # 0. 절대선 — 폭락장 일시정지와 무관하게 평가손실 -15% 도달 시 무조건 매도
+            if pos.pnl_pct <= self._ABSOLUTE_FLOOR_PNL:
+                reason = (
+                    f"절대선손절 ({pos.pnl_pct:.1%} ≤ {self._ABSOLUTE_FLOOR_PNL:.0%}) [{pos.label}]"
+                )
 
-            # 2. 트레일링 스탑 (수익 구간에서만 적용, avg_price=0 포지션은 스킵)
-            #    섹터별 변동성 기반 스탑 적용 (반도체/2차전지=10%, 금융=5% 등)
+            # 1. 하드 손절 (strategy_type별) — 폭락장 일시정지 적용
+            if reason is None and pos.pnl_pct <= pos_sl:
+                if crash_pause:
+                    logger.info(
+                        f"[crash_pause] 하드손절 보류 {pos.name}({ticker}) "
+                        f"pnl={pos.pnl_pct:.1%} (코스피 {kospi_change:.2%})"
+                    )
+                else:
+                    reason = f"하드손절 ({pos.pnl_pct:.1%} ≤ {pos_sl:.0%}) [{pos.label}]"
+
+            # 2. 트레일링 스탑 — 폭락장 일시정지 적용
             if reason is None and pos.avg_price > 0 and pos.peak_price > pos.avg_price:
                 drawdown = (pos.peak_price - pos.current_price) / pos.peak_price
                 if drawdown >= trailing_stop_pct:
-                    sector_label = f" [{sector} {trailing_stop_pct:.0%}]" if sector and sector in sector_trailing_stop else ""
-                    reason = (
-                        f"트레일링스탑 (고점{pos.peak_price:,.0f}"
-                        f"→현재{pos.current_price:,.0f}, -{drawdown:.1%}){sector_label} [{pos.label}]"
-                    )
+                    if crash_pause:
+                        logger.info(
+                            f"[crash_pause] 트레일링스탑 보류 {pos.name}({ticker}) "
+                            f"drawdown={drawdown:.1%}"
+                        )
+                    else:
+                        sector_label = f" [{sector} {trailing_stop_pct:.0%}]" if sector and sector in sector_trailing_stop else ""
+                        reason = (
+                            f"트레일링스탑 (고점{pos.peak_price:,.0f}"
+                            f"→현재{pos.current_price:,.0f}, -{drawdown:.1%}){sector_label} [{pos.label}]"
+                        )
 
-            # 3. 조기 익절 (수익 +5% 이상이면서 고점 대비 -5% 하락 시)
+            # 3. 조기 익절 (수익 +5% 이상이면서 고점 대비 -5% 하락 시) — 폭락장 일시정지 적용
             if reason is None and pos.pnl_pct >= 0.05:
                 if pos.peak_price > 0 and pos.current_price < pos.peak_price * 0.95:
-                    reason = (
-                        f"조기익절 (수익 {pos.pnl_pct:.1%}, "
-                        f"고점{pos.peak_price:,.0f}→현재{pos.current_price:,.0f} 하락반전) [{pos.label}]"
-                    )
+                    if crash_pause:
+                        logger.info(
+                            f"[crash_pause] 조기익절 보류 {pos.name}({ticker}) pnl={pos.pnl_pct:.1%}"
+                        )
+                    else:
+                        reason = (
+                            f"조기익절 (수익 {pos.pnl_pct:.1%}, "
+                            f"고점{pos.peak_price:,.0f}→현재{pos.current_price:,.0f} 하락반전) [{pos.label}]"
+                        )
 
             # 3-B. 갭상승 부분 익절 (장시작 30분 + 코스피 +1.5% + 수익 +3% 이상)
             # value는 장기 보유이므로 제외, 당일 1회만
@@ -172,6 +220,11 @@ class RiskManager:
                 result = self._execute_risk_exit(ticker, pos, reason)
                 if result:
                     results.append(result)
+
+        # 3.5 폭락장 분할 추가매수 (물타기) — 손절 일시정지와 짝으로 활성화
+        if crash_pause:
+            avg_down_results = self._trigger_avg_down_orders(kospi_change)
+            results.extend(avg_down_results)
 
         # 4. 집중도 경고 (자동 매도는 아니지만 텔레그램 알림)
         # 2종목 이하면 비중 초과는 불가피하므로 경고 스킵
@@ -225,6 +278,141 @@ class RiskManager:
                 self._save_alert_state()
 
         return results
+
+    def _trigger_avg_down_orders(self, kospi_change: float | None) -> list[dict]:
+        """폭락장 + 현금 ≥ 40% 시 평단 -5%/-10% 도달 종목에 자동 분할 추가매수.
+
+        - swing/value 종목만 (daytrading 제외 — 짧은 손익 구조에 맞지 않음)
+        - 1차(평단 -5%) / 2차(평단 -10%) 각각 보유 비중의 1/3 추가매수
+        - 동일 종목 동일 차수는 일별 1회만 (`_avg_down_fired` dedupe)
+        - 종목당 max_position_ratio (15%) 초과 금지 (캡)
+        - 절대선 -15% 종목은 위 check_risk_exits에서 이미 청산되므로 진입 안 함
+        """
+        if not self.portfolio.positions:
+            return []
+
+        total_asset = self.portfolio.total_asset or 1
+        cash = getattr(self.portfolio, "cash", 0) or 0
+        cash_ratio = cash / total_asset
+        if cash_ratio < self._AVG_DOWN_CASH_RATIO_MIN:
+            logger.info(
+                f"[avg_down] 현금비율 {cash_ratio:.1%} < {self._AVG_DOWN_CASH_RATIO_MIN:.0%} — skip"
+            )
+            return []
+
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        max_position_ratio = self.safety_guard.rules.get("max_position_ratio", 0.15)
+        actions: list[dict] = []
+        fired_log: list[tuple[str, int]] = []
+
+        for ticker, pos in self.portfolio.positions.items():
+            if pos.avg_price <= 0:
+                continue
+            if (pos.strategy_type or "swing") == "daytrading":
+                continue
+
+            # 차수 결정 — 2차가 우선 (절대선 -15% 직전 마지막 분할)
+            if pos.pnl_pct <= self._AVG_DOWN_TIER_2_PNL:
+                tier = 2
+            elif pos.pnl_pct <= self._AVG_DOWN_TIER_1_PNL:
+                tier = 1
+            else:
+                continue
+
+            # 일별 dedupe (같은 종목 같은 차수는 하루 1회)
+            fired = self._avg_down_fired.get(ticker, {})
+            if fired.get(tier) == today_str:
+                continue
+
+            # 매수 비중 = 보유 비중의 1/3
+            current_weight = (pos.market_value or 0) / total_asset
+            buy_ratio = current_weight * self._AVG_DOWN_RATIO_PER_TIER
+
+            # 종목당 한도 캡
+            if current_weight + buy_ratio > max_position_ratio:
+                buy_ratio = max(0.0, max_position_ratio - current_weight)
+
+            # 너무 작은 주문은 의미 없음 (수수료/슬리피지 고려, 0.5% 미만 컷)
+            if buy_ratio < 0.005:
+                logger.info(
+                    f"[avg_down] {pos.name}({ticker}) {tier}차 skip — "
+                    f"종목 비중 {current_weight:.1%} 한도 근접 (buy_ratio={buy_ratio:.2%})"
+                )
+                continue
+
+            # 현금 잔액 캡 — 동시 여러 종목 추가매수 시 현금 부족 방지
+            order_amount = total_asset * buy_ratio
+            if order_amount > cash:
+                buy_ratio = cash / total_asset
+                if buy_ratio < 0.005:
+                    continue
+
+            limit_price = int(pos.current_price * 0.99)  # 현재가 -1% 보수적 지정가
+            actions.append({
+                "type": "BUY",
+                "ticker": ticker,
+                "name": pos.name,
+                "ratio": buy_ratio,
+                "urgency": "limit",
+                "limit_price": limit_price,
+                "reason": (
+                    f"폭락장 분할추가매수 {tier}차 (평단대비 {pos.pnl_pct:.1%}, "
+                    f"비중 {current_weight:.1%}+{buy_ratio:.1%}, 코스피 {kospi_change:.2%})"
+                ),
+                "strategy_type": pos.strategy_type or "swing",
+            })
+            fired_log.append((ticker, tier))
+            cash -= order_amount  # 다음 종목 계산 시 차감
+
+        if not actions:
+            return []
+
+        pseudo_signal = {
+            "reasoning": f"RiskManager 자동 분할 추가매수 (폭락장 + 현금 {cash_ratio:.0%})",
+            "actions": actions,
+            "risk_assessment": "MEDIUM",
+            "market_outlook": f"코스피 {kospi_change:.2%} 폭락장 — 분할 평단조정",
+            "config_adjustments": [],
+        }
+
+        current_prices = {tk: p.current_price for tk, p in self.portfolio.positions.items()}
+        logger.warning(f"Avg-down triggered: {len(actions)} orders")
+
+        try:
+            results = self.executor.execute_signal(pseudo_signal, current_prices)
+        except Exception as e:
+            logger.error(f"Avg-down execution failed: {e}")
+            return []
+
+        # 성공 시 dedupe 마킹 (실패 시 다음 사이클에서 재시도 가능)
+        for r in results or []:
+            if r and r.get("status") not in ("FAILED",):
+                tk = r.get("ticker")
+                for (etk, tier) in fired_log:
+                    if etk == tk:
+                        f = self._avg_down_fired.get(tk, {})
+                        f[tier] = today_str
+                        self._avg_down_fired[tk] = f
+
+        # 텔레그램 알림
+        if self.telegram and getattr(self.telegram, "enabled", False):
+            try:
+                lines = [
+                    f"📥 <b>폭락장 분할 추가매수 (자동)</b>",
+                    f"코스피 {kospi_change:.2%} / 현금비율 {cash_ratio:.0%}",
+                    "",
+                ]
+                for a in actions:
+                    lines.append(
+                        f"• {a['name']}({a['ticker']}) "
+                        f"비중 +{a['ratio']:.1%} @ {a['limit_price']:,}원"
+                    )
+                    lines.append(f"  └ {a['reason']}")
+                self.telegram.send_alert_sync("trade_executed", "\n".join(lines))
+            except Exception as e:
+                logger.warning(f"Avg-down telegram send failed: {e}")
+
+        return results or []
 
     def _get_kospi_change_pct(self) -> float | None:
         """현재 코스피 당일 등락률 조회."""
