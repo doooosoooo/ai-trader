@@ -672,6 +672,101 @@ new_active_md는 반드시 완전한 markdown 전문을 포함해야 합니다 (
         )
         return self._parse_json_response(raw)
 
+    def extract_param_adjustment(
+        self,
+        suggestion_text: str,
+        rule_id: str,
+        current_params_flat: dict,
+        adjustable_limits: dict,
+    ) -> dict:
+        """자연어 제안을 trading-params.yaml의 {param, value, reason}로 추출.
+
+        category='trading'으로 비용 추적 (작은 호출, Sonnet 충분).
+        반환: {"param": "...", "value": ..., "reason": "..."} 또는 {"error": "..."}.
+        """
+        system_prompt = """당신은 한국 주식 자동매매 시스템의 룰 수정 보조 엔진입니다.
+자연어 제안을 trading-params.yaml의 단일 키-값 수정 형식으로 변환합니다.
+
+규칙:
+1. **adjustable_limits 화이트리스트 내 파라미터만 출력** — 목록 밖이면 error
+2. **단일 키 수정만** — 여러 키 동시 수정 제안은 가장 핵심 1개만 선택
+3. **현재값 대비 합리적 범위** — 극단적 변경(>50%) 회피
+4. **active.md 수정이 필요한 제안이면 error** — "active.md 텍스트 수정 필요"로 분류
+
+반드시 JSON으로만 응답:
+- 성공: {"param": "param.key", "value": 숫자또는불린, "reason": "변경 이유 한 줄"}
+- 실패: {"error": "에러 사유 (한 줄)"}"""
+
+        user_message = f"""## 제안 원문
+- rule_id: {rule_id}
+- suggestion: {suggestion_text}
+
+## 현재 trading-params (플랫)
+{json.dumps(current_params_flat, ensure_ascii=False, indent=2)[:3000]}
+
+## adjustable_limits (화이트리스트 + 범위)
+{json.dumps(adjustable_limits, ensure_ascii=False, indent=2)[:2000]}
+
+JSON으로만 응답."""
+
+        raw = self._call_llm(system_prompt, user_message, category="trading", max_tokens=1024)
+        return self._parse_json_response(raw)
+
+    def apply_suggestion_to_strategy(
+        self,
+        suggestion_text: str,
+        rule_id: str,
+        current_active_md: str,
+    ) -> dict:
+        """단일 제안을 active.md에 반영한 새 전문 생성. weekly_refinement와 유사하나
+        한 가지 제안에만 집중. category='weekly_review'로 비용 추적.
+
+        반환: weekly_refinement와 동일 구조 (headline, new_active_md, proposed_changes, ...).
+        """
+        system_prompt = """당신은 한국 주식 자동매매 시스템의 전략 다듬기 엔진입니다.
+사용자가 텔레그램에서 daily_review/RCA 제안을 검토용으로 변환 요청했습니다.
+**한 가지 제안에만** 집중하여 active.md를 미세 조정한 새 전문을 출력합니다.
+
+원칙:
+1. **제안 범위만 수정** — 다른 섹션은 그대로 유지
+2. **핵심 안전장치 유지** — 손절선/시장가 금지/E3 미보유 SELL 룰 절대 약화 금지
+3. **새 active.md 전문 출력** — 부분 패치가 아니라 새 버전 전체
+
+⚠️ 금지:
+- 손절 폭 -5%/-10% 완화 금지
+- 시장가 매수 허용 금지 (urgency: limit 강제 유지)
+- 익절 단독 매도 허용 금지
+- 새 strategy_type 도입 금지
+- E3(미보유 SELL) 룰 약화 금지
+
+반드시 JSON 형식:
+{
+  "headline": "한 줄 요약 (80자 이내, 텔레그램용)",
+  "proposed_changes": [
+    {"section": "...", "current": "...", "new": "...", "rationale": "..."}
+  ],
+  "new_active_md": "새 active.md 전문 (markdown 형식, 최소 2000자, '# 트레이딩 전략' 헤더 포함)",
+  "risk_notes": "모니터링 포인트"
+}"""
+
+        user_message = f"""## 검토용 변환 요청 (단일 제안)
+- rule_id: {rule_id}
+- suggestion: {suggestion_text}
+
+## 현재 active.md 전문
+{current_active_md}
+
+위 제안만 반영한 새 active.md 전문을 JSON으로만 응답하세요.
+new_active_md는 반드시 완전한 markdown 전문 (최소 2000자)."""
+
+        raw = self._call_llm(
+            system_prompt, user_message,
+            model="claude-opus-4-7",
+            category="weekly_review",  # 같은 카테고리 — Opus + active.md 전문 생성
+            max_tokens=16384,
+        )
+        return self._parse_json_response(raw)
+
     def generate_news_deep_analysis(
         self,
         news_items: list[dict],

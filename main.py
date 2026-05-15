@@ -51,6 +51,8 @@ from review.daily_review import DailyReviewer
 from review.incident_analyzer import IncidentAnalyzer
 from review.strategy_refiner import StrategyRefiner
 from review.news_analyzer import NewsAnalyzer
+from review.pending_suggestions import PendingSuggestionStore
+from review.suggestion_applier import SuggestionApplier
 from review.strategy_evaluator import StrategyEvaluator
 from simulation.simulator import SimulationTracker
 from data.collectors.screener import StockScreener
@@ -107,18 +109,28 @@ class TradingSystem:
             self.portfolio,
             db_path=settings.get("system", {}).get("db_path", "data/storage/trader.db"),
         )
+        # 룰 수정 제안 저장소 — incident_analyzer/daily_review의 제안을 텔레그램 버튼으로 처리
+        self.pending_suggestions = PendingSuggestionStore()
         self.incident_analyzer = IncidentAnalyzer(
             llm_engine=self.llm_engine,
             portfolio=self.portfolio,
             circuit_breaker=self.circuit_breaker,
             telegram=self.telegram,
             db_path=settings.get("system", {}).get("db_path", "data/storage/trader.db"),
+            pending_suggestions=self.pending_suggestions,
         )
         self.strategy_refiner = StrategyRefiner(
             llm_engine=self.llm_engine,
             portfolio=self.portfolio,
             telegram=self.telegram,
             db_path=settings.get("system", {}).get("db_path", "data/storage/trader.db"),
+        )
+        # 텔레그램 버튼 콜백 → 룰 수정 적용 엔진
+        self.suggestion_applier = SuggestionApplier(
+            llm_engine=self.llm_engine,
+            config_manager=self.config_manager,
+            strategy_refiner=self.strategy_refiner,
+            pending_store=self.pending_suggestions,
         )
         # watchlist_provider는 인스턴스 생성 후 self._watchlist 참조 — lambda로 lazy 조회
         self.news_analyzer = NewsAnalyzer(
@@ -1121,11 +1133,27 @@ class TradingSystem:
         if review.get("overall_score") in (0, "0", None) and not review.get("key_findings"):
             return review
 
-        # 텔레그램 발송
+        # 텔레그램 발송 — strategy_modification_hint 있으면 인라인 버튼 추가
         try:
             if self.telegram and self.telegram.enabled:
                 msg = self.reviewer.format_deep_review_telegram(review)
-                self.telegram.send_alert_sync("daily_report", msg)
+                hint = (review.get("strategy_modification_hint") or {})
+                if hint.get("needed") and hasattr(self.telegram, "send_suggestion_alert_sync"):
+                    suggestion_id = self.pending_suggestions.save(
+                        source="daily_review",
+                        suggestion=hint,
+                        context={
+                            "overall_score": review.get("overall_score"),
+                            "headline": review.get("headline", ""),
+                        },
+                    )
+                    rule_id_str = (hint.get("rule_id", "") or "").lower()
+                    show_param = "trading-params" in rule_id_str or ".yaml" in rule_id_str or "param" in rule_id_str
+                    self.telegram.send_suggestion_alert_sync(
+                        "daily_report", msg, suggestion_id, show_param_apply=show_param,
+                    )
+                else:
+                    self.telegram.send_alert_sync("daily_report", msg)
         except Exception as e:
             logger.error(f"Daily review telegram failed: {e}")
         return review

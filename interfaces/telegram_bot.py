@@ -209,6 +209,64 @@ class TelegramBot:
             text = text[cut:].lstrip("\n")
         return chunks
 
+    def send_suggestion_alert_sync(
+        self, level: str, message: str, suggestion_id: str,
+        show_param_apply: bool = True,
+    ) -> bool:
+        """룰 수정 제안 알림 — 인라인 버튼 3개([⚙️ 즉시 적용][📝 검토용 변환][❌ 무시])와 함께.
+
+        show_param_apply=False면 변환/무시만 표시 (제안이 명백히 active.md 수정인 경우).
+        """
+        if not self.enabled or not self.chat_id or not self._app:
+            logger.info(f"[Alert:{level}] {message[:200]}")
+            return False
+
+        # 인라인 키보드 구성 — callback_data 형식: sugg_<action>_<suggestion_id>
+        buttons = []
+        if show_param_apply:
+            buttons.append(InlineKeyboardButton(
+                "⚙️ 파라미터 즉시 적용", callback_data=f"sugg_apply_{suggestion_id}",
+            ))
+        buttons.append(InlineKeyboardButton(
+            "📝 검토용 변환", callback_data=f"sugg_convert_{suggestion_id}",
+        ))
+        buttons.append(InlineKeyboardButton(
+            "❌ 무시", callback_data=f"sugg_dismiss_{suggestion_id}",
+        ))
+        # 한 줄에 2개씩 배치
+        rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+        keyboard = InlineKeyboardMarkup(rows)
+
+        async def _send():
+            try:
+                await self._app.bot.send_message(
+                    chat_id=self.chat_id,
+                    text=message[:4090],
+                    parse_mode="HTML",
+                    reply_markup=keyboard,
+                )
+            except Exception as e:
+                if "Can't parse entities" in str(e):
+                    try:
+                        await self._app.bot.send_message(
+                            chat_id=self.chat_id, text=message[:4090], reply_markup=keyboard,
+                        )
+                    except Exception as e2:
+                        logger.error(f"suggestion alert plain fallback failed: {e2}")
+                else:
+                    logger.error(f"suggestion alert failed: {e}")
+
+        try:
+            loop = self._loop
+            if loop and loop.is_running():
+                asyncio.run_coroutine_threadsafe(_send(), loop)
+            else:
+                asyncio.run(_send())
+            return True
+        except Exception as e:
+            logger.error(f"send_suggestion_alert_sync failed: {e}")
+            return False
+
     def send_alert_sync(self, level: str, message: str) -> bool:
         """동기 알림 발송 — 스케줄러 스레드에서도 안전하게 동작."""
         if not self.enabled or not self.chat_id or not self._app:
@@ -1394,6 +1452,49 @@ class TelegramBot:
         await query.answer()
 
         data = query.data
+
+        # 룰 수정 제안 — 텔레그램 버튼 라우팅 (daily_review / RCA에서 온 제안)
+        if data.startswith("sugg_"):
+            applier = getattr(self.system, "suggestion_applier", None)
+            if not applier:
+                await query.edit_message_text("⚠️ suggestion_applier가 초기화되지 않음")
+                return
+
+            # callback_data 형식: sugg_<action>_<suggestion_id>
+            # action: apply / convert / dismiss. suggestion_id는 'sugg_YYYYMMDD_HHMMSS_xxxx'
+            rest = data[len("sugg_"):]
+            try:
+                action, suggestion_id = rest.split("_", 1)
+            except ValueError:
+                await query.edit_message_text(f"⚠️ 잘못된 callback: {data[:80]}")
+                return
+
+            loop = asyncio.get_event_loop()
+            try:
+                if action == "apply":
+                    ok, msg = await loop.run_in_executor(None, applier.apply_param, suggestion_id)
+                elif action == "convert":
+                    ok, msg = await loop.run_in_executor(None, applier.convert_to_refinement, suggestion_id)
+                elif action == "dismiss":
+                    ok, msg = await loop.run_in_executor(None, applier.dismiss, suggestion_id)
+                else:
+                    ok, msg = False, f"알 수 없는 action: {action}"
+            except Exception as e:
+                logger.error(f"suggestion callback failed: {e}")
+                ok, msg = False, f"⚠️ 처리 중 오류: {str(e)[:200]}"
+
+            prefix = "✅" if ok else "ℹ️"
+            try:
+                # 원본 메시지에 결과 append (버튼 제거)
+                original = (query.message.text or query.message.caption or "")[:2000]
+                await query.edit_message_text(
+                    f"{original}\n\n──────────\n{prefix} <b>처리 결과</b>\n{msg}",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                # 길이 초과 등 폴백 — 결과만 전송
+                await query.edit_message_text(f"{prefix} {msg}", parse_mode="HTML")
+            return
 
         # 파라미터 강제 적용
         if data.startswith("force_param_"):

@@ -56,12 +56,14 @@ def _mask_secrets(text: str) -> str:
 class IncidentAnalyzer:
     """이벤트 트리거 기반 근본 원인 분석 — Opus 4.7."""
 
-    def __init__(self, llm_engine, portfolio, circuit_breaker, telegram, db_path: str = "data/storage/trader.db"):
+    def __init__(self, llm_engine, portfolio, circuit_breaker, telegram, db_path: str = "data/storage/trader.db", pending_suggestions=None):
         self.llm = llm_engine
         self.portfolio = portfolio
         self.circuit_breaker = circuit_breaker
         self.telegram = telegram
         self.db_path = db_path
+        # 룰 수정 제안 저장소 — 텔레그램 버튼 콜백용 (선택)
+        self.pending_suggestions = pending_suggestions
 
         # dedupe: {(event_type, ticker): datetime}
         self._last_fired: dict[tuple[str, str], datetime] = {}
@@ -380,13 +382,38 @@ class IncidentAnalyzer:
                 lines.append(f"• [{scope}] {str(a.get('action', ''))[:120]}")
 
         suggest = rca.get("rule_change_suggestion", {}) or {}
+        suggestion_id = None
         if suggest.get("needed"):
             lines.append("")
             lines.append("<b>룰 수정 제안</b>")
             lines.append(f"대상: {suggest.get('rule_id', '')[:80]}")
             lines.append(f"제안: {str(suggest.get('suggestion', ''))[:200]}")
 
+            # pending_suggestions에 저장 → 텔레그램 버튼으로 처리 가능하게
+            if self.pending_suggestions:
+                try:
+                    suggestion_id = self.pending_suggestions.save(
+                        source="incident_rca",
+                        suggestion=suggest,
+                        context={
+                            "event_type": event_type,
+                            "ticker": ticker,
+                            "severity": rca.get("severity", "?"),
+                            "headline": rca.get("headline", ""),
+                        },
+                    )
+                except Exception as e:
+                    logger.warning(f"pending_suggestions.save failed: {e}")
+
         try:
-            self.telegram.send_alert_sync("error", "\n".join(lines))
+            if suggestion_id and hasattr(self.telegram, "send_suggestion_alert_sync"):
+                # rule_id에 따라 파라미터 적용 버튼 노출 여부 결정 (active.md 자연어면 변환만 표시)
+                rule_id_str = (suggest.get("rule_id", "") or "").lower()
+                show_param = "trading-params" in rule_id_str or ".yaml" in rule_id_str or "param" in rule_id_str
+                self.telegram.send_suggestion_alert_sync(
+                    "error", "\n".join(lines), suggestion_id, show_param_apply=show_param,
+                )
+            else:
+                self.telegram.send_alert_sync("error", "\n".join(lines))
         except Exception as e:
             logger.warning(f"RCA telegram send failed: {e}")
