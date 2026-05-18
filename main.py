@@ -165,6 +165,7 @@ class TradingSystem:
             sim_tracker=self.sim_tracker,
             sync_account_fn=lambda: self.account_manager.sync_account_from_broker(),
             rca_callback=self.incident_analyzer.trigger,
+            circuit_breaker=self.circuit_breaker,  # 폭락장 다중 신호 가드
         )
 
         # live 모드면 실계좌 동기화, 시뮬레이션이면 초기 자본금 설정
@@ -615,6 +616,39 @@ class TradingSystem:
                 current_prices = self.data_pipeline.collect_prices_only(
                     [a["ticker"] for a in actions if a.get("ticker")]
                 )
+
+                # 폭락장 LLM SELL 차단 — risk_manager가 자동 손절을 일시정지하는데
+                # LLM이 SELL 액션 내면 정책 우회. 보유 종목 자체 보호용.
+                # 단, 평가손실 -15% 절대선 도달 종목은 통과 (risk_manager 절대선과 일관성).
+                try:
+                    from core.circuit_breaker import CircuitState
+                    crash_active = (
+                        self.circuit_breaker.state in (CircuitState.HALTED, CircuitState.EMERGENCY)
+                    )
+                except Exception:
+                    crash_active = False
+                if crash_active:
+                    pre_count = len(actions)
+                    kept = []
+                    blocked_sells = []
+                    for a in actions:
+                        if a.get("type", "").upper() != "SELL":
+                            kept.append(a)
+                            continue
+                        tk = a.get("ticker", "")
+                        pos = self.portfolio.positions.get(tk)
+                        # 절대선 -15% 미달 SELL은 차단 (보유 유지)
+                        if pos and getattr(pos, "pnl_pct", 0) > -0.15:
+                            blocked_sells.append(a)
+                        else:
+                            kept.append(a)
+                    if blocked_sells:
+                        actions = kept
+                        logger.warning(
+                            f"[crash_pause] LLM SELL {len(blocked_sells)}건 차단 "
+                            f"(circuit {self.circuit_breaker.state.value}, 절대선 -15% 미달): "
+                            f"{[(a.get('ticker'), a.get('name')) for a in blocked_sells]}"
+                        )
 
                 # 서킷브레이커 상태에 따라 BUY/SELL 필터링
                 if not self.circuit_breaker.is_buy_allowed:

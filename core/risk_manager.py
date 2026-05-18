@@ -26,6 +26,7 @@ class RiskManager:
         sim_tracker,
         sync_account_fn=None,
         rca_callback=None,
+        circuit_breaker=None,
     ):
         """
         Args:
@@ -46,6 +47,7 @@ class RiskManager:
         self.sim_tracker = sim_tracker
         self.sync_account_fn = sync_account_fn
         self._rca_callback = rca_callback
+        self.circuit_breaker = circuit_breaker  # 폭락장 가드 다중 신호용
         self._watchlist: list[str] | None = None  # 스크리닝 관심종목 (외부에서 설정)
         self._gap_sold_today: dict[str, str] = {}  # {ticker: date_str} 갭상승 익절 중복 방지
         # 자동 매도 연속 실패 추적 — 동일 종목 N회 실패 시 일시 차단 + 알림 (KIS 장애 등 무한 재시도 방지)
@@ -121,13 +123,62 @@ class RiskManager:
         sector_trailing_stop = params.get("trailing_stop_by_sector", {}) or {}
         max_hold_days = params.get("holding_period_days", {}).get("max", 20)
 
-        # 폭락장 여부 — 코스피 일중 등락률 -2% 이하면 자동 손절 일시정지
+        # 폭락장 여부 — 다중 신호로 판단 (KOSPI API 실패 시초가 우회 방지)
+        # (a) KOSPI 명시적 폭락 (-2% 이하)
+        # (b) Circuit breaker 이미 HALTED/EMERGENCY (서킷이 폭락 인식)
+        # (c) KOSPI 데이터 없을 때 — 포트폴리오 일일 손실 -2% 이상 폴백
+        # (d) 시초가 30분 (09:00~09:30) + KOSPI 데이터 없음 — 갭다운 가능성 보수적 처리
         kospi_change = self._get_kospi_change_pct()
-        crash_pause = kospi_change is not None and kospi_change <= self._CRASH_PAUSE_THRESHOLD
+        crash_by_kospi = kospi_change is not None and kospi_change <= self._CRASH_PAUSE_THRESHOLD
+
+        crash_by_circuit = False
+        try:
+            if self.circuit_breaker:
+                from core.circuit_breaker import CircuitState
+                crash_by_circuit = self.circuit_breaker.state in (
+                    CircuitState.HALTED, CircuitState.EMERGENCY,
+                )
+        except Exception:
+            pass
+
+        crash_by_portfolio = False
+        try:
+            snapshots = self.portfolio.get_daily_snapshots(days=3)
+            if snapshots:
+                today_str = datetime.now().strftime("%Y-%m-%d")
+                prev_asset = None
+                for snap in snapshots:
+                    if str(snap.get("date", ""))[:10] != today_str:
+                        prev_asset = snap.get("total_asset", 0)
+                        break
+                cur_asset = self.portfolio.total_asset or 0
+                if prev_asset and prev_asset > 0 and cur_asset > 0:
+                    daily_pct = (cur_asset - prev_asset) / prev_asset
+                    crash_by_portfolio = daily_pct <= -0.02
+        except Exception:
+            pass
+
+        crash_by_opening_unknown = False
+        try:
+            from datetime import time as dtime
+            now_t = datetime.now().time()
+            if kospi_change is None and dtime(9, 0) <= now_t < dtime(9, 30):
+                crash_by_opening_unknown = True
+        except Exception:
+            pass
+
+        crash_pause = crash_by_kospi or crash_by_circuit or crash_by_portfolio or crash_by_opening_unknown
+
         if crash_pause:
+            kospi_str = f"{kospi_change:.2%}" if kospi_change is not None else "N/A"
+            signals = []
+            if crash_by_kospi: signals.append(f"KOSPI {kospi_str}")
+            if crash_by_circuit: signals.append(f"circuit {self.circuit_breaker.state.value}")
+            if crash_by_portfolio: signals.append("포트폴리오 일일손실 -2%↓")
+            if crash_by_opening_unknown: signals.append("시초가30분 KOSPI 데이터 없음")
             logger.warning(
-                f"Crash market pause active (KOSPI {kospi_change:.2%} ≤ "
-                f"{self._CRASH_PAUSE_THRESHOLD:.0%}) — 하드손절/트레일링/조기익절 일시정지, "
+                f"Crash market pause active [{', '.join(signals)}] — "
+                f"하드손절/트레일링/조기익절 일시정지, "
                 f"절대선 {self._ABSOLUTE_FLOOR_PNL:.0%}만 유지"
             )
 
@@ -151,9 +202,10 @@ class RiskManager:
             # 1. 하드 손절 (strategy_type별) — 폭락장 일시정지 적용
             if reason is None and pos.pnl_pct <= pos_sl:
                 if crash_pause:
+                    kospi_str = f"{kospi_change:.2%}" if kospi_change is not None else "N/A"
                     logger.info(
                         f"[crash_pause] 하드손절 보류 {pos.name}({ticker}) "
-                        f"pnl={pos.pnl_pct:.1%} (코스피 {kospi_change:.2%})"
+                        f"pnl={pos.pnl_pct:.1%} (코스피 {kospi_str})"
                     )
                 else:
                     reason = f"하드손절 ({pos.pnl_pct:.1%} ≤ {pos_sl:.0%}) [{pos.label}]"
@@ -357,7 +409,7 @@ class RiskManager:
                 "limit_price": limit_price,
                 "reason": (
                     f"폭락장 분할추가매수 {tier}차 (평단대비 {pos.pnl_pct:.1%}, "
-                    f"비중 {current_weight:.1%}+{buy_ratio:.1%}, 코스피 {kospi_change:.2%})"
+                    f"비중 {current_weight:.1%}+{buy_ratio:.1%}, 코스피 {f'{kospi_change:.2%}' if kospi_change is not None else 'N/A'})"
                 ),
                 "strategy_type": pos.strategy_type or "swing",
             })
@@ -371,7 +423,7 @@ class RiskManager:
             "reasoning": f"RiskManager 자동 분할 추가매수 (폭락장 + 현금 {cash_ratio:.0%})",
             "actions": actions,
             "risk_assessment": "MEDIUM",
-            "market_outlook": f"코스피 {kospi_change:.2%} 폭락장 — 분할 평단조정",
+            "market_outlook": f"코스피 {f'{kospi_change:.2%}' if kospi_change is not None else 'N/A'} 폭락장 — 분할 평단조정",
             "config_adjustments": [],
         }
 
@@ -399,7 +451,7 @@ class RiskManager:
             try:
                 lines = [
                     f"📥 <b>폭락장 분할 추가매수 (자동)</b>",
-                    f"코스피 {kospi_change:.2%} / 현금비율 {cash_ratio:.0%}",
+                    f"코스피 {f'{kospi_change:.2%}' if kospi_change is not None else 'N/A'} / 현금비율 {cash_ratio:.0%}",
                     "",
                 ]
                 for a in actions:
