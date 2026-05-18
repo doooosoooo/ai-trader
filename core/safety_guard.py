@@ -166,13 +166,17 @@ class SafetyGuard:
             violations.extend(action_violations)
 
         # 사이클 레벨 검증: 동일 섹터 BUY 다중 진입 차단 (섹터 집중 방지)
+        # 단, include_tickers 종목은 한도 계산에서 제외 (강제 후보 + 폭락장 분산 진입 허용)
         max_same_sector_buys = self.rules.get("max_same_sector_buys_per_cycle")
         if max_same_sector_buys and max_same_sector_buys > 0:
             sector_buys: dict[str, list[int]] = {}
             for i, action in enumerate(actions):
                 if action.get("type", "").upper() != "BUY":
                     continue
-                sector = self._sector_map.get(action.get("ticker", ""))
+                ticker = action.get("ticker", "")
+                if ticker in self._include_tickers:
+                    continue  # include_tickers는 섹터 한도 면제
+                sector = self._sector_map.get(ticker)
                 if not sector:
                     continue
                 sector_buys.setdefault(sector, []).append(i)
