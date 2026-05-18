@@ -48,6 +48,8 @@ class SafetyGuard:
         self._last_trade_time: dict[str, datetime] = {}  # ticker -> last trade time
         self._daily_pnl: float = 0.0
         self._daily_pnl_date: str = ""
+        # 재매수 쿨다운 면제 대상 (include_tickers) — main.py에서 set_include_tickers로 주입
+        self._include_tickers: set[str] = set()
         # 재매수 쿨다운 검사용 DB 경로 (trade_history 조회)
         self.db_path = db_path or str(
             Path(__file__).parent.parent / "data" / "storage" / "trader.db"
@@ -74,6 +76,12 @@ class SafetyGuard:
         except Exception as e:
             logger.error(f"Failed to load sector-mapping.yaml: {e}")
             return {}
+
+    def set_include_tickers(self, tickers: list[str]) -> None:
+        """재매수 쿨다운 면제 종목 등록. include_tickers (screening-params.yaml)는
+        강제 후보화 종목이라 손절-재매수-손절 사이클 위험이 낮고, 폭락장 회복
+        기회를 놓치지 않기 위해 같은 종목/같은 섹터 쿨다운에서 면제."""
+        self._include_tickers = set(tickers or [])
 
     def get_sector(self, ticker: str) -> str | None:
         """종목코드의 섹터 반환. 매핑 없으면 None."""
@@ -271,8 +279,9 @@ class SafetyGuard:
 
             # 3.6. 동일 섹터 매도 후 재매수 쿨다운 (섹터 즉시 회전 차단)
             #     같은 섹터에서 최근 SELL이 있으면 N거래일간 신규 매수 금지.
+            #     단, include_tickers 종목은 면제 (강제 후보 + 폭락장 회복 기회).
             sector_cooldown = self.rules.get("same_sector_rebuy_cooldown_days")
-            if sector_cooldown and not is_existing:
+            if sector_cooldown and not is_existing and ticker not in self._include_tickers:
                 target_sector = self._sector_map.get(ticker)
                 if target_sector:
                     last_sell = self._last_sell_in_sector(target_sector)
@@ -297,24 +306,23 @@ class SafetyGuard:
                 ))
 
             # 4.5. 재매수 쿨다운 — 매도 후 N거래일 내 동일 종목 재매수 차단
-            #     LLM 프롬프트(active.md) 규칙을 코드 레벨에서 강제
+            #     LLM 프롬프트(active.md) 규칙을 코드 레벨에서 강제.
             cooldown_days = self.rules.get("rebuy_cooldown_trading_days", 2)
             last_sell = self._last_sell_for(ticker)
             if last_sell is not None:
                 sell_ts, sell_price = last_sell
                 elapsed_days = _trading_days_between(sell_ts, datetime.now())
-                if elapsed_days < cooldown_days:
+                is_include = ticker in self._include_tickers
+                # 거래일 쿨다운 — include_tickers는 면제 (강제 후보, 폭락장 회복 기회)
+                if not is_include and elapsed_days < cooldown_days:
                     violations.append(SafetyViolation(
                         "rebuy_cooldown",
                         f"{ticker} 매도({sell_ts.strftime('%m-%d %H:%M')}) "
                         f"후 {elapsed_days}거래일 < 쿨다운 {cooldown_days}거래일",
                         index,
                     ))
-                # 매도가보다 높은 가격에 같은 날 재매수 금지 (active.md 규칙 D)
+                # 같은 날 재매수 차단 — include_tickers에도 적용 (단타 추격 방지)
                 same_day = sell_ts.date() == datetime.now().date()
-                action_price = action.get("limit_price")
-                # limit_price가 없으면 reference로 매도가 자체 비교는 못 하지만,
-                # 같은 날 재매수 자체가 위험하므로 차단
                 if same_day:
                     violations.append(SafetyViolation(
                         "same_day_rebuy",
