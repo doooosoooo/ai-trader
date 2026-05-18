@@ -622,8 +622,8 @@ class TradingSystem:
                 # 폭락장 LLM SELL 차단 — risk_manager가 자동 손절을 일시정지하는데
                 # LLM이 SELL 액션 내면 정책 우회. 보유 종목 자체 보호용.
                 # 단, 평가손실 -15% 절대선 도달 종목은 통과 (risk_manager 절대선과 일관성).
+                # CircuitState는 모듈 상단에서 이미 import됨 (line 39).
                 try:
-                    from core.circuit_breaker import CircuitState
                     crash_active = (
                         self.circuit_breaker.state in (CircuitState.HALTED, CircuitState.EMERGENCY)
                     )
