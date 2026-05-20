@@ -102,11 +102,41 @@ class RiskManager:
     _CRASH_PAUSE_THRESHOLD = -0.02
     # 폭락장 일시정지가 작동하더라도 평가손실이 이 절대선을 넘으면 무조건 매도
     _ABSOLUTE_FLOOR_PNL = -0.15
+    # 우량주 하드손절 면제 — 시총 임계값 (10조원). include_tickers는 시총 무관 면제.
+    # 우량주는 단기 변동성으로 -5% 터치 후 반등하는 경우 다수 — 손절-재매수 사이클로 자본 잠식 방지.
+    # 트레일링 스탑(8~10%)과 절대선 -15%는 그대로 적용.
+    # current_prices.market_cap 단위는 억원(100M won) — KIS hts_avls 원본 단위.
+    _PREMIUM_MARKET_CAP_MIN_OK = 100_000  # 10조원 = 100,000억원
     # 분할 추가매수 (물타기) 트리거 — 폭락장 + 현금 ≥ 40% 시 활성화
     _AVG_DOWN_CASH_RATIO_MIN = 0.40
     _AVG_DOWN_TIER_1_PNL = -0.05  # 1차 추가매수 트리거 평단 대비 손실률
     _AVG_DOWN_TIER_2_PNL = -0.10  # 2차 추가매수 트리거
     _AVG_DOWN_RATIO_PER_TIER = 1 / 3  # 매 차수마다 보유 수량의 1/3 추가매수
+
+    def _is_premium_stock(self, ticker: str) -> tuple[bool, str]:
+        """우량주 여부 — include_tickers 또는 시총 10조+ 종목.
+
+        Returns:
+            (is_premium, reason)
+        """
+        try:
+            if self.safety_guard and ticker in getattr(self.safety_guard, "_include_tickers", set()):
+                return True, "include_tickers"
+        except Exception:
+            pass
+        try:
+            import sqlite3
+            db_path = Path(__file__).parent.parent / "data" / "storage" / "trader.db"
+            with sqlite3.connect(str(db_path)) as conn:
+                row = conn.execute(
+                    "SELECT market_cap FROM current_prices WHERE ticker=?",
+                    (ticker,),
+                ).fetchone()
+            if row and row[0] and row[0] >= self._PREMIUM_MARKET_CAP_MIN_OK:
+                return True, f"시총 {row[0]/10000:.1f}조"
+        except Exception:
+            pass
+        return False, ""
 
     def check_risk_exits(self) -> list[dict]:
         """리스크 기반 자동 청산 — 손절/트레일링스탑/보유기간 초과.
@@ -199,9 +229,16 @@ class RiskManager:
                     f"절대선손절 ({pos.pnl_pct:.1%} ≤ {self._ABSOLUTE_FLOOR_PNL:.0%}) [{pos.label}]"
                 )
 
-            # 1. 하드 손절 (strategy_type별) — 폭락장 일시정지 적용
+            # 1. 하드 손절 (strategy_type별) — 우량주 면제 + 폭락장 일시정지 적용
             if reason is None and pos.pnl_pct <= pos_sl:
-                if crash_pause:
+                is_premium, premium_reason = self._is_premium_stock(ticker)
+                if is_premium:
+                    # 우량주는 하드손절 면제 — 트레일링 스탑/절대선 -15%로만 보호
+                    logger.info(
+                        f"[premium_exempt] 하드손절 면제 {pos.name}({ticker}) "
+                        f"pnl={pos.pnl_pct:.1%} ({premium_reason}) — 트레일링/절대선만 적용"
+                    )
+                elif crash_pause:
                     kospi_str = f"{kospi_change:.2%}" if kospi_change is not None else "N/A"
                     logger.info(
                         f"[crash_pause] 하드손절 보류 {pos.name}({ticker}) "
