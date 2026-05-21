@@ -60,6 +60,8 @@ class RiskManager:
         self._dd_alerted = False
         # 분할 추가매수 (물타기) 일별 dedupe — {ticker: {tier: date_str}}
         self._avg_down_fired: dict[str, dict[int, str]] = {}
+        # 강세장 사이즈업 일별 dedupe — {ticker: date_str}, 하루 1회만 추가매수
+        self._fill_up_fired: dict[str, str] = {}
         self._load_alert_state()
 
     def set_rca_callback(self, cb) -> None:
@@ -112,6 +114,12 @@ class RiskManager:
     _AVG_DOWN_TIER_1_PNL = -0.05  # 1차 추가매수 트리거 평단 대비 손실률
     _AVG_DOWN_TIER_2_PNL = -0.10  # 2차 추가매수 트리거
     _AVG_DOWN_RATIO_PER_TIER = 1 / 3  # 매 차수마다 보유 수량의 1/3 추가매수
+    # 강세장 자동 추가매수 (포지션 사이즈업) — 토막 진입 종목 키우기
+    # 폭락장(crash_pause)에서는 비활성, avg_down이 담당.
+    _FILL_UP_CASH_RATIO_MIN = 0.30   # 현금 30% 이상일 때만 작동
+    _FILL_UP_WEIGHT_TARGET = 0.05    # 비중 5% 미만 종목이 대상
+    _FILL_UP_PNL_MIN = -0.02         # 평단 대비 -2% 이하(=손실 큰)는 제외 (avg_down 영역)
+    _FILL_UP_RATIO_STEP = 0.02       # 1회 추가 매수 ≒ 총자산의 2%
 
     def _is_premium_stock(self, ticker: str) -> tuple[bool, str]:
         """우량주 여부 — include_tickers 또는 시총 10조+ 종목.
@@ -314,6 +322,10 @@ class RiskManager:
         if crash_pause:
             avg_down_results = self._trigger_avg_down_orders(kospi_change)
             results.extend(avg_down_results)
+        else:
+            # 3.6 강세/정상장 자동 사이즈업 — 토막 진입한 종목 비중 키우기
+            fill_up_results = self._trigger_fill_up_orders()
+            results.extend(fill_up_results)
 
         # 4. 집중도 경고 (자동 매도는 아니지만 텔레그램 알림)
         # 2종목 이하면 비중 초과는 불가피하므로 경고 스킵
@@ -500,6 +512,146 @@ class RiskManager:
                 self.telegram.send_alert_sync("trade_executed", "\n".join(lines))
             except Exception as e:
                 logger.warning(f"Avg-down telegram send failed: {e}")
+
+        return results or []
+
+    def _trigger_fill_up_orders(self) -> list[dict]:
+        """강세/정상장에서 토막 진입한 종목을 자동 사이즈업.
+
+        Why: LLM은 신규 BUY만 하고 기존 작은 포지션을 키우지 않음 →
+             1차 진입(3%) 후 추가 매수 안 되어 현금 누적. 5/21 현금 55.7%,
+             종목 7개 비중 <3% 사태.
+
+        Trigger:
+        - NOT crash_pause (avg_down이 담당하는 영역과 충돌 회피)
+        - 현금 ≥ 30%
+        - 종목 비중 < 5%
+        - 평단 대비 손실 -2% 이하는 제외 (avg_down 영역)
+        - daytrading 제외 (짧은 손익)
+
+        Action:
+        - 종목당 +2% 추가 매수 (총자산 기준)
+        - 종목당 max_position_ratio 한도(15%) 초과 금지
+        - 종목당 하루 1회만 (dedupe)
+        - limit_price = 현재가 -1%
+        """
+        if not self.portfolio.positions:
+            return []
+
+        total_asset = self.portfolio.total_asset or 1
+        cash = getattr(self.portfolio, "cash", 0) or 0
+        cash_ratio = cash / total_asset
+        if cash_ratio < self._FILL_UP_CASH_RATIO_MIN:
+            return []
+
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        max_position_ratio = self.safety_guard.rules.get("max_position_ratio", 0.15)
+        actions: list[dict] = []
+        fired_log: list[str] = []
+
+        # 비중 작은 순으로 정렬 — 가장 토막난 종목부터 채움
+        candidates = sorted(
+            self.portfolio.positions.items(),
+            key=lambda kv: (kv[1].market_value or 0) / total_asset,
+        )
+
+        for ticker, pos in candidates:
+            if pos.avg_price <= 0 or pos.current_price <= 0:
+                continue
+            if (pos.strategy_type or "swing") == "daytrading":
+                continue
+            if pos.pnl_pct < self._FILL_UP_PNL_MIN:
+                continue  # 평단 -2% 이하 손실 종목은 avg_down 영역
+
+            current_weight = (pos.market_value or 0) / total_asset
+            if current_weight >= self._FILL_UP_WEIGHT_TARGET:
+                continue  # 이미 충분히 큰 종목
+
+            # 일별 dedupe
+            if self._fill_up_fired.get(ticker) == today_str:
+                continue
+
+            buy_ratio = self._FILL_UP_RATIO_STEP
+
+            # 종목당 한도 캡
+            if current_weight + buy_ratio > max_position_ratio:
+                buy_ratio = max(0.0, max_position_ratio - current_weight)
+            if buy_ratio < 0.005:
+                continue
+
+            # 현금 잔액 캡
+            order_amount = total_asset * buy_ratio
+            if order_amount > cash:
+                buy_ratio = cash / total_asset
+                if buy_ratio < 0.005:
+                    continue
+                order_amount = total_asset * buy_ratio
+
+            limit_price = int(pos.current_price * 0.99)
+            actions.append({
+                "type": "BUY",
+                "ticker": ticker,
+                "name": pos.name,
+                "ratio": buy_ratio,
+                "urgency": "limit",
+                "limit_price": limit_price,
+                "reason": (
+                    f"강세장 자동 사이즈업 (비중 {current_weight:.1%}+{buy_ratio:.1%}, "
+                    f"손익 {pos.pnl_pct:+.1%}, 현금 {cash_ratio:.0%})"
+                ),
+                "strategy_type": pos.strategy_type or "swing",
+            })
+            fired_log.append(ticker)
+            cash -= order_amount
+
+            # 한 사이클에 너무 많이 풀지 않음 — 최대 3종목
+            if len(actions) >= 3:
+                break
+
+        if not actions:
+            return []
+
+        pseudo_signal = {
+            "reasoning": f"RiskManager 자동 사이즈업 (강세/정상장, 현금 {cash_ratio:.0%})",
+            "actions": actions,
+            "risk_assessment": "LOW",
+            "market_outlook": "정상/강세장 — 토막 진입 종목 사이즈업",
+            "config_adjustments": [],
+        }
+
+        current_prices = {tk: p.current_price for tk, p in self.portfolio.positions.items()}
+        logger.warning(f"Fill-up triggered: {len(actions)} orders")
+
+        try:
+            results = self.executor.execute_signal(pseudo_signal, current_prices)
+        except Exception as e:
+            logger.error(f"Fill-up execution failed: {e}")
+            return []
+
+        # 성공 시 dedupe 마킹
+        for r in results or []:
+            if r and r.get("status") not in ("FAILED",):
+                tk = r.get("ticker")
+                if tk in fired_log:
+                    self._fill_up_fired[tk] = today_str
+
+        # 텔레그램 알림
+        if self.telegram and getattr(self.telegram, "enabled", False):
+            try:
+                lines = [
+                    f"📥 <b>강세장 자동 사이즈업</b>",
+                    f"현금비율 {cash_ratio:.0%} → 토막 종목 비중 키움",
+                    "",
+                ]
+                for a in actions:
+                    lines.append(
+                        f"• {a['name']}({a['ticker']}) "
+                        f"비중 +{a['ratio']:.1%} @ {a['limit_price']:,}원"
+                    )
+                    lines.append(f"  └ {a['reason']}")
+                self.telegram.send_alert_sync("trade_executed", "\n".join(lines))
+            except Exception as e:
+                logger.warning(f"Fill-up telegram send failed: {e}")
 
         return results or []
 
