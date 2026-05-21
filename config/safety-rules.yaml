@@ -6,7 +6,7 @@
 
 # 포지션 관리
 max_position_ratio: 0.15           # 종목당 최대 총자산의 15%
-max_positions: 8                   # 동시 보유 최대 8종목
+max_positions: 15                  # 동시 보유 최대 15종목 (5/21 8→15: 현금 70% 활용 + 종목당 평균 400만 진입)
 max_sector_positions: 2            # 동일 섹터 최대 2종목 (섹터 쏠림 방지, sector-mapping.yaml 매핑 기반)
 max_same_sector_buys_per_cycle: 1  # 단일 분석 사이클에서 동일 섹터 BUY 최대 1건 (사이클 내 섹터 분산 강제)
 max_single_order_amount: 7000000   # 단일 주문 최대 700만원 (5M→7M, position_size_pct 0.13과 한도 모순 해소)
